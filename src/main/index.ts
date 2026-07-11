@@ -659,54 +659,114 @@ ipcMain.handle('component:detail', async (_e, name: string) => {
   }
 });
 
-// ── Component drilldown (double-click: detailed sub-diagram) ─────────────────
+// ── Component drilldown ───────────────────────────────────────────────────────
 
-function buildDrilldownPrompt(name: string, structureJson: string): string {
+/**
+ * Find the best-matching file path for a component name.
+ * Tries: exact nodePaths key, then case-insensitive, then substring match.
+ */
+function resolveComponentPath(name: string, nodePaths: Record<string, string>): string | null {
+  // Exact match
+  if (nodePaths[name]) return nodePaths[name];
+  const lc = name.toLowerCase();
+  // Case-insensitive exact
+  const ci = Object.keys(nodePaths).find(k => k.toLowerCase() === lc);
+  if (ci) return nodePaths[ci];
+  // Substring: component name contained in file name (e.g. "AuthViewModel" → "AuthViewModel.kt")
+  const sub = Object.keys(nodePaths).find(k => k.toLowerCase().includes(lc) || lc.includes(k.toLowerCase().replace(/\.[^.]+$/, '')));
+  if (sub) return nodePaths[sub];
+  return null;
+}
+
+function buildDrilldownPrompt(name: string, sourceCode: string, imports: string[], calledBy: string[]): string {
   return [
-    `You are a senior software architect. Draw a detailed internal diagram of the component "${name}".`,
+    `You are a senior software architect. Analyse the component "${name}" and produce a detailed Mermaid diagram of what it ACTUALLY does.`,
     'Output ONLY the JSON below — no fences, no prose.',
     '',
-    'RULES:',
-    '- Show the internal structure: key functions/methods, data it owns, sub-components.',
-    '- Show every incoming and outgoing connection to OTHER components in the project.',
-    '- Use real names from the project code.',
-    '- 6–14 nodes total. Label every edge with what data or call flows across it.',
+    'WHAT TO SHOW (use only things that exist in the source code below):',
+    `1. Every function/method inside "${name}" as a node — use the real function name as the label.`,
+    '2. Data it reads or writes (state, DB, cache, files, network) — one node per data source with type.',
+    '3. Every external component it calls — use the real class/function name.',
+    '4. Error paths — if a function has try/catch or error handling, show where errors go.',
+    '5. Edge labels must say WHAT is passed (param name, return type, or event name) — not just "calls".',
     '',
-    'MERMAID SYNTAX (follow exactly):',
+    'LAYOUT: top = entry points / public API, middle = internal logic, bottom = data/external calls.',
+    '',
+    calledBy.length > 0 ? `This component is called by: ${calledBy.join(', ')}` : '',
+    imports.length > 0 ? `It imports: ${imports.join(', ')}` : '',
+    '',
+    'MERMAID SYNTAX (follow exactly or it will not render):',
     '- Start with `flowchart TD`.',
-    '- Node id = letters/digits/underscore only. Format: `Id[Label]`.',
-    '- Label text: letters, digits, spaces only. NO ( ) / : ; " \' | inside [ ].',
-    '- Edge with label: `A -->|data or call| B`.',
+    '- Node id = letters/digits/underscore only (NO dots, slashes, spaces). Format: `Id[Label]`.',
+    '- Label: letters, digits, spaces only. NO special chars inside [ ].',
+    '- Edge with label: `A -->|what flows| B`.',
     '- NO subgraph, NO classDiagram, NO sequenceDiagram.',
+    '- 8–18 nodes. Every node must be connected.',
     '',
     'Schema:',
-    '{"mermaid":"flowchart TD string with \\n as newlines"}',
+    '{"mermaid":"flowchart TD string — use \\n for newlines"}',
     '',
-    'Project structure (for context):',
-    structureJson,
+    `SOURCE CODE of ${name}:`,
+    '```',
+    sourceCode.slice(0, 6000),
+    '```',
     '',
     'JSON only.',
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 }
 
 ipcMain.handle('component:drilldown', async (_e, name: string) => {
   if (!currentFolder || !name) return { error: 'no component' };
   try {
-    // Check drilldown cache first
+    // Cache check
     const cached = loadCache(currentFolder);
     if (cached?.drilldowns?.[name]) {
       return { ok: true, mermaid: cached.drilldowns[name], fromCache: true };
     }
 
     const structure = extractStructure(currentFolder);
-    const prompt = buildDrilldownPrompt(name, toClaudePromptJSON(structure));
+
+    // Read the actual source file for this component
+    const filePath = resolveComponentPath(name, structure.nodePaths);
+    let sourceCode = '';
+    if (filePath) {
+      try { sourceCode = fs.readFileSync(filePath, 'utf8'); } catch { /* ignore */ }
+    }
+
+    // If we couldn't find a single file, fall back to searching all files for the name
+    if (!sourceCode) {
+      for (const [, fp] of Object.entries(structure.nodePaths)) {
+        try {
+          const content = fs.readFileSync(fp, 'utf8');
+          if (content.includes(name)) { sourceCode = content; break; }
+        } catch { /* ignore */ }
+      }
+    }
+
+    if (!sourceCode) {
+      return { error: `Could not find source code for "${name}"` };
+    }
+
+    // Find what calls this component (reverse dependency)
+    const calledBy: string[] = [];
+    for (const [fname, fp] of Object.entries(structure.nodePaths)) {
+      if (fp === filePath) continue;
+      try {
+        const content = fs.readFileSync(fp, 'utf8');
+        if (content.includes(name)) calledBy.push(fname.replace(/\.[^.]+$/, ''));
+      } catch { /* ignore */ }
+    }
+
+    // Extract imports from source
+    const importMatches = sourceCode.match(/import\s+.*?['"][^'"]+['"]/g) || [];
+    const imports = importMatches.slice(0, 12).map(m => m.replace(/^import\s+.*?from\s+['"]/, '').replace(/['"].*/, '').split('/').pop() || '');
+
+    const prompt = buildDrilldownPrompt(name, sourceCode, imports, calledBy.slice(0, 8));
     const raw = await runCapture(prompt, currentFolder);
     const parsed = extractJson(raw) as { mermaid?: string } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
 
-    // Persist drilldown so repeat double-clicks are instant
     saveDrilldown(currentFolder, name, parsed.mermaid);
-
     return { ok: true, mermaid: parsed.mermaid };
   } catch (err: unknown) {
     return { error: err instanceof Error ? err.message : String(err) };
