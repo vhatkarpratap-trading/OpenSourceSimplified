@@ -124,9 +124,12 @@ function buildClaudePrompt(structureJson: string): string {
   const schema = `{
   "pattern": "e.g. MVVM, Clean Architecture, MVC, Redux/Flux, Layered, Hexagonal, Microservices, Event-Driven",
   "diagrams": {
-    "structure": "flowchart TD string — layers as subgraphs, labelled edges",
+    "structure": "flowchart TD string — flat, labelled edges, no subgraph",
     "sequence": "flowchart LR string — one request end-to-end",
     "gitDiff": ""
+  },
+  "descriptions": {
+    "NodeLabel": "1 sentence — what this component does in the context of THIS project and what service/value it provides"
   }
 }`;
 
@@ -143,22 +146,23 @@ function buildClaudePrompt(structureJson: string): string {
     '',
     '4. sequence diagram — trace ONE user action end-to-end through the layers.',
     '',
+    '5. descriptions — for EVERY node in the structure diagram write exactly 1 sentence:',
+    '   - What it does in the context of THIS project (not a generic definition)',
+    '   - What service or value it provides to the system',
+    '   - Use the exact same NodeLabel as the key (copy from the flowchart)',
+    '   - Plain English, no jargon, max 12 words',
+    '',
     'MERMAID SYNTAX (follow exactly or it will not render):',
     '- Start with `flowchart TD` (structure) or `flowchart LR` (sequence). Never classDiagram/sequenceDiagram/subgraph.',
     '- Node id = letters/digits only (no dots, spaces, slashes). Format: `Id[Label]`.',
     '- Label text: letters, digits, spaces only. NO ( ) / : ; " \' | inside [ ].',
     '- Edge with label: `A -->|gets visit list| B`  ← pipes only around the label, never inside it.',
-    '- subgraph: `subgraph Data` … `end`. One node per line. Reuse the same Id everywhere.',
     '',
     'VALID EXAMPLE (copy this shape):',
     'flowchart TD',
-    '  subgraph UI',
-    '    HomeScreen[HomeScreen]',
-    '  end',
-    '  subgraph Data',
-    '    VisitRepo[VisitRepo]',
-    '    ApiClient[ApiClient]',
-    '  end',
+    '  HomeScreen[HomeScreen]',
+    '  VisitRepo[VisitRepo]',
+    '  ApiClient[ApiClient]',
     '  HomeScreen -->|asks for visits| VisitRepo',
     '  VisitRepo -->|GET visits| ApiClient',
     '  ApiClient -->|visit json| VisitRepo',

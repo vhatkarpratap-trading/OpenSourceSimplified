@@ -154,11 +154,9 @@ async function tryParse(def: string): Promise<{ type?: string }[] | null> {
   }
 }
 
-export async function buildMermaidScene(mermaid: string): Promise<FlatScene> {
+export async function buildMermaidScene(mermaid: string, descriptions?: Record<string, string>): Promise<FlatScene> {
   const cleaned = cleanMermaid(mermaid);
 
-  // Attempt 1: as-is. Attempt 2: sanitised labels (fixes the common LLM mistakes
-  // that make Mermaid silently rasterise to an unusable image).
   let skeletons = await tryParse(cleaned);
   if (!skeletons) skeletons = await tryParse(sanitizeMermaid(cleaned));
   if (!skeletons) {
@@ -168,28 +166,46 @@ export async function buildMermaidScene(mermaid: string): Promise<FlatScene> {
     throw new Error('Could not draw this diagram — the chart text was invalid');
   }
 
-  // convertToExcalidrawElements fills in all required Excalidraw fields, but the
-  // default styling is very light/low-contrast. Apply a readable baseline palette
-  // and preserve Mermaid `:::changed` styling (amber) as a highlighted node.
   const converted = convertToExcalidrawElements(skeletons as never) as unknown as ExcalidrawElement[];
 
   const NODE_BG = '#eff6ff', NODE_STROKE = '#3b5b8c', NODE_TEXT = '#1e293b';
   const EDGE = '#7c8aa0', EDGE_LABEL = '#475569';
   const LAYER_BG = '#f8fafc', LAYER_STROKE = '#cbd5e1', LAYER_TEXT = '#64748b';
-  const CHANGED_FILLS = new Set(['#fef3c7', '#fffbeb', '#fef9c3']); // Mermaid classDef changed fills
+  const CHANGED_FILLS = new Set(['#fef3c7', '#fffbeb', '#fef9c3']);
+  const DESC_TEXT = '#64748b';
 
-  // A subgraph (layer) container is a rectangle whose own id has a matching
-  // `subgraph_group_<id>` in its groupIds — style these as calm layer bands.
   const isLayer = (el: ExcalidrawElement): boolean =>
     el.type === 'rectangle' && Array.isArray(el.groupIds) &&
     el.groupIds.includes(`subgraph_group_${el.id}`);
 
   const layerIds = new Set(converted.filter(isLayer).map(el => el.id));
 
+  // Build containerId → label text map so we can look up descriptions
+  const containerLabel = new Map<string, string>();
+  for (const el of converted) {
+    if (el.type === 'text') {
+      const cid = (el as { containerId?: string | null }).containerId;
+      if (cid && !layerIds.has(cid)) {
+        containerLabel.set(cid, ((el as { text: string }).text || '').trim());
+      }
+    }
+  }
+
+  // Normalise description keys to lowercase for fuzzy matching
+  const descNorm: Record<string, string> = {};
+  if (descriptions) {
+    for (const [k, v] of Object.entries(descriptions)) {
+      descNorm[k.toLowerCase().trim()] = v;
+    }
+  }
+
+  const DESC_EXTRA_HEIGHT = descriptions && Object.keys(descriptions).length > 0 ? 28 : 0;
+  const extraElements: ExcalidrawElement[] = [];
+  let descSeed = 8000000;
+
   const elements = converted.map(el => {
     if (el.type === 'rectangle') {
       if (layerIds.has(el.id)) {
-        // Layer band — sits behind components, calm and dashed
         return {
           ...el,
           backgroundColor: LAYER_BG, strokeColor: LAYER_STROKE, strokeWidth: 1,
@@ -198,21 +214,69 @@ export async function buildMermaidScene(mermaid: string): Promise<FlatScene> {
         } as ExcalidrawElement;
       }
       const isChanged = CHANGED_FILLS.has((el.backgroundColor || '').toLowerCase());
+
+      // Expand height if we have a description for this node
+      const label = containerLabel.get(el.id);
+      const desc = label ? (descNorm[label.toLowerCase()] ?? null) : null;
+      const extraH = desc ? DESC_EXTRA_HEIGHT : 0;
+      const box = el as ExcalidrawElement & { x: number; y: number; width: number; height: number };
+
+      if (desc && extraH > 0) {
+        // Add a floating description text element below the label, inside the box
+        extraElements.push({
+          type: 'text',
+          id: `desc-${el.id}`,
+          x: box.x + 8,
+          y: box.y + box.height + 6,  // just below existing box bottom
+          width: box.width - 16,
+          height: extraH - 8,
+          text: desc,
+          originalText: desc,
+          fontSize: 10,
+          fontFamily: 2,
+          textAlign: 'center',
+          verticalAlign: 'top',
+          strokeColor: DESC_TEXT,
+          backgroundColor: 'transparent',
+          fillStyle: 'solid',
+          strokeWidth: 1,
+          strokeStyle: 'solid',
+          angle: 0,
+          roughness: 0,
+          opacity: 85,
+          roundness: null,
+          groupIds: el.groupIds,
+          frameId: null,
+          seed: descSeed++,
+          version: 1,
+          versionNonce: descSeed++,
+          isDeleted: false,
+          boundElements: null,
+          updated: 1,
+          link: null,
+          locked: false,
+          containerId: null,
+          lineHeight: 1.3,
+          baseline: 9,
+          customData: { isDescription: true },
+        } as unknown as ExcalidrawElement);
+      }
+
       return {
         ...el,
+        height: (el as { height: number }).height + extraH,
         backgroundColor: isChanged ? '#fef3c7' : NODE_BG,
         strokeColor:     isChanged ? '#d97706' : NODE_STROKE,
         strokeWidth:     isChanged ? 2 : 1.5,
         fillStyle: 'solid',
-        roughness: 0,          // crisp, not sketchy — improves legibility
+        roughness: 0,
         customData: { ...el.customData, nodeType: 'component', changed: isChanged },
       } as ExcalidrawElement;
     }
     if (el.type === 'text') {
-      // Edge labels have a containerId of null and small size; node labels are bound.
       const boundTo = (el as { containerId?: string | null }).containerId;
       if (boundTo && layerIds.has(boundTo)) {
-        return { ...el, strokeColor: LAYER_TEXT, opacity: 100 } as ExcalidrawElement; // layer title
+        return { ...el, strokeColor: LAYER_TEXT, opacity: 100 } as ExcalidrawElement;
       }
       const isEdgeLabel = !boundTo;
       return { ...el, strokeColor: isEdgeLabel ? EDGE_LABEL : NODE_TEXT, opacity: 100 } as ExcalidrawElement;
@@ -223,13 +287,14 @@ export async function buildMermaidScene(mermaid: string): Promise<FlatScene> {
     return el;
   });
 
-  const normalIds = elements.map(el => el.id);
+  const allElements = [...elements, ...extraElements];
+  const normalIds = allElements.map(el => el.id);
 
   return {
-    elements,
+    elements: allElements,
     detailIds: [],
     overviewIds: [],
     normalIds,
-    nodeIds: buildNodeIds(elements, layerIds),
+    nodeIds: buildNodeIds(elements, layerIds),  // index base elements only (not desc overlays)
   };
 }

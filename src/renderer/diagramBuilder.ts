@@ -12,10 +12,11 @@ export type DiagramKind = 'structure' | 'sequence' | 'gitDiff';
 export interface DiagramData {
   pattern: string;
   diagrams: {
-    structure?: string;  // Mermaid: classDiagram — component structure overview
-    sequence?: string;   // Mermaid: sequenceDiagram — call/data flow of a change
+    structure?: string;  // Mermaid: flowchart TD — component structure overview
+    sequence?: string;   // Mermaid: flowchart LR — call/data flow of a change
     gitDiff?: string;    // Mermaid: flowchart — changed files + +/- lines
   };
+  descriptions?: Record<string, string>;  // NodeLabel → 1-sentence description
 }
 
 export type ZoomTier = 'overview' | 'normal' | 'detail';

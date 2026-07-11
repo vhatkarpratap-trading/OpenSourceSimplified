@@ -167,7 +167,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     (async () => {
       let flat: FlatScene;
       try {
-        flat = await buildMermaidScene(mermaid);
+        flat = await buildMermaidScene(mermaid, diagramData.descriptions);
         onRenderError?.(null);
       } catch (err) {
         // Invalid Mermaid from the LLM — keep the last good scene, surface error
