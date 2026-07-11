@@ -155,6 +155,8 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     // Fingerprint = active kind + its mermaid source; redraw only when it changes
     const key = `${activeKind}|${mermaid.length}|${mermaid.slice(0, 64)}`;
     if (key === lastDiagramKey.current) return;
+    // Don't reload base scene while drilldown is active — it would wipe the overlay
+    if (drilldownActiveRef.current) return;
     lastDiagramKey.current = key;
     lastDataRef.current = diagramData;
 
@@ -218,6 +220,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       const api  = apiRef.current;
       const flat = flatRef.current;
       if (!api || !flat) return;
+      if (drilldownActiveRef.current) return; // drilldown owns the scene — don't overwrite
 
       const zoom = (api.getAppState().zoom as { value: number }).value;
       if (Math.abs(zoom - lastZoomRef.current) < 0.001) return;
@@ -228,7 +231,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       debounceRef.current = setTimeout(() => {
         const api2 = apiRef.current;
         const flat2 = flatRef.current;
-        if (!api2 || !flat2) return;
+        if (!api2 || !flat2 || drilldownActiveRef.current) return;
         const z = (api2.getAppState().zoom as { value: number }).value;
         const updated = applyZoomAndGit(flat2, z, gitRef.current, claudeRef.current);
         flatRef.current = { ...flat2, elements: updated };
@@ -243,6 +246,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
   useEffect(() => {
     window.electronAPI.onGitStatus((changedNames: string[]) => {
       gitRef.current = changedNames;
+      if (drilldownActiveRef.current) return; // don't overwrite drilldown scene
       const api  = apiRef.current;
       const flat = flatRef.current;
       if (!api || !flat) return;
@@ -260,6 +264,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     window.electronAPI.onClaudeChanges((changes: ClaudeHighlights) => {
       claudeRef.current = changes;
       gitRef.current = null;
+      if (drilldownActiveRef.current) return; // don't overwrite drilldown scene
       const api  = apiRef.current;
       const flat = flatRef.current;
       if (!api || !flat) return;
@@ -359,7 +364,9 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     if (!api || !drilldownActiveRef.current) return;
     drilldownActiveRef.current = false;
     onDrilldownChange?.(false);
+    // Restore base elements and reset fingerprint so zoom/git can resume
     api.updateScene({ elements: baseElementsRef.current as unknown as EXEl[] });
+    lastDiagramKey.current = ''; // force re-fingerprint so scene-load effect re-runs if needed
     setTimeout(() => {
       const els = api.getSceneElements().filter(e => (e.opacity ?? 100) > 0);
       if (els.length > 0) api.scrollToContent(els as EXEl[], { fitToContent: true, animate: true });
