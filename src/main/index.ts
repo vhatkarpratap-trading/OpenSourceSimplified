@@ -662,20 +662,69 @@ ipcMain.handle('component:detail', async (_e, name: string) => {
 // ── Component drilldown ───────────────────────────────────────────────────────
 
 /**
- * Find the best-matching file path for a component name.
- * Tries: exact nodePaths key, then case-insensitive, then substring match.
+ * Find source files relevant to a component name.
+ * Scores every source file by name-match + occurrence count, returns top 3.
+ * Searches the full project tree (not just the 80-file index) so concept-level
+ * labels like "SimEngine" that span multiple files are handled correctly.
+ * Never returns empty — if nothing scores > 0 returns [] and caller uses
+ * project structure as fallback context.
  */
-function resolveComponentPath(name: string, nodePaths: Record<string, string>): string | null {
-  // Exact match
-  if (nodePaths[name]) return nodePaths[name];
+function findSourceFiles(
+  name: string,
+  nodePaths: Record<string, string>,
+  projectRoot: string,
+): { filePath: string; content: string }[] {
   const lc = name.toLowerCase();
-  // Case-insensitive exact
-  const ci = Object.keys(nodePaths).find(k => k.toLowerCase() === lc);
-  if (ci) return nodePaths[ci];
-  // Substring: component name contained in file name (e.g. "AuthViewModel" → "AuthViewModel.kt")
-  const sub = Object.keys(nodePaths).find(k => k.toLowerCase().includes(lc) || lc.includes(k.toLowerCase().replace(/\.[^.]+$/, '')));
-  if (sub) return nodePaths[sub];
-  return null;
+  const SOURCE_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.kt', '.java', '.py', '.swift', '.dart', '.go', '.rs', '.vue', '.cs']);
+  const IGNORE = new Set(['node_modules', 'dist', 'build', '.git', '.dart_tool', 'Pods', '.next', 'out', 'target', '__pycache__', 'coverage']);
+
+  const read = (fp: string): string => { try { return fs.readFileSync(fp, 'utf8'); } catch { return ''; } };
+
+  const scoreFile = (fileName: string, content: string): number => {
+    const fn = fileName.toLowerCase().replace(/\.[^.]+$/, '');
+    let s = 0;
+    if (fn === lc) s += 100;
+    else if (fn.includes(lc) || lc.includes(fn)) s += 50;
+    try {
+      const re = new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+      s += Math.min((content.match(re) || []).length * 3, 45);
+    } catch { /* ignore invalid regex */ }
+    return s;
+  };
+
+  const seen = new Set<string>();
+  const results: { filePath: string; content: string; score: number }[] = [];
+
+  const add = (fp: string, fileName: string) => {
+    if (seen.has(fp)) return;
+    seen.add(fp);
+    const content = read(fp);
+    const s = scoreFile(fileName, content);
+    if (s > 0) results.push({ filePath: fp, content, score: s });
+  };
+
+  // Score indexed files first (fast)
+  for (const [fileName, fp] of Object.entries(nodePaths)) add(fp, fileName);
+
+  // If best score so far is low, walk the full project tree
+  const bestSoFar = results.reduce((m, r) => Math.max(m, r.score), 0);
+  if (bestSoFar < 20 && fs.existsSync(projectRoot)) {
+    const walk = (dir: string, depth: number) => {
+      if (depth > 7) return;
+      let entries: fs.Dirent[];
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        if (e.isDirectory() && !IGNORE.has(e.name) && !e.name.startsWith('.'))
+          walk(path.join(dir, e.name), depth + 1);
+        else if (e.isFile() && SOURCE_EXTS.has(path.extname(e.name).toLowerCase()))
+          add(path.join(dir, e.name), e.name);
+      }
+    };
+    walk(projectRoot, 0);
+  }
+
+  results.sort((a, b) => b.score - a.score);
+  return results.slice(0, 3).filter(r => r.score > 0).map(r => ({ filePath: r.filePath, content: r.content }));
 }
 
 function buildDrilldownPrompt(name: string, sourceCode: string, imports: string[], calledBy: string[]): string {
@@ -708,7 +757,7 @@ function buildDrilldownPrompt(name: string, sourceCode: string, imports: string[
     '',
     `SOURCE CODE of ${name}:`,
     '```',
-    sourceCode.slice(0, 6000),
+    sourceCode.slice(0, 7000),
     '```',
     '',
     'JSON only.',
@@ -719,50 +768,50 @@ ipcMain.handle('component:drilldown', async (_e, rawName: string) => {
   const name = rawName.trim();
   if (!currentFolder || !name) return { error: 'no component' };
   try {
-    // Cache check
     const cached = loadCache(currentFolder);
     if (cached?.drilldowns?.[name]) {
       return { ok: true, mermaid: cached.drilldowns[name], fromCache: true };
     }
 
     const structure = extractStructure(currentFolder);
+    const sourceFiles = findSourceFiles(name, structure.nodePaths, currentFolder);
 
-    // Read the actual source file for this component
-    const filePath = resolveComponentPath(name, structure.nodePaths);
+    // Combine source from top matching files (cap at 8000 chars total)
     let sourceCode = '';
-    if (filePath) {
-      try { sourceCode = fs.readFileSync(filePath, 'utf8'); } catch { /* ignore */ }
+    const usedFiles: string[] = [];
+    let budget = 8000;
+    for (const { filePath, content } of sourceFiles) {
+      const rel = path.relative(currentFolder, filePath);
+      const chunk = content.slice(0, budget);
+      sourceCode += `\n// ── ${rel} ──\n${chunk}`;
+      usedFiles.push(rel);
+      budget -= chunk.length;
+      if (budget <= 0) break;
     }
 
-    // If we couldn't find a single file, fall back to searching all files for the name
-    if (!sourceCode) {
-      for (const [, fp] of Object.entries(structure.nodePaths)) {
-        try {
-          const content = fs.readFileSync(fp, 'utf8');
-          if (content.includes(name)) { sourceCode = content; break; }
-        } catch { /* ignore */ }
-      }
-    }
+    // Fall back to project structure when no source found
+    const contextForClaude = sourceCode.trim()
+      ? sourceCode
+      : `// No source file found for "${name}" — using project structure for context.\n${toClaudePromptJSON(structure).slice(0, 4000)}`;
 
-    if (!sourceCode) {
-      return { error: `Could not find source code for "${name}"` };
-    }
-
-    // Find what calls this component (reverse dependency)
+    // Reverse dependencies: which files mention this component
+    const usedSet = new Set(sourceFiles.map(f => f.filePath));
     const calledBy: string[] = [];
     for (const [fname, fp] of Object.entries(structure.nodePaths)) {
-      if (fp === filePath) continue;
+      if (usedSet.has(fp)) continue;
       try {
-        const content = fs.readFileSync(fp, 'utf8');
-        if (content.includes(name)) calledBy.push(fname.replace(/\.[^.]+$/, ''));
+        if (fs.readFileSync(fp, 'utf8').includes(name))
+          calledBy.push(fname.replace(/\.[^.]+$/, ''));
       } catch { /* ignore */ }
     }
 
-    // Extract imports from source
     const importMatches = sourceCode.match(/import\s+.*?['"][^'"]+['"]/g) || [];
-    const imports = importMatches.slice(0, 12).map(m => m.replace(/^import\s+.*?from\s+['"]/, '').replace(/['"].*/, '').split('/').pop() || '');
+    const imports = [...new Set(importMatches.slice(0, 12)
+      .map(m => m.replace(/^import\s+.*?from\s+['"]/, '').replace(/['"].*/, '').split('/').pop() || ''))].filter(Boolean);
 
-    const prompt = buildDrilldownPrompt(name, sourceCode, imports, calledBy.slice(0, 8));
+    console.log(`[drilldown] "${name}" files:[${usedFiles.join(',')}] calledBy:[${calledBy.slice(0, 5).join(',')}]`);
+
+    const prompt = buildDrilldownPrompt(name, contextForClaude, imports, calledBy.slice(0, 8));
     const raw = await runCapture(prompt, currentFolder);
     const parsed = extractJson(raw) as { mermaid?: string } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
