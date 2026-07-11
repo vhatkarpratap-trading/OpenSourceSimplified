@@ -129,10 +129,10 @@ function buildNodeIds(elements: ExcalidrawElement[], layerIds: Set<string>): Rec
     if (el.type === 'text') {
       const boundTo = (el as { containerId?: string | null }).containerId;
       if (boundTo && layerIds.has(boundTo)) continue;        // skip layer titles
-      add((el as { text: string }).text, el.id);
+      add(((el as { text: string }).text || '').trim(), el.id);
     } else if (el.type === 'rectangle') {
       const label = containerText.get(el.id);
-      if (label) add(label, el.id);
+      if (label) add(label.trim(), el.id);
     }
   }
   return nodeIds;

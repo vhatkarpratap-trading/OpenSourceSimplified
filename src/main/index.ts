@@ -715,7 +715,8 @@ function buildDrilldownPrompt(name: string, sourceCode: string, imports: string[
   ].filter(Boolean).join('\n');
 }
 
-ipcMain.handle('component:drilldown', async (_e, name: string) => {
+ipcMain.handle('component:drilldown', async (_e, rawName: string) => {
+  const name = rawName.trim();
   if (!currentFolder || !name) return { error: 'no component' };
   try {
     // Cache check

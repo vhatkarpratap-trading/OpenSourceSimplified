@@ -397,25 +397,41 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     if (clearDrilldownRef) clearDrilldownRef.current = clearDrilldown;
   }, [clearDrilldown, clearDrilldownRef]);
 
-  const renderDrilldown = useCallback(async (name: string) => {
+  const renderDrilldown = useCallback(async (rawName: string) => {
+    const name = rawName.trim();
     const api = apiRef.current;
-    if (!api || drillBusyRef.current) return;
+    if (!api) return;
+
+    // Reset stuck busy flag — if a previous drill failed mid-way drillBusyRef
+    // could be left true, blocking all future drills.
+    drillBusyRef.current = false;
     drillBusyRef.current = true;
+
+    console.log('[drill] starting drill for:', name);
+    console.log('[drill] idToNameRef entries:', Object.entries(idToNameRef.current).slice(0, 20));
 
     // Snapshot the full current scene before we add to it
     const currentEls = api.getSceneElements() as unknown as ExcalidrawElement[];
 
-    // Find the selected component's box anywhere on the current canvas
-    // (works for both base nodes and previously drilled nodes)
-    const nodeElIds = new Set(idToNameRef.current
-      ? Object.entries(idToNameRef.current)
-          .filter(([, n]) => n === name)
-          .map(([id]) => id)
-      : []);
-    const box = currentEls.find(e =>
-      (nodeElIds.has(e.id) || (e as ExcalidrawElement & { customData?: { drillName?: string } }).customData?.drillName === name)
-      && e.type === 'rectangle'
-    ) as (ExcalidrawElement & { x: number; y: number; width: number; height: number }) | undefined;
+    // Find the selected component's box anywhere on the current canvas.
+    // Match by: idToNameRef lookup, customData.drillName, or text content of any rectangle's label.
+    const nameLC = name.toLowerCase();
+    const matchingIds = Object.entries(idToNameRef.current)
+      .filter(([, n]) => n.toLowerCase() === nameLC)
+      .map(([id]) => id);
+    const nodeElIds = new Set(matchingIds);
+
+    console.log('[drill] matching ids for', name, ':', matchingIds);
+
+    const box = currentEls.find(e => {
+      if (e.type !== 'rectangle') return false;
+      if (nodeElIds.has(e.id)) return true;
+      // Also match by drillName tag on drilled nodes
+      const dn = (e as ExcalidrawElement & { customData?: { drillName?: string } }).customData?.drillName;
+      return dn && dn.toLowerCase() === nameLC;
+    }) as (ExcalidrawElement & { x: number; y: number; width: number; height: number }) | undefined;
+
+    console.log('[drill] box found:', !!box, box ? `at (${box.x},${box.y})` : '');
 
     // Show loading indicator to the right of the selected box
     const allRects = currentEls.filter(e => e.type === 'rectangle') as (ExcalidrawElement & { x: number; y: number; width: number; height: number })[];
@@ -580,11 +596,17 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       clearSelection();
       return;
     }
-    const name = selectedIds.map(id => idToNameRef.current[id]).find(Boolean);
+    // Find the first selected element that maps to a known component name
+    let name: string | undefined;
+    for (const id of selectedIds) {
+      const n = idToNameRef.current[id];
+      if (n) { name = n; break; }
+    }
     if (!name) { clearSelection(); return; }
     if (name === selectedNameRef.current) return;
     selectedNameRef.current = name;
-    onSelectionChange?.(name);
+    console.log('[canvas] selected component:', name, '— ids:', selectedIds);
+    onSelectionChange?.(name.trim());
   }, [clearSelection, onSelectionChange]);
 
   const handleAPI = useCallback((api: ExcalidrawImperativeAPI) => {
