@@ -40,8 +40,9 @@ export default function App() {
   const [activeKind, setActiveKind]         = useState<DiagramKind>('structure');
   const [renderError, setRenderError]       = useState<string | null>(null);
   const [drilldownActive, setDrilldownActive] = useState(false);
+  const [drillDepth, setDrillDepth]           = useState(0);
   const [selectedComponent, setSelectedComponent] = useState<string | null>(null);
-  const [drilling, setDrilling]             = useState(false);
+  const [drilling, setDrilling]               = useState(false);
 
   const excalidrawAPIRef  = useRef<ExcalidrawImperativeAPI | null>(null);
   const clearDrilldownRef = useRef<(() => void) | null>(null);
@@ -99,13 +100,14 @@ export default function App() {
 
   const handleBack = useCallback(() => {
     clearDrilldownRef.current?.();
-    setDrilldownActive(false);
+    setDrillDepth(d => Math.max(0, d - 1));
   }, []);
 
   const handleDrill = useCallback(async () => {
     if (!selectedComponent || drilling) return;
     setDrilling(true);
-    renderDrilldownRef.current?.(selectedComponent);
+    await renderDrilldownRef.current?.(selectedComponent);
+    setDrillDepth(d => d + 1);
     setDrilling(false);
   }, [selectedComponent, drilling]);
 
@@ -288,10 +290,10 @@ export default function App() {
                 display: 'flex', alignItems: 'center', gap: 4,
                 padding: '3px 10px', fontSize: 11, borderRadius: 5,
                 fontFamily: 'system-ui, -apple-system, sans-serif',
-                border: '1px solid #7c3aed', background: '#f5f3ff',
-                color: '#5b21b6', cursor: 'pointer', flexShrink: 0,
+                border: '1px solid #1a73b5', background: '#e0f2fe',
+                color: '#0369a1', cursor: 'pointer', flexShrink: 0,
               }}>
-                ← Back
+                ← Back {drillDepth > 1 ? `(${drillDepth} levels)` : ''}
               </button>
             )}
 
@@ -347,7 +349,7 @@ export default function App() {
               activeKind={activeKind}
               onAPIReady={(api) => { excalidrawAPIRef.current = api; }}
               onRenderError={setRenderError}
-              onDrilldownChange={setDrilldownActive}
+              onDrilldownChange={(active) => { setDrilldownActive(active); if (!active) setDrillDepth(0); }}
               onSelectionChange={setSelectedComponent}
               clearDrilldownRef={clearDrilldownRef}
               renderDrilldownRef={renderDrilldownRef}

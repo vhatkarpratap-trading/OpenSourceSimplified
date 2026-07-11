@@ -132,8 +132,10 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
   const idToNameRef        = useRef<Record<string, string>>({});
   const selectedNameRef    = useRef<string | null>(null);
   const drillBusyRef       = useRef(false);
+  // drilldownActiveRef is true whenever drillStackRef has entries
   const drilldownActiveRef = useRef(false);
-  const baseElementsRef    = useRef<ExcalidrawElement[]>([]);
+  // Stack of scene snapshots — each push saves the full element list before adding a drill level
+  const drillStackRef      = useRef<ExcalidrawElement[][]>([]);
 
   // Load scene when data, active diagram kind, or API changes
   useEffect(() => {
@@ -359,16 +361,34 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
 
   // ── Inline drilldown ──────────────────────────────────────────────────────────
 
+  // Pop one drill level (Back button). If stack empties, exit drill mode.
   const clearDrilldown = useCallback(() => {
     const api = apiRef.current;
-    if (!api || !drilldownActiveRef.current) return;
-    drilldownActiveRef.current = false;
-    onDrilldownChange?.(false);
-    // Restore base elements and reset fingerprint so zoom/git can resume
-    api.updateScene({ elements: baseElementsRef.current as unknown as EXEl[] });
-    lastDiagramKey.current = ''; // force re-fingerprint so scene-load effect re-runs if needed
+    if (!api || drillStackRef.current.length === 0) return;
+
+    drillStackRef.current.pop();
+    const prev = drillStackRef.current[drillStackRef.current.length - 1] ?? null;
+
+    if (prev) {
+      // Restore previous drill level
+      api.updateScene({ elements: prev as unknown as EXEl[] });
+    } else {
+      // Stack empty — fully exit drilldown, restore base scene
+      drilldownActiveRef.current = false;
+      onDrilldownChange?.(false);
+      lastDiagramKey.current = ''; // allow scene-load effect to re-run
+      // Restore base elements from flatRef
+      const flat = flatRef.current;
+      if (flat) {
+        const els = applyZoomAndGit(flat, lastZoomRef.current, gitRef.current, claudeRef.current);
+        api.updateScene({ elements: els as unknown as EXEl[] });
+      } else {
+        api.resetScene();
+      }
+    }
+
     setTimeout(() => {
-      const els = api.getSceneElements().filter(e => (e.opacity ?? 100) > 0);
+      const els = api.getSceneElements().filter(e => (e.opacity ?? 100) > 5);
       if (els.length > 0) api.scrollToContent(els as EXEl[], { fitToContent: true, animate: true });
     }, 100);
   }, [onDrilldownChange]);
@@ -378,40 +398,43 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
   }, [clearDrilldown, clearDrilldownRef]);
 
   const renderDrilldown = useCallback(async (name: string) => {
-    const api  = apiRef.current;
-    const flat = flatRef.current;
-    if (!api || !flat || drillBusyRef.current) return;
-
+    const api = apiRef.current;
+    if (!api || drillBusyRef.current) return;
     drillBusyRef.current = true;
 
+    // Snapshot the full current scene before we add to it
     const currentEls = api.getSceneElements() as unknown as ExcalidrawElement[];
-    const baseEls = currentEls.filter(e =>
-      !e.id.startsWith('detail-') && !e.id.startsWith('drill-')
-    );
 
-    const nodeElIds = new Set(flat.nodeIds[name] || []);
-    const box = baseEls.find(e => nodeElIds.has(e.id) && e.type === 'rectangle') as
-      (ExcalidrawElement & { x: number; y: number; width: number; height: number }) | undefined;
+    // Find the selected component's box anywhere on the current canvas
+    // (works for both base nodes and previously drilled nodes)
+    const nodeElIds = new Set(idToNameRef.current
+      ? Object.entries(idToNameRef.current)
+          .filter(([, n]) => n === name)
+          .map(([id]) => id)
+      : []);
+    const box = currentEls.find(e =>
+      (nodeElIds.has(e.id) || (e as ExcalidrawElement & { customData?: { drillName?: string } }).customData?.drillName === name)
+      && e.type === 'rectangle'
+    ) as (ExcalidrawElement & { x: number; y: number; width: number; height: number }) | undefined;
 
-    // Show loading indicator
-    let seed = 9000000;
-    const loadX = box ? box.x + box.width + 80 : 800;
-    const loadY = box ? box.y : 200;
-    const dimmed = baseEls.map(e => {
-      const base = (e as ExcalidrawElement & { _baseOpacity?: number })._baseOpacity ?? 100;
-      return { ...e, opacity: nodeElIds.has(e.id) ? base : Math.max(1, Math.floor(base * 0.15)) };
-    });
-    api.updateScene({ elements: [...dimmed, {
-      type: 'rectangle', id: 'drill-loading',
-      x: loadX, y: loadY, width: 240, height: 44,
+    // Show loading indicator to the right of the selected box
+    const allRects = currentEls.filter(e => e.type === 'rectangle') as (ExcalidrawElement & { x: number; y: number; width: number; height: number })[];
+    const maxX = allRects.reduce((m, e) => Math.max(m, e.x + e.width), box ? box.x + box.width : 0);
+    const loadX = maxX + 80;
+    const loadY = box ? box.y : allRects.reduce((m, e) => Math.min(m, e.y), 200);
+
+    let seed = 9000000 + drillStackRef.current.length * 100000;
+    const loadingEls: unknown[] = [{
+      type: 'rectangle', id: `drill-loading-${seed}`,
+      x: loadX, y: loadY, width: 220, height: 40,
       strokeColor: '#1a73b5', backgroundColor: '#e0f2fe',
       fillStyle: 'solid', strokeWidth: 2, strokeStyle: 'dashed',
       angle: 0, roughness: 0, opacity: 100, roundness: { type: 3 }, groupIds: [],
       frameId: null, seed: seed++, version: 1, versionNonce: seed++,
       isDeleted: false, boundElements: [], updated: Date.now(), link: null, locked: false,
     }, {
-      type: 'text', id: 'drill-loading-text',
-      x: loadX + 12, y: loadY + 12, width: 216, height: 20,
+      type: 'text', id: `drill-loading-text-${seed}`,
+      x: loadX + 10, y: loadY + 11, width: 200, height: 18,
       text: `Drilling into ${name}…`, originalText: `Drilling into ${name}…`,
       fontSize: 12, fontFamily: 2, textAlign: 'left', verticalAlign: 'top',
       strokeColor: '#0369a1', backgroundColor: 'transparent',
@@ -420,7 +443,8 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       frameId: null, seed: seed++, version: 1, versionNonce: seed++,
       isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false,
       containerId: null, lineHeight: 1.25, baseline: 10,
-    }] as unknown as EXEl[] });
+    }];
+    api.updateScene({ elements: [...currentEls, ...loadingEls] as unknown as EXEl[] });
 
     try {
       const res = await window.electronAPI.getComponentDrilldown(name);
@@ -429,30 +453,53 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       const { buildMermaidScene: bms } = await import('./mermaidScene');
       const drillScene = await bms(res.mermaid);
 
-      // Place drilldown to the right of all base elements
-      const rects = baseEls.filter(e => e.type === 'rectangle') as (ExcalidrawElement & { x: number; y: number; width: number; height: number })[];
-      const maxX = rects.reduce((m, e) => Math.max(m, e.x + e.width), 0);
-      const minY = rects.reduce((m, e) => Math.min(m, e.y), Infinity);
-      const offsetX = maxX + 120;
-      const offsetY = isFinite(minY) ? minY : 0;
+      // Place new drill panel to the right of everything currently on canvas
+      const freshEls = api.getSceneElements() as unknown as ExcalidrawElement[];
+      const freshRects = freshEls.filter(e =>
+        e.type === 'rectangle' && !e.id.startsWith('drill-loading')
+      ) as (ExcalidrawElement & { x: number; y: number; width: number; height: number })[];
+      const panelOffsetX = freshRects.reduce((m, e) => Math.max(m, e.x + e.width), 0) + 100;
+      const panelOffsetY = freshRects.reduce((m, e) => Math.min(m, e.y), Infinity);
+      const panelY = isFinite(panelOffsetY) ? panelOffsetY : 0;
 
-      seed = 9100000;
+      // Give each element in this drill level a unique id using depth + index
+      const depth = drillStackRef.current.length;
+      seed = 9000000 + depth * 100000;
+
       const drillEls = drillScene.elements.map((e, i) => ({
         ...e,
-        id: `drill-${i}-${e.id}`,
-        x: (e as { x: number }).x + offsetX,
-        y: (e as { y: number }).y + offsetY,
+        id: `drill-d${depth}-${i}-${e.id}`,
+        x: (e as { x: number }).x + panelOffsetX,
+        y: (e as { y: number }).y + panelY,
         _baseOpacity: 100,
         opacity: 100,
+        customData: {
+          ...(e as { customData?: object }).customData,
+          drillDepth: depth,
+          // Tag each node with its label so future drills can find it
+          drillName: (e as { type?: string }).type === 'rectangle'
+            ? (() => {
+                // extract label from the matching text element
+                const textEl = drillScene.elements.find(t =>
+                  (t as { type?: string; containerId?: string }).type === 'text' &&
+                  (t as { containerId?: string }).containerId === (e as { id: string }).id
+                );
+                return textEl ? (textEl as { text?: string }).text?.split('\n')[0].trim() : undefined;
+              })()
+            : undefined,
+        },
       })) as unknown as ExcalidrawElement[];
 
-      // Dashed connector from selected node to drilldown area
-      const drillMinX = drillEls.reduce((m, e) => Math.min(m, (e as { x: number }).x), Infinity);
-      const drillMidY = drillEls.filter(e => e.type === 'rectangle')
+      // Dashed connector from selected box to first node of drill panel
+      const drillMinX = drillEls
+        .filter(e => e.type === 'rectangle')
+        .reduce((m, e) => Math.min(m, (e as { x: number }).x), Infinity);
+      const drillMidY = drillEls
+        .filter(e => e.type === 'rectangle')
         .reduce((acc, e, _, arr) => acc + ((e as { y: number; height: number }).y + (e as { height: number }).height / 2) / arr.length, 0);
 
-      const connectors: unknown[] = box ? [{
-        type: 'arrow', id: 'drill-connector',
+      const connEls: unknown[] = box ? [{
+        type: 'arrow', id: `drill-conn-d${depth}`,
         x: box.x + box.width, y: box.y + box.height / 2,
         width: drillMinX - (box.x + box.width),
         height: drillMidY - (box.y + box.height / 2),
@@ -466,10 +513,11 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       }] : [];
 
       const labelEls: unknown[] = [{
-        type: 'text', id: 'drill-label',
-        x: offsetX, y: offsetY - 28, width: 320, height: 20,
-        text: `◆ ${name}`, originalText: `◆ ${name}`,
-        fontSize: 14, fontFamily: 2, textAlign: 'left', verticalAlign: 'top',
+        type: 'text', id: `drill-label-d${depth}`,
+        x: panelOffsetX, y: panelY - 26, width: 320, height: 20,
+        text: `${'▸ '.repeat(depth + 1)}${name}`,
+        originalText: `${'▸ '.repeat(depth + 1)}${name}`,
+        fontSize: 13, fontFamily: 2, textAlign: 'left', verticalAlign: 'top',
         strokeColor: '#0369a1', backgroundColor: 'transparent',
         fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
         angle: 0, roughness: 0, opacity: 100, roundness: null, groupIds: [],
@@ -478,21 +526,45 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
         containerId: null, lineHeight: 1.25, baseline: 10,
       }];
 
-      baseElementsRef.current = dimmed as ExcalidrawElement[];
+      // Remove loading placeholder, add drill panel
+      const withoutLoading = (api.getSceneElements() as unknown as ExcalidrawElement[])
+        .filter(e => !e.id.startsWith('drill-loading'));
+      const finalEls = [...withoutLoading, ...connEls, ...labelEls, ...drillEls];
+
+      // Push snapshot BEFORE adding the new drill level (so Back restores to current state)
+      drillStackRef.current.push(withoutLoading as ExcalidrawElement[]);
+
+      // Extend idToNameRef with new nodes so they can be selected + drilled further
+      for (const e of drillEls) {
+        const dn = (e as ExcalidrawElement & { customData?: { drillName?: string } }).customData?.drillName;
+        if (dn && e.type === 'rectangle') idToNameRef.current[e.id] = dn;
+      }
+      // Also index text elements
+      for (const e of drillEls) {
+        if (e.type === 'text') {
+          const text = (e as { text?: string }).text?.split('\n')[0].trim();
+          if (text) idToNameRef.current[e.id] = text;
+        }
+      }
+
       drilldownActiveRef.current = true;
       onDrilldownChange?.(true);
 
-      api.updateScene({ elements: [...dimmed, ...connectors, ...labelEls, ...drillEls] as unknown as EXEl[] });
+      api.updateScene({ elements: finalEls as unknown as EXEl[] });
       setTimeout(() => {
-        const visible = api.getSceneElements().filter(e => (e.opacity ?? 100) > 5);
-        if (visible.length > 0) api.scrollToContent(visible as EXEl[], { fitToContent: true, animate: true });
+        // Scroll to show the new drill panel
+        const newPanelEls = (finalEls as ExcalidrawElement[]).filter((e: ExcalidrawElement) =>
+          e.id.startsWith(`drill-d${depth}`) || e.id === `drill-conn-d${depth}` || e.id === `drill-label-d${depth}`
+        );
+        if (newPanelEls.length > 0)
+          api.scrollToContent(newPanelEls as unknown as EXEl[], { fitToContent: false, animate: true });
       }, 150);
 
     } catch {
-      // Restore on failure
-      api.updateScene({ elements: baseEls.map(e => ({
-        ...e, opacity: (e as ExcalidrawElement & { _baseOpacity?: number })._baseOpacity ?? 100,
-      })) as unknown as EXEl[] });
+      // Remove loading indicator on failure, restore clean state
+      const withoutLoading = (api.getSceneElements() as unknown as ExcalidrawElement[])
+        .filter(e => !e.id.startsWith('drill-loading'));
+      api.updateScene({ elements: withoutLoading as unknown as EXEl[] });
     } finally {
       drillBusyRef.current = false;
     }
