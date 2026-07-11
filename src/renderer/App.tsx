@@ -39,6 +39,11 @@ export default function App() {
   } | null>(null);
   const [activeKind, setActiveKind] = useState<DiagramKind>('structure');
   const [renderError, setRenderError] = useState<string | null>(null);
+
+  // Drilldown: when user double-clicks a component we swap the canvas to a
+  // detailed sub-diagram. drilldownDiagram holds the active drilldown; null = top-level view.
+  const [drilldownDiagram, setDrilldownDiagram] = useState<{ name: string; diagram: DiagramData } | null>(null);
+
   const excalidrawAPIRef = useRef<ExcalidrawImperativeAPI | null>(null);
   const listenersAttached = useRef(false);
 
@@ -87,7 +92,25 @@ export default function App() {
 
   const folderName = folder ? folder.split('/').filter(Boolean).pop() : null;
   const busy = status === 'running' || status === 'patching';
-  const canvasLabel = diagram ? diagram.pattern : 'Canvas';
+  const activeDiagram = drilldownDiagram ? drilldownDiagram.diagram : diagram;
+  const canvasLabel = drilldownDiagram
+    ? drilldownDiagram.name
+    : (diagram ? diagram.pattern : 'Canvas');
+
+  const handleDrilldown = useCallback((componentName: string, mermaid: string) => {
+    const dd: DiagramData = {
+      pattern: componentName,
+      diagrams: { structure: mermaid },
+    };
+    setDrilldownDiagram({ name: componentName, diagram: dd });
+    setActiveKind('structure');
+    setRenderError(null);
+  }, []);
+
+  const handleBack = useCallback(() => {
+    setDrilldownDiagram(null);
+    setRenderError(null);
+  }, []);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', width: '100vw', height: '100vh', background: '#0f0f1a' }}>
@@ -240,37 +263,54 @@ export default function App() {
             borderBottom: '1px solid #ebebf5',
             flexShrink: 0, userSelect: 'none',
           }}>
+            {/* Back button — shown only when drilling into a component */}
+            {drilldownDiagram && (
+              <button onClick={handleBack} style={{
+                display: 'flex', alignItems: 'center', gap: 4,
+                padding: '3px 10px', fontSize: 11, borderRadius: 5,
+                fontFamily: 'system-ui, -apple-system, sans-serif',
+                border: '1px solid #7c3aed', background: '#f5f3ff',
+                color: '#5b21b6', cursor: 'pointer', flexShrink: 0,
+              }}>
+                ← Back
+              </button>
+            )}
+
             <span style={{
-              fontSize: 10, color: '#aaaabc', letterSpacing: '0.1em', textTransform: 'uppercase',
+              fontSize: 10, color: drilldownDiagram ? '#5b21b6' : '#aaaabc',
+              letterSpacing: '0.1em', textTransform: 'uppercase',
               fontFamily: 'system-ui, -apple-system, sans-serif',
+              fontWeight: drilldownDiagram ? 600 : 400,
             }}>
               {canvasLabel}
             </span>
 
-            {/* Diagram-type switcher */}
-            <div style={{ display: 'flex', gap: 4, marginLeft: 'auto' }}>
-              {DIAGRAM_TABS.map(({ kind, label }) => {
-                const available = !!diagram?.diagrams?.[kind];
-                const active = activeKind === kind;
-                return (
-                  <button
-                    key={kind}
-                    disabled={!available}
-                    onClick={() => { setActiveKind(kind); setRenderError(null); }}
-                    style={{
-                      padding: '3px 10px', fontSize: 11, borderRadius: 5,
-                      fontFamily: 'system-ui, -apple-system, sans-serif',
-                      border: active ? '1px solid #7c3aed' : '1px solid #e0e0e8',
-                      background: active ? '#f5f3ff' : '#ffffff',
-                      color: active ? '#5b21b6' : available ? '#666688' : '#c8c8d4',
-                      cursor: available ? 'pointer' : 'not-allowed',
-                    }}
-                  >
-                    {label}
-                  </button>
-                );
-              })}
-            </div>
+            {/* Diagram-type switcher — hidden during drilldown */}
+            {!drilldownDiagram && (
+              <div style={{ display: 'flex', gap: 4, marginLeft: 'auto' }}>
+                {DIAGRAM_TABS.map(({ kind, label }) => {
+                  const available = !!diagram?.diagrams?.[kind];
+                  const active = activeKind === kind;
+                  return (
+                    <button
+                      key={kind}
+                      disabled={!available}
+                      onClick={() => { setActiveKind(kind); setRenderError(null); }}
+                      style={{
+                        padding: '3px 10px', fontSize: 11, borderRadius: 5,
+                        fontFamily: 'system-ui, -apple-system, sans-serif',
+                        border: active ? '1px solid #7c3aed' : '1px solid #e0e0e8',
+                        background: active ? '#f5f3ff' : '#ffffff',
+                        color: active ? '#5b21b6' : available ? '#666688' : '#c8c8d4',
+                        cursor: available ? 'pointer' : 'not-allowed',
+                      }}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
           {renderError && (
@@ -284,10 +324,11 @@ export default function App() {
           )}
           <div style={{ flex: 1, overflow: 'hidden' }}>
             <Canvas
-              diagramData={diagram}
+              diagramData={activeDiagram}
               activeKind={activeKind}
               onAPIReady={(api) => { excalidrawAPIRef.current = api; }}
               onRenderError={setRenderError}
+              onDrilldown={handleDrilldown}
             />
           </div>
         </div>

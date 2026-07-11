@@ -17,6 +17,7 @@ declare global {
       openFolder: () => Promise<{ folder: string; hasCachedDiagram: boolean } | null>;
       runAnalysis: () => Promise<{ ok?: boolean; error?: string }>;
       getComponentDetail: (name: string) => Promise<{ ok?: boolean; error?: string; detail?: ComponentDetail }>;
+      getComponentDrilldown: (name: string) => Promise<{ ok?: boolean; error?: string; mermaid?: string }>;
       onDiagram: (cb: (diagram: DiagramData | null) => void) => void;
       onAnalysisStatus: (cb: (status: string) => void) => void;
       onAnalysisStatusDetail: (cb: (detail: string) => void) => void;

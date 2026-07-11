@@ -10,6 +10,7 @@ interface CanvasProps {
   activeKind?: DiagramKind;
   onAPIReady?: (api: ExcalidrawImperativeAPI) => void;
   onRenderError?: (message: string | null) => void;
+  onDrilldown?: (componentName: string, mermaid: string) => void;
 }
 
 interface GitAnnotation { name: string; summary: string; added: number; removed: number }
@@ -112,7 +113,7 @@ function applyZoomAndGit(
   });
 }
 
-export default function Canvas({ diagramData, activeKind = 'structure', onAPIReady, onRenderError }: CanvasProps) {
+export default function Canvas({ diagramData, activeKind = 'structure', onAPIReady, onRenderError, onDrilldown }: CanvasProps) {
   const [apiReady, setApiReady] = useState(false);
   const apiRef          = useRef<ExcalidrawImperativeAPI | null>(null);
   const lastDataRef     = useRef<DiagramData | null>(null);
@@ -128,6 +129,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
   const idToNameRef     = useRef<Record<string, string>>({});  // element id → component name
   const selectedNameRef = useRef<string | null>(null);          // currently expanded component
   const detailBusyRef   = useRef(false);
+  const lastClickRef    = useRef<{ name: string; time: number } | null>(null);  // double-click tracking
 
   // Load scene when data, active diagram kind, or API changes
   useEffect(() => {
@@ -474,16 +476,39 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
   const handleChange = useCallback((_els: readonly EXEl[], appState: { selectedElementIds?: Record<string, boolean> }) => {
     const selectedIds = Object.keys(appState.selectedElementIds || {}).filter(id => appState.selectedElementIds![id]);
     if (selectedIds.length === 0) {
-      // Deselected → collapse detail (only if one was open)
       if (selectedNameRef.current) clearDetail();
       return;
     }
-    // Map the first selected element to a component name
     const name = selectedIds.map(id => idToNameRef.current[id]).find(Boolean);
     if (!name) return;
-    if (name === selectedNameRef.current) return; // already showing this one
+
+    const now = Date.now();
+    const last = lastClickRef.current;
+
+    // Double-click: same component clicked within 400ms
+    if (last && last.name === name && now - last.time < 400) {
+      lastClickRef.current = null;
+      // Trigger drilldown — show loading state on the card, then fetch
+      if (onDrilldown && !detailBusyRef.current) {
+        detailBusyRef.current = true;
+        renderDetailCard(name, { title: name, summary: '⏳ Loading detailed view…', does: [], talksTo: [] });
+        window.electronAPI.getComponentDrilldown(name).then(res => {
+          detailBusyRef.current = false;
+          if (res?.ok && res.mermaid) {
+            onDrilldown(name, res.mermaid);
+          } else {
+            renderDetailCard(name, { title: name, summary: 'Could not load detailed view.', does: [], talksTo: [] });
+          }
+        });
+      }
+      return;
+    }
+
+    lastClickRef.current = { name, time: now };
+
+    if (name === selectedNameRef.current) return;
     handleSelect(name);
-  }, [clearDetail, handleSelect]);
+  }, [clearDetail, handleSelect, renderDetailCard, onDrilldown]);
 
   const handleAPI = useCallback((api: ExcalidrawImperativeAPI) => {
     apiRef.current = api;

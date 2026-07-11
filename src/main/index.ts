@@ -2,6 +2,7 @@ import { app, BrowserWindow, ipcMain, dialog } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import * as crypto from 'crypto';
 import { execSync } from 'child_process';
 import { createPty, writeToPty, resizePty, killPty, restartPty, runCapture, setPtyDataCallback, getPtyCwd } from './ptyManager';
 import { startFileWatcher, stopFileWatcher } from './fileWatcher';
@@ -12,6 +13,72 @@ let currentFolder: string | null = null;
 let currentDiagram: object | null = null;
 let currentNodePaths: Record<string, string> = {};
 let patchInProgress = false;
+
+// ── Diagram cache ─────────────────────────────────────────────────────────────
+// One JSON file per project, keyed by a hash of the extracted structure.
+// Drilldown results are cached inside the same file under `drilldowns[name]`.
+
+interface CacheFile {
+  structureHash: string;           // SHA-256 of structureJson — invalidates when code changes
+  diagram: object;                 // full DiagramData returned by Claude
+  drilldowns: Record<string, string>;  // componentName → mermaid string
+  savedAt: number;                 // Date.now() at write time
+}
+
+function cacheDir(): string {
+  const dir = path.join(app.getPath('userData'), 'diagram-cache');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function cacheFile(folder: string): string {
+  const key = crypto.createHash('sha256').update(folder).digest('hex').slice(0, 16);
+  return path.join(cacheDir(), `${key}.json`);
+}
+
+function hashStructure(structureJson: string): string {
+  return crypto.createHash('sha256').update(structureJson).digest('hex').slice(0, 32);
+}
+
+function loadCache(folder: string): CacheFile | null {
+  try {
+    const raw = fs.readFileSync(cacheFile(folder), 'utf8');
+    return JSON.parse(raw) as CacheFile;
+  } catch { return null; }
+}
+
+function saveCache(folder: string, data: Partial<CacheFile> & { diagram: object; structureHash: string }) {
+  try {
+    const existing = loadCache(folder);
+    const merged: CacheFile = {
+      structureHash: data.structureHash,
+      diagram: data.diagram,
+      drilldowns: { ...(existing?.drilldowns ?? {}), ...(data.drilldowns ?? {}) },
+      savedAt: Date.now(),
+    };
+    fs.writeFileSync(cacheFile(folder), JSON.stringify(merged, null, 2), 'utf8');
+  } catch { /* ignore — cache is best-effort */ }
+}
+
+function saveDrilldown(folder: string, componentName: string, mermaid: string) {
+  try {
+    const existing = loadCache(folder);
+    if (!existing) return;
+    existing.drilldowns[componentName] = mermaid;
+    existing.savedAt = Date.now();
+    fs.writeFileSync(cacheFile(folder), JSON.stringify(existing, null, 2), 'utf8');
+  } catch { /* ignore */ }
+}
+
+function invalidateDrilldowns(folder: string) {
+  try {
+    const existing = loadCache(folder);
+    if (!existing) return;
+    existing.drilldowns = {};
+    existing.savedAt = Date.now();
+    fs.writeFileSync(cacheFile(folder), JSON.stringify(existing, null, 2), 'utf8');
+  } catch { /* ignore */ }
+}
 
 // ── Last project persistence ──────────────────────────────────────────────────
 
@@ -295,10 +362,27 @@ async function runIncrementalPatch(changedFiles: string) {
     if (!currentDiagram) {
       win.webContents.send('analysis:status', 'running');
       win.webContents.send('analysis:statusDetail', 'Drawing the project map…');
-      const raw = await runCapture(buildClaudePrompt(toClaudePromptJSON(structure)), folder);
-      const base = extractJson(raw);
+
+      const structureJson = toClaudePromptJSON(structure);
+      const structureHash = hashStructure(structureJson);
+
+      // Check cache before asking Claude
+      const cached = loadCache(folder);
+      let base: object | null = null;
+      if (cached && cached.structureHash === structureHash && cached.diagram) {
+        base = cached.diagram;
+      } else {
+        const raw = await runCapture(buildClaudePrompt(structureJson), folder);
+        base = extractJson(raw);
+        if (base) {
+          // New diagram = stale drilldowns; wipe them
+          saveCache(folder, { structureHash, diagram: base });
+          invalidateDrilldowns(folder);
+        }
+      }
+
       try {
-        fs.writeFileSync(path.join(os.tmpdir(), 'rex-last-analysis.json'), (JSON.stringify(base, null, 2) || raw), 'utf8');
+        fs.writeFileSync(path.join(os.tmpdir(), 'rex-last-analysis.json'), (JSON.stringify(base, null, 2) || ''), 'utf8');
         const d = (base as { diagrams?: { structure?: string } } | null)?.diagrams?.structure || '';
         console.log('\n===== STRUCTURE MERMAID (auto) =====\n' + d + '\n====================================\n');
       } catch { /* ignore */ }
@@ -402,7 +486,17 @@ function createWindow() {
     if (last) {
       currentFolder = last;
       restartPty(mainWindow, last);
-      mainWindow.webContents.send('folder:restored', { folder: last, hasCachedDiagram: false });
+
+      // Restore cached diagram immediately — canvas is populated before any analysis
+      const cached = loadCache(last);
+      if (cached?.diagram) {
+        currentDiagram = cached.diagram;
+        mainWindow.webContents.send('canvas:diagram', cached.diagram);
+        mainWindow.webContents.send('folder:restored', { folder: last, hasCachedDiagram: true });
+      } else {
+        mainWindow.webContents.send('folder:restored', { folder: last, hasCachedDiagram: false });
+      }
+
       startFileWatcher(last, (changedFiles) => {
         if (mainWindow) sendGitStatus(mainWindow);
         runIncrementalPatch(changedFiles);
@@ -444,12 +538,19 @@ ipcMain.handle('folder:open', async () => {
 
   restartPty(mainWindow, folder);
 
+  // Restore cached diagram for this project if one exists
+  const cached = loadCache(folder);
+  if (cached?.diagram) {
+    currentDiagram = cached.diagram;
+    mainWindow.webContents.send('canvas:diagram', cached.diagram);
+  }
+
   startFileWatcher(folder, (changedFiles) => {
     if (mainWindow) sendGitStatus(mainWindow);
     runIncrementalPatch(changedFiles);
   });
 
-  return { folder, hasCachedDiagram: false };
+  return { folder, hasCachedDiagram: !!cached?.diagram };
 });
 
 ipcMain.handle('analysis:run', async () => {
@@ -461,7 +562,6 @@ ipcMain.handle('analysis:run', async () => {
     mainWindow.webContents.send('analysis:statusDetail', 'Extracting code structure…');
     const structure = extractStructure(currentFolder);
 
-    // Empty / non-code folder → don't waste a Claude call on nothing
     if (structure.totalFiles === 0) {
       mainWindow.webContents.send('analysis:statusDetail', 'No source files found in this folder.');
       mainWindow.webContents.send('analysis:status', 'error');
@@ -469,13 +569,27 @@ ipcMain.handle('analysis:run', async () => {
     }
 
     const structureJson = toClaudePromptJSON(structure);
+    const structureHash = hashStructure(structureJson);
 
+    // ── Cache hit: structure unchanged since last analysis ──
+    const cached = loadCache(currentFolder);
+    if (cached && cached.structureHash === structureHash && cached.diagram) {
+      currentDiagram = cached.diagram;
+      currentNodePaths = structure.nodePaths;
+      normalizeDiagramPattern(cached.diagram as Record<string, unknown>, structure);
+      mainWindow.webContents.send('canvas:diagram', cached.diagram);
+      mainWindow.webContents.send('analysis:statusDetail', 'Loaded from cache');
+      mainWindow.webContents.send('analysis:status', 'done');
+      sendGitStatus(mainWindow);
+      return { ok: true, fromCache: true };
+    }
+
+    // ── Cache miss: ask Claude ──
     mainWindow.webContents.send('analysis:statusDetail', `Analysing ${structure.totalFiles} files with Claude…`);
     const prompt = buildClaudePrompt(structureJson);
     const raw = await runCapture(prompt, currentFolder);
     const diagram = extractJson(raw);
 
-    // TEMP debug: dump what Claude actually returned so we can see the Mermaid
     try {
       fs.writeFileSync(path.join(os.tmpdir(), 'rex-last-analysis.json'),
         JSON.stringify(diagram, null, 2) || raw, 'utf8');
@@ -494,6 +608,10 @@ ipcMain.handle('analysis:run', async () => {
 
     currentDiagram = diagram;
     currentNodePaths = structure.nodePaths;
+
+    // Persist to cache; structure changed so drilldowns are stale — wipe them
+    saveCache(currentFolder, { structureHash, diagram });
+
     mainWindow.webContents.send('canvas:diagram', diagram);
     mainWindow.webContents.send('analysis:status', 'done');
     sendGitStatus(mainWindow);
@@ -541,7 +659,59 @@ ipcMain.handle('component:detail', async (_e, name: string) => {
   }
 });
 
-// ── Pattern normalization ─────────────────────────────────────────────────────
+// ── Component drilldown (double-click: detailed sub-diagram) ─────────────────
+
+function buildDrilldownPrompt(name: string, structureJson: string): string {
+  return [
+    `You are a senior software architect. Draw a detailed internal diagram of the component "${name}".`,
+    'Output ONLY the JSON below — no fences, no prose.',
+    '',
+    'RULES:',
+    '- Show the internal structure: key functions/methods, data it owns, sub-components.',
+    '- Show every incoming and outgoing connection to OTHER components in the project.',
+    '- Use real names from the project code.',
+    '- 6–14 nodes total. Label every edge with what data or call flows across it.',
+    '',
+    'MERMAID SYNTAX (follow exactly):',
+    '- Start with `flowchart TD`.',
+    '- Node id = letters/digits/underscore only. Format: `Id[Label]`.',
+    '- Label text: letters, digits, spaces only. NO ( ) / : ; " \' | inside [ ].',
+    '- Edge with label: `A -->|data or call| B`.',
+    '- NO subgraph, NO classDiagram, NO sequenceDiagram.',
+    '',
+    'Schema:',
+    '{"mermaid":"flowchart TD string with \\n as newlines"}',
+    '',
+    'Project structure (for context):',
+    structureJson,
+    '',
+    'JSON only.',
+  ].join('\n');
+}
+
+ipcMain.handle('component:drilldown', async (_e, name: string) => {
+  if (!currentFolder || !name) return { error: 'no component' };
+  try {
+    // Check drilldown cache first
+    const cached = loadCache(currentFolder);
+    if (cached?.drilldowns?.[name]) {
+      return { ok: true, mermaid: cached.drilldowns[name], fromCache: true };
+    }
+
+    const structure = extractStructure(currentFolder);
+    const prompt = buildDrilldownPrompt(name, toClaudePromptJSON(structure));
+    const raw = await runCapture(prompt, currentFolder);
+    const parsed = extractJson(raw) as { mermaid?: string } | null;
+    if (!parsed?.mermaid) return { error: 'no mermaid in response' };
+
+    // Persist drilldown so repeat double-clicks are instant
+    saveDrilldown(currentFolder, name, parsed.mermaid);
+
+    return { ok: true, mermaid: parsed.mermaid };
+  } catch (err: unknown) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+});
 
 function normalizeDiagramPattern(diagram: Record<string, unknown>, structure: ExtractedStructure) {
   const pat = (diagram.pattern as string | undefined) || '';

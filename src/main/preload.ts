@@ -23,6 +23,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getComponentDetail: (name: string): Promise<{ ok?: boolean; error?: string; detail?: unknown }> =>
     ipcRenderer.invoke('component:detail', name),
 
+  // Double-click drilldown: fetch a detailed sub-diagram for one component
+  getComponentDrilldown: (name: string): Promise<{ ok?: boolean; error?: string; mermaid?: string }> =>
+    ipcRenderer.invoke('component:drilldown', name),
+
   // Events from main → renderer
   onDiagram: (callback: (diagram: unknown) => void) => {
     ipcRenderer.on('canvas:diagram', (_event: unknown, diagram: unknown) => callback(diagram));
