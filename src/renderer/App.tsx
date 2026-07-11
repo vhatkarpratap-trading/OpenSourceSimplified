@@ -37,13 +37,16 @@ export default function App() {
     changed: { name: string; type: string; description: string; oldDescription: string }[];
     impacted: { name: string; type: string; description: string; reason: string }[];
   } | null>(null);
-  const [activeKind, setActiveKind] = useState<DiagramKind>('structure');
-  const [renderError, setRenderError] = useState<string | null>(null);
+  const [activeKind, setActiveKind]         = useState<DiagramKind>('structure');
+  const [renderError, setRenderError]       = useState<string | null>(null);
   const [drilldownActive, setDrilldownActive] = useState(false);
+  const [selectedComponent, setSelectedComponent] = useState<string | null>(null);
+  const [drilling, setDrilling]             = useState(false);
 
-  const excalidrawAPIRef   = useRef<ExcalidrawImperativeAPI | null>(null);
-  const clearDrilldownRef  = useRef<(() => void) | null>(null);
-  const listenersAttached  = useRef(false);
+  const excalidrawAPIRef  = useRef<ExcalidrawImperativeAPI | null>(null);
+  const clearDrilldownRef = useRef<(() => void) | null>(null);
+  const renderDrilldownRef = useRef<((name: string) => void) | null>(null);
+  const listenersAttached = useRef(false);
 
   if (!listenersAttached.current) {
     listenersAttached.current = true;
@@ -90,11 +93,21 @@ export default function App() {
 
   const folderName = folder ? folder.split('/').filter(Boolean).pop() : null;
   const busy = status === 'running' || status === 'patching';
-  const canvasLabel = drilldownActive ? 'Drilled in' : (diagram ? diagram.pattern : 'Canvas');
+  const canvasLabel = drilldownActive
+    ? `Drill: ${selectedComponent ?? ''}`
+    : (diagram ? diagram.pattern : 'Canvas');
 
   const handleBack = useCallback(() => {
     clearDrilldownRef.current?.();
+    setDrilldownActive(false);
   }, []);
+
+  const handleDrill = useCallback(async () => {
+    if (!selectedComponent || drilling) return;
+    setDrilling(true);
+    renderDrilldownRef.current?.(selectedComponent);
+    setDrilling(false);
+  }, [selectedComponent, drilling]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', width: '100vw', height: '100vh', background: '#0f0f1a' }}>
@@ -151,6 +164,28 @@ export default function App() {
             </span>
           )}
         </div>
+
+        {/* Drill button — enabled only when a component is selected */}
+        <button
+          onClick={handleDrill}
+          disabled={!selectedComponent || drilling || drilldownActive}
+          title={selectedComponent ? `Drill into ${selectedComponent}` : 'Select a component on the canvas first'}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 6,
+            padding: '5px 14px', background: selectedComponent && !drilldownActive ? '#0f4c75' : '#13131f',
+            border: `1px solid ${selectedComponent && !drilldownActive ? '#1a73b5' : '#2a2a50'}`, borderRadius: 6,
+            color: selectedComponent && !drilldownActive ? '#bae6fd' : '#444466', fontSize: 12,
+            fontFamily: 'system-ui, -apple-system, sans-serif',
+            cursor: selectedComponent && !drilldownActive ? 'pointer' : 'not-allowed',
+            opacity: selectedComponent && !drilldownActive ? 1 : 0.45, flexShrink: 0,
+            transition: 'all 0.2s',
+            // @ts-ignore
+            WebkitAppRegion: 'no-drag',
+          }}
+        >
+          <DrillIcon />
+          {drilling ? 'Drilling…' : selectedComponent ? `Drill: ${selectedComponent}` : 'Drill'}
+        </button>
 
         {/* Analyse */}
         <button onClick={handleAnalyse} disabled={!folder || busy} style={{
@@ -313,12 +348,25 @@ export default function App() {
               onAPIReady={(api) => { excalidrawAPIRef.current = api; }}
               onRenderError={setRenderError}
               onDrilldownChange={setDrilldownActive}
+              onSelectionChange={setSelectedComponent}
               clearDrilldownRef={clearDrilldownRef}
+              renderDrilldownRef={renderDrilldownRef}
             />
           </div>
         </div>
       </div>
     </div>
+  );
+}
+
+function DrillIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <circle cx="11" cy="11" r="8" />
+      <line x1="21" y1="21" x2="16.65" y2="16.65" />
+      <line x1="11" y1="8" x2="11" y2="14" />
+      <line x1="8" y1="11" x2="14" y2="11" />
+    </svg>
   );
 }
 

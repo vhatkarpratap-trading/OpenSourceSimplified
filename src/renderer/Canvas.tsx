@@ -11,7 +11,9 @@ interface CanvasProps {
   onAPIReady?: (api: ExcalidrawImperativeAPI) => void;
   onRenderError?: (message: string | null) => void;
   onDrilldownChange?: (active: boolean) => void;
+  onSelectionChange?: (name: string | null) => void;
   clearDrilldownRef?: React.MutableRefObject<(() => void) | null>;
+  renderDrilldownRef?: React.MutableRefObject<((name: string) => void) | null>;
 }
 
 interface GitAnnotation { name: string; summary: string; added: number; removed: number }
@@ -114,7 +116,7 @@ function applyZoomAndGit(
   });
 }
 
-export default function Canvas({ diagramData, activeKind = 'structure', onAPIReady, onRenderError, onDrilldownChange, clearDrilldownRef }: CanvasProps) {
+export default function Canvas({ diagramData, activeKind = 'structure', onAPIReady, onRenderError, onDrilldownChange, onSelectionChange, clearDrilldownRef, renderDrilldownRef }: CanvasProps) {
   const [apiReady, setApiReady] = useState(false);
   const apiRef          = useRef<ExcalidrawImperativeAPI | null>(null);
   const lastDataRef     = useRef<DiagramData | null>(null);
@@ -126,11 +128,10 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
   const debounceRef     = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastDiagramKey  = useRef<string>('');
 
-  // Click-to-inspect + drilldown state
+  // Selection + drilldown state
   const idToNameRef        = useRef<Record<string, string>>({});
   const selectedNameRef    = useRef<string | null>(null);
-  const detailBusyRef      = useRef(false);
-  // Drilldown: stores base element ids so we can restore them on Back
+  const drillBusyRef       = useRef(false);
   const drilldownActiveRef = useRef(false);
   const baseElementsRef    = useRef<ExcalidrawElement[]>([]);
 
@@ -344,111 +345,91 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     }
   }, []);
 
-  // ── Click-to-inspect + inline drilldown ──────────────────────────────────────
+  // ── Selection tracking ────────────────────────────────────────────────────────
 
-  const clearDetail = useCallback(() => {
-    const api = apiRef.current;
-    if (!api) return;
-    const els = api.getSceneElements() as unknown as (EXEl & { id: string; opacity?: number; _baseOpacity?: number })[];
-    const cleaned = els
-      .filter(e => !e.id.startsWith('detail-'))
-      .map(e => {
-        const base = (e as { _baseOpacity?: number })._baseOpacity ?? 100;
-        return (e.opacity ?? 100) === base ? e : { ...e, opacity: base };
-      });
-    api.updateScene({ elements: cleaned as Parameters<typeof api.updateScene>[0]['elements'] });
+  const clearSelection = useCallback(() => {
     selectedNameRef.current = null;
-  }, []);
+    onSelectionChange?.(null);
+  }, [onSelectionChange]);
 
-  // Restore the full base diagram (exit drilldown)
+  // ── Inline drilldown ──────────────────────────────────────────────────────────
+
   const clearDrilldown = useCallback(() => {
     const api = apiRef.current;
     if (!api || !drilldownActiveRef.current) return;
     drilldownActiveRef.current = false;
     onDrilldownChange?.(false);
-    const base = baseElementsRef.current;
-    api.updateScene({ elements: base as unknown as EXEl[] });
+    api.updateScene({ elements: baseElementsRef.current as unknown as EXEl[] });
     setTimeout(() => {
       const els = api.getSceneElements().filter(e => (e.opacity ?? 100) > 0);
       if (els.length > 0) api.scrollToContent(els as EXEl[], { fitToContent: true, animate: true });
     }, 100);
   }, [onDrilldownChange]);
 
-  // Expose clearDrilldown so App's Back button can call it
   useEffect(() => {
     if (clearDrilldownRef) clearDrilldownRef.current = clearDrilldown;
   }, [clearDrilldown, clearDrilldownRef]);
 
-  // Expand a component's drilldown inline: dim the base, add the sub-diagram to the right
   const renderDrilldown = useCallback(async (name: string) => {
     const api  = apiRef.current;
     const flat = flatRef.current;
-    if (!api || !flat || detailBusyRef.current) return;
+    if (!api || !flat || drillBusyRef.current) return;
 
-    detailBusyRef.current = true;
+    drillBusyRef.current = true;
 
-    // Snapshot base elements before we modify them
     const currentEls = api.getSceneElements() as unknown as ExcalidrawElement[];
     const baseEls = currentEls.filter(e =>
       !e.id.startsWith('detail-') && !e.id.startsWith('drill-')
     );
 
-    // Show a loading indicator next to the selected node
     const nodeElIds = new Set(flat.nodeIds[name] || []);
     const box = baseEls.find(e => nodeElIds.has(e.id) && e.type === 'rectangle') as
       (ExcalidrawElement & { x: number; y: number; width: number; height: number }) | undefined;
 
-    const loadX = box ? box.x + box.width + 60 : 800;
-    const loadY = box ? box.y : 200;
+    // Show loading indicator
     let seed = 9000000;
-
-    const loadingEls: unknown[] = [
-      {
-        type: 'rectangle', id: 'drill-loading',
-        x: loadX, y: loadY, width: 220, height: 48,
-        strokeColor: '#7c3aed', backgroundColor: '#f5f3ff',
-        fillStyle: 'solid', strokeWidth: 2, strokeStyle: 'dashed',
-        angle: 0, roughness: 0, opacity: 100, roundness: { type: 3 }, groupIds: [],
-        frameId: null, seed: seed++, version: 1, versionNonce: seed++,
-        isDeleted: false, boundElements: [], updated: Date.now(), link: null, locked: false,
-      },
-      {
-        type: 'text', id: 'drill-loading-text',
-        x: loadX + 12, y: loadY + 14, width: 196, height: 20,
-        text: `Loading ${name} details…`, originalText: `Loading ${name} details…`,
-        fontSize: 12, fontFamily: 2, textAlign: 'left', verticalAlign: 'top',
-        strokeColor: '#7c3aed', backgroundColor: 'transparent',
-        fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
-        angle: 0, roughness: 0, opacity: 100, roundness: null, groupIds: [],
-        frameId: null, seed: seed++, version: 1, versionNonce: seed++,
-        isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false,
-        containerId: null, lineHeight: 1.25, baseline: 10,
-      },
-    ];
-
-    // Dim everything, show loader
+    const loadX = box ? box.x + box.width + 80 : 800;
+    const loadY = box ? box.y : 200;
     const dimmed = baseEls.map(e => {
       const base = (e as ExcalidrawElement & { _baseOpacity?: number })._baseOpacity ?? 100;
       return { ...e, opacity: nodeElIds.has(e.id) ? base : Math.max(1, Math.floor(base * 0.15)) };
     });
-    api.updateScene({ elements: [...dimmed, ...loadingEls] as unknown as EXEl[] });
+    api.updateScene({ elements: [...dimmed, {
+      type: 'rectangle', id: 'drill-loading',
+      x: loadX, y: loadY, width: 240, height: 44,
+      strokeColor: '#1a73b5', backgroundColor: '#e0f2fe',
+      fillStyle: 'solid', strokeWidth: 2, strokeStyle: 'dashed',
+      angle: 0, roughness: 0, opacity: 100, roundness: { type: 3 }, groupIds: [],
+      frameId: null, seed: seed++, version: 1, versionNonce: seed++,
+      isDeleted: false, boundElements: [], updated: Date.now(), link: null, locked: false,
+    }, {
+      type: 'text', id: 'drill-loading-text',
+      x: loadX + 12, y: loadY + 12, width: 216, height: 20,
+      text: `Drilling into ${name}…`, originalText: `Drilling into ${name}…`,
+      fontSize: 12, fontFamily: 2, textAlign: 'left', verticalAlign: 'top',
+      strokeColor: '#0369a1', backgroundColor: 'transparent',
+      fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
+      angle: 0, roughness: 0, opacity: 100, roundness: null, groupIds: [],
+      frameId: null, seed: seed++, version: 1, versionNonce: seed++,
+      isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false,
+      containerId: null, lineHeight: 1.25, baseline: 10,
+    }] as unknown as EXEl[] });
 
     try {
       const res = await window.electronAPI.getComponentDrilldown(name);
       if (!res?.ok || !res.mermaid) throw new Error('no mermaid');
 
-      // Parse the drilldown Mermaid into Excalidraw elements
       const { buildMermaidScene: bms } = await import('./mermaidScene');
       const drillScene = await bms(res.mermaid);
 
-      // Compute bounding box of base elements to place drilldown to the right
-      const visibleBase = baseEls.filter(e => e.type === 'rectangle' || e.type === 'text');
-      const maxX = visibleBase.reduce((m, e) => Math.max(m, (e as { x: number; width: number }).x + (e as { width: number }).width), 0);
-      const minY = visibleBase.reduce((m, e) => Math.min(m, (e as { y: number }).y), Infinity);
+      // Place drilldown to the right of all base elements
+      const rects = baseEls.filter(e => e.type === 'rectangle') as (ExcalidrawElement & { x: number; y: number; width: number; height: number })[];
+      const maxX = rects.reduce((m, e) => Math.max(m, e.x + e.width), 0);
+      const minY = rects.reduce((m, e) => Math.min(m, e.y), Infinity);
       const offsetX = maxX + 120;
       const offsetY = isFinite(minY) ? minY : 0;
 
-      // Shift drilldown elements so they sit to the right of the main diagram
+      seed = 9100000;
       const drillEls = drillScene.elements.map((e, i) => ({
         ...e,
         id: `drill-${i}-${e.id}`,
@@ -458,19 +439,18 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
         opacity: 100,
       })) as unknown as ExcalidrawElement[];
 
-      // Draw a connector from the selected box to the drilldown area
+      // Dashed connector from selected node to drilldown area
       const drillMinX = drillEls.reduce((m, e) => Math.min(m, (e as { x: number }).x), Infinity);
-      const drillMidY = offsetY + (drillScene.elements.reduce((m, e) =>
-        m + (e as { y: number }).y + (e as { height: number }).height / 2, 0) / Math.max(1, drillScene.elements.length));
+      const drillMidY = drillEls.filter(e => e.type === 'rectangle')
+        .reduce((acc, e, _, arr) => acc + ((e as { y: number; height: number }).y + (e as { height: number }).height / 2) / arr.length, 0);
 
-      seed = 9100000;
-      const connectorEls: unknown[] = box ? [{
+      const connectors: unknown[] = box ? [{
         type: 'arrow', id: 'drill-connector',
         x: box.x + box.width, y: box.y + box.height / 2,
         width: drillMinX - (box.x + box.width),
         height: drillMidY - (box.y + box.height / 2),
         points: [[0, 0], [drillMinX - (box.x + box.width), drillMidY - (box.y + box.height / 2)]],
-        strokeColor: '#7c3aed', backgroundColor: 'transparent', fillStyle: 'solid',
+        strokeColor: '#1a73b5', backgroundColor: 'transparent', fillStyle: 'solid',
         strokeWidth: 2, strokeStyle: 'dashed', angle: 0, roughness: 0, opacity: 80,
         startArrowhead: null, endArrowhead: 'arrow', boundElements: null,
         groupIds: [], frameId: null, seed: seed++, version: 1, versionNonce: seed++,
@@ -478,13 +458,12 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
         startBinding: null, endBinding: null, roundness: { type: 2 }, elbowed: false,
       }] : [];
 
-      // Label above the drilldown area
       const labelEls: unknown[] = [{
         type: 'text', id: 'drill-label',
-        x: offsetX, y: offsetY - 28, width: 300, height: 20,
-        text: `◆ ${name} — internals`, originalText: `◆ ${name} — internals`,
-        fontSize: 13, fontFamily: 2, textAlign: 'left', verticalAlign: 'top',
-        strokeColor: '#5b21b6', backgroundColor: 'transparent',
+        x: offsetX, y: offsetY - 28, width: 320, height: 20,
+        text: `◆ ${name}`, originalText: `◆ ${name}`,
+        fontSize: 14, fontFamily: 2, textAlign: 'left', verticalAlign: 'top',
+        strokeColor: '#0369a1', backgroundColor: 'transparent',
         fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
         angle: 0, roughness: 0, opacity: 100, roundness: null, groupIds: [],
         frameId: null, seed: seed++, version: 1, versionNonce: seed++,
@@ -492,194 +471,42 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
         containerId: null, lineHeight: 1.25, baseline: 10,
       }];
 
-      // Save base snapshot and mark drilldown active
       baseElementsRef.current = dimmed as ExcalidrawElement[];
       drilldownActiveRef.current = true;
       onDrilldownChange?.(true);
 
-      const allEls = [...dimmed, ...connectorEls, ...labelEls, ...drillEls];
-      api.updateScene({ elements: allEls as unknown as EXEl[] });
-
-      // Scroll to show both the selected node and the drilldown
+      api.updateScene({ elements: [...dimmed, ...connectors, ...labelEls, ...drillEls] as unknown as EXEl[] });
       setTimeout(() => {
         const visible = api.getSceneElements().filter(e => (e.opacity ?? 100) > 5);
         if (visible.length > 0) api.scrollToContent(visible as EXEl[], { fitToContent: true, animate: true });
       }, 150);
 
     } catch {
-      // Restore base on failure
-      const cleaned = baseEls.map(e => {
-        const base = (e as ExcalidrawElement & { _baseOpacity?: number })._baseOpacity ?? 100;
-        return { ...e, opacity: base };
-      });
-      api.updateScene({ elements: cleaned as unknown as EXEl[] });
+      // Restore on failure
+      api.updateScene({ elements: baseEls.map(e => ({
+        ...e, opacity: (e as ExcalidrawElement & { _baseOpacity?: number })._baseOpacity ?? 100,
+      })) as unknown as EXEl[] });
     } finally {
-      detailBusyRef.current = false;
-      // Remove any lingering detail/loading cards
-      clearDetail();
+      drillBusyRef.current = false;
     }
-  }, [clearDetail, onDrilldownChange]);
+  }, [onDrilldownChange]);
 
-  const renderDetailCard = useCallback((name: string, detail: { title?: string; summary?: string; does?: string[]; talksTo?: string[] }, showDrillButton = true) => {
-    const api  = apiRef.current;
-    const flat = flatRef.current;
-    if (!api || !flat) return;
-
-    const existing = api.getSceneElements() as unknown as (EXEl & { id: string; type: string; x: number; y: number; width: number; height: number })[];
-    const withoutOld = existing.filter(e => !e.id.startsWith('detail-'));
-
-    const nodeElIds = new Set(flat.nodeIds[name] || []);
-    const box = existing.find(e => nodeElIds.has(e.id) && e.type === 'rectangle');
-    if (!box) return;
-
-    const dimmed = withoutOld.map(e => {
-      const keep = nodeElIds.has(e.id);
-      const base = (e as { _baseOpacity?: number })._baseOpacity ?? 100;
-      return { ...e, opacity: keep ? base : Math.max(1, Math.floor(base * 0.12)) };
-    });
-
-    const lines: string[] = [];
-    if (detail.summary) lines.push(detail.summary);
-    if (detail.does?.length) { lines.push(''); for (const d of detail.does) lines.push(`• ${d}`); }
-    if (detail.talksTo?.length) { lines.push(''); lines.push(`Works with: ${detail.talksTo.join(', ')}`); }
-    // Hint for drill button
-    if (showDrillButton) lines.push('\n[ Drill in → ]');
-    const body = lines.join('\n');
-
-    const cardW = 300;
-    const cardH = Math.max(120, 46 + body.split('\n').length * 18 + 16);
-    const cardX = box.x + box.width + 28;
-    const cardY = box.y;
-
-    let seed = 5000000;
-    const card: unknown[] = [];
-
-    card.push({
-      type: 'arrow', id: 'detail-arrow',
-      x: box.x + box.width, y: box.y + box.height / 2,
-      width: cardX - (box.x + box.width), height: (cardY + 24) - (box.y + box.height / 2),
-      points: [[0, 0], [cardX - (box.x + box.width), (cardY + 24) - (box.y + box.height / 2)]],
-      strokeColor: '#7c3aed', backgroundColor: 'transparent', fillStyle: 'solid',
-      strokeWidth: 1.5, strokeStyle: 'solid', angle: 0, roughness: 0, opacity: 90,
-      startArrowhead: null, endArrowhead: 'arrow', boundElements: null,
-      groupIds: [], frameId: null, seed: seed++, version: 1, versionNonce: seed++,
-      isDeleted: false, updated: Date.now(), link: null, locked: false,
-      startBinding: null, endBinding: null, roundness: { type: 2 }, elbowed: false,
-    });
-
-    card.push({
-      type: 'rectangle', id: 'detail-card',
-      x: cardX, y: cardY, width: cardW, height: cardH,
-      strokeColor: '#7c3aed', backgroundColor: '#faf5ff',
-      fillStyle: 'solid', strokeWidth: 2, strokeStyle: 'solid',
-      angle: 0, roughness: 0, opacity: 100, roundness: { type: 3 }, groupIds: [],
-      frameId: null, seed: seed++, version: 1, versionNonce: seed++,
-      isDeleted: false, boundElements: [], updated: Date.now(), link: null, locked: false,
-      customData: { isDetail: true },
-    });
-
-    const title = detail.title || name;
-    card.push({
-      type: 'text', id: 'detail-title',
-      x: cardX + 12, y: cardY + 10, width: cardW - 24, height: 22,
-      text: title, originalText: title, fontSize: 15, fontFamily: 2,
-      textAlign: 'left', verticalAlign: 'top',
-      strokeColor: '#5b21b6', backgroundColor: 'transparent',
-      fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
-      angle: 0, roughness: 0, opacity: 100, roundness: null,
-      groupIds: [], frameId: null, seed: seed++, version: 1, versionNonce: seed++,
-      isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false,
-      containerId: null, lineHeight: 1.25, baseline: 12, customData: { isDetail: true },
-    });
-
-    card.push({
-      type: 'text', id: 'detail-body',
-      x: cardX + 12, y: cardY + 38, width: cardW - 24, height: cardH - 48,
-      text: body, originalText: body, fontSize: 12, fontFamily: 2,
-      textAlign: 'left', verticalAlign: 'top',
-      strokeColor: '#4c1d95', backgroundColor: 'transparent',
-      fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
-      angle: 0, roughness: 0, opacity: 100, roundness: null,
-      groupIds: [], frameId: null, seed: seed++, version: 1, versionNonce: seed++,
-      isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false,
-      containerId: null, lineHeight: 1.4, baseline: 10, customData: { isDetail: true },
-    });
-
-    // "Drill in →" button box — clickable rectangle at the bottom of the card
-    if (showDrillButton) {
-      const btnY = cardY + cardH - 34;
-      card.push({
-        type: 'rectangle', id: 'detail-drill-btn',
-        x: cardX + 12, y: btnY, width: cardW - 24, height: 26,
-        strokeColor: '#7c3aed', backgroundColor: '#ede9fe',
-        fillStyle: 'solid', strokeWidth: 1.5, strokeStyle: 'solid',
-        angle: 0, roughness: 0, opacity: 100, roundness: { type: 3 }, groupIds: [],
-        frameId: null, seed: seed++, version: 1, versionNonce: seed++,
-        isDeleted: false, boundElements: [], updated: Date.now(), link: null, locked: false,
-        customData: { isDrillBtn: true, drillTarget: name },
-      });
-      card.push({
-        type: 'text', id: 'detail-drill-btn-label',
-        x: cardX + 12, y: btnY + 5, width: cardW - 24, height: 16,
-        text: 'Drill in →', originalText: 'Drill in →',
-        fontSize: 12, fontFamily: 2, textAlign: 'center', verticalAlign: 'top',
-        strokeColor: '#5b21b6', backgroundColor: 'transparent',
-        fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
-        angle: 0, roughness: 0, opacity: 100, roundness: null, groupIds: [],
-        frameId: null, seed: seed++, version: 1, versionNonce: seed++,
-        isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false,
-        containerId: null, lineHeight: 1.25, baseline: 10,
-        customData: { isDrillBtn: true, drillTarget: name },
-      });
-    }
-
-    api.updateScene({ elements: [...dimmed, ...card] as Parameters<typeof api.updateScene>[0]['elements'] });
-  }, []);
-
-  const handleSelect = useCallback(async (name: string) => {
-    if (detailBusyRef.current) return;
-    selectedNameRef.current = name;
-    detailBusyRef.current = true;
-
-    renderDetailCard(name, { title: name, summary: 'Looking into this part…', does: [], talksTo: [] }, false);
-
-    try {
-      const res = await window.electronAPI.getComponentDetail(name);
-      if (selectedNameRef.current !== name) return;
-      if (res?.ok && res.detail) {
-        renderDetailCard(name, res.detail as { title?: string; summary?: string; does?: string[]; talksTo?: string[] }, true);
-      } else {
-        renderDetailCard(name, { title: name, summary: 'Could not load details right now.', does: [], talksTo: [] }, false);
-      }
-    } finally {
-      detailBusyRef.current = false;
-    }
-  }, [renderDetailCard]);
+  useEffect(() => {
+    if (renderDrilldownRef) renderDrilldownRef.current = renderDrilldown;
+  }, [renderDrilldown, renderDrilldownRef]);
 
   const handleChange = useCallback((_els: readonly EXEl[], appState: { selectedElementIds?: Record<string, boolean> }) => {
     const selectedIds = Object.keys(appState.selectedElementIds || {}).filter(id => appState.selectedElementIds![id]);
     if (selectedIds.length === 0) {
-      if (selectedNameRef.current) clearDetail();
+      clearSelection();
       return;
     }
-
-    // Check if the user clicked the "Drill in →" button
-    const allEls = apiRef.current?.getSceneElements() as unknown as (ExcalidrawElement & { customData?: Record<string, unknown> })[] | undefined;
-    const drillTarget = selectedIds
-      .map(id => allEls?.find(e => e.id === id)?.customData?.drillTarget as string | undefined)
-      .find(Boolean);
-
-    if (drillTarget) {
-      clearDetail();
-      renderDrilldown(drillTarget);
-      return;
-    }
-
     const name = selectedIds.map(id => idToNameRef.current[id]).find(Boolean);
-    if (!name) return;
+    if (!name) { clearSelection(); return; }
     if (name === selectedNameRef.current) return;
-    handleSelect(name);
-  }, [clearDetail, handleSelect, renderDrilldown]);
+    selectedNameRef.current = name;
+    onSelectionChange?.(name);
+  }, [clearSelection, onSelectionChange]);
 
   const handleAPI = useCallback((api: ExcalidrawImperativeAPI) => {
     apiRef.current = api;
