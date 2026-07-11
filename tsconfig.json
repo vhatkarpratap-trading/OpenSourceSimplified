@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "lib": ["ES2020", "DOM"],
+    "jsx": "react",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "outDir": "dist/renderer",
+    "rootDir": "src/renderer",
+    "moduleResolution": "node"
+  },
+  "include": ["src/renderer/**/*"]
+}
