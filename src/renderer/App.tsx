@@ -39,13 +39,11 @@ export default function App() {
   } | null>(null);
   const [activeKind, setActiveKind] = useState<DiagramKind>('structure');
   const [renderError, setRenderError] = useState<string | null>(null);
+  const [drilldownActive, setDrilldownActive] = useState(false);
 
-  // Drilldown: when user double-clicks a component we swap the canvas to a
-  // detailed sub-diagram. drilldownDiagram holds the active drilldown; null = top-level view.
-  const [drilldownDiagram, setDrilldownDiagram] = useState<{ name: string; diagram: DiagramData } | null>(null);
-
-  const excalidrawAPIRef = useRef<ExcalidrawImperativeAPI | null>(null);
-  const listenersAttached = useRef(false);
+  const excalidrawAPIRef   = useRef<ExcalidrawImperativeAPI | null>(null);
+  const clearDrilldownRef  = useRef<(() => void) | null>(null);
+  const listenersAttached  = useRef(false);
 
   if (!listenersAttached.current) {
     listenersAttached.current = true;
@@ -92,24 +90,10 @@ export default function App() {
 
   const folderName = folder ? folder.split('/').filter(Boolean).pop() : null;
   const busy = status === 'running' || status === 'patching';
-  const activeDiagram = drilldownDiagram ? drilldownDiagram.diagram : diagram;
-  const canvasLabel = drilldownDiagram
-    ? drilldownDiagram.name
-    : (diagram ? diagram.pattern : 'Canvas');
-
-  const handleDrilldown = useCallback((componentName: string, mermaid: string) => {
-    const dd: DiagramData = {
-      pattern: componentName,
-      diagrams: { structure: mermaid },
-    };
-    setDrilldownDiagram({ name: componentName, diagram: dd });
-    setActiveKind('structure');
-    setRenderError(null);
-  }, []);
+  const canvasLabel = drilldownActive ? 'Drilled in' : (diagram ? diagram.pattern : 'Canvas');
 
   const handleBack = useCallback(() => {
-    setDrilldownDiagram(null);
-    setRenderError(null);
+    clearDrilldownRef.current?.();
   }, []);
 
   return (
@@ -263,8 +247,8 @@ export default function App() {
             borderBottom: '1px solid #ebebf5',
             flexShrink: 0, userSelect: 'none',
           }}>
-            {/* Back button — shown only when drilling into a component */}
-            {drilldownDiagram && (
+            {/* Back button — shown only when a drilldown is active on the canvas */}
+            {drilldownActive && (
               <button onClick={handleBack} style={{
                 display: 'flex', alignItems: 'center', gap: 4,
                 padding: '3px 10px', fontSize: 11, borderRadius: 5,
@@ -277,16 +261,16 @@ export default function App() {
             )}
 
             <span style={{
-              fontSize: 10, color: drilldownDiagram ? '#5b21b6' : '#aaaabc',
+              fontSize: 10, color: drilldownActive ? '#5b21b6' : '#aaaabc',
               letterSpacing: '0.1em', textTransform: 'uppercase',
               fontFamily: 'system-ui, -apple-system, sans-serif',
-              fontWeight: drilldownDiagram ? 600 : 400,
+              fontWeight: drilldownActive ? 600 : 400,
             }}>
               {canvasLabel}
             </span>
 
             {/* Diagram-type switcher — hidden during drilldown */}
-            {!drilldownDiagram && (
+            {!drilldownActive && (
               <div style={{ display: 'flex', gap: 4, marginLeft: 'auto' }}>
                 {DIAGRAM_TABS.map(({ kind, label }) => {
                   const available = !!diagram?.diagrams?.[kind];
@@ -324,11 +308,12 @@ export default function App() {
           )}
           <div style={{ flex: 1, overflow: 'hidden' }}>
             <Canvas
-              diagramData={activeDiagram}
+              diagramData={diagram}
               activeKind={activeKind}
               onAPIReady={(api) => { excalidrawAPIRef.current = api; }}
               onRenderError={setRenderError}
-              onDrilldown={handleDrilldown}
+              onDrilldownChange={setDrilldownActive}
+              clearDrilldownRef={clearDrilldownRef}
             />
           </div>
         </div>
