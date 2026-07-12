@@ -28,7 +28,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('component:drilldown', name),
 
   // Code flow: structured class/function/data trace rendered onto the canvas
-  getComponentCodeFlow: (name: string): Promise<{ ok?: boolean; error?: string; mermaid?: string }> =>
+  getComponentCodeFlow: (name: string): Promise<{ ok?: boolean; error?: string; mermaid?: string; happyPath?: string[] }> =>
     ipcRenderer.invoke('component:codeflow', name),
 
   // Events from main → renderer

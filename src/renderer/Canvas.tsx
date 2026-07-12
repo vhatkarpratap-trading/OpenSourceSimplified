@@ -704,6 +704,14 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       const depth = flowStackRef.current.length;
       seed = 7000000 + depth * 100000;
 
+      // Parse Mermaid source to map nodeId → label text (first line only)
+      // e.g. `A["login()\ncode line"]` → { A: "login()" }
+      const mermaidNodeLabels = new Map<string, string>();
+      for (const line of (res.mermaid || '').split('\n')) {
+        const m = line.trim().match(/^([A-Za-z0-9_]+)\s*[\[({]+"?([^\\"\\n]+)/);
+        if (m) mermaidNodeLabels.set(m[1], m[2].replace(/["]/g, '').trim());
+      }
+
       const flowEls = flowScene.elements.map((e, i) => ({
         ...e,
         id: `flow-d${depth}-${i}-${e.id}`,
@@ -725,6 +733,122 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
         },
       })) as unknown as ExcalidrawElement[];
 
+      // ── Happy path overlay ────────────────────────────────────────────────────
+      // Match Mermaid node IDs from happyPath to rendered element IDs by label text
+      const happyPath: string[] = res.happyPath ?? [];
+
+      // Build: mermaidNodeId → new element id, by matching label text against rendered elements
+      const origToNewId = new Map<string, string>();
+
+      // Build a lookup of all text content per rect (by containerId or by groupId proximity)
+      const rectTexts = new Map<string, string>(); // rectId → first line of label text
+      for (const el of flowEls) {
+        if (el.type !== 'text') continue;
+        const cid = (el as { containerId?: string | null }).containerId;
+        const txt = ((el as { text?: string }).text ?? '').split('\n')[0].trim().toLowerCase().replace(/[().\s]/g, '');
+        if (cid) {
+          // prefer containerId binding
+          const existing = rectTexts.get(cid) ?? '';
+          if (!existing || txt.length > existing.length) rectTexts.set(cid, txt);
+        }
+      }
+      // Fallback: for rects with no containerId text, use first text in same group
+      for (const el of flowEls) {
+        if (el.type !== 'rectangle' || rectTexts.has(el.id)) continue;
+        const grp = el.groupIds?.[0];
+        if (!grp) continue;
+        const groupText = flowEls.find(t =>
+          t.type === 'text' && t.groupIds?.includes(grp)
+        );
+        if (groupText) {
+          const txt = ((groupText as { text?: string }).text ?? '').split('\n')[0].trim().toLowerCase().replace(/[().\s]/g, '');
+          rectTexts.set(el.id, txt);
+        }
+      }
+
+      for (const [mermaidId, labelText] of mermaidNodeLabels.entries()) {
+        // Skip Desc nodes — we only track function nodes
+        if (mermaidId.endsWith('Desc')) continue;
+        const needle = labelText.toLowerCase().replace(/[().\s]/g, '').slice(0, 14);
+        const match = flowEls.find(el =>
+          el.type === 'rectangle' && (rectTexts.get(el.id) ?? '').startsWith(needle)
+        );
+        if (match) origToNewId.set(mermaidId, match.id);
+      }
+
+      console.log('[codeflow] happyPath:', happyPath, 'resolved:', happyPath.map(id => [id, origToNewId.get(id) ? '✓' : '✗']));
+
+      // Apply red stroke to happy path nodes and find arrows to recolor
+      const happyNodeIds = new Set<string>();
+      happyPath.forEach(origId => {
+        const newId = origToNewId.get(origId);
+        if (newId) happyNodeIds.add(newId);
+      });
+
+      const flowElsMutable = flowEls.map(el => {
+        // Red border on happy path function nodes
+        if (happyNodeIds.has(el.id) && el.type === 'rectangle') {
+          return { ...el, strokeColor: '#dc2626', strokeWidth: 2.5 } as ExcalidrawElement;
+        }
+        // Red arrows: connecting a happy path Desc node to the next happy path function node
+        if (el.type === 'arrow') {
+          const sb = (el as { startBinding?: { elementId: string } | null }).startBinding;
+          const eb = (el as { endBinding?: { elementId: string } | null }).endBinding;
+          if (!sb || !eb) return el;
+          // Check if this arrow connects consecutive happy path nodes (via Desc intermediate)
+          const fromOrigDesc = happyPath.find(id => origToNewId.get(id + 'Desc') === sb.elementId || origToNewId.get(id) === sb.elementId);
+          const toOrig = happyPath.find(id => origToNewId.get(id) === eb.elementId);
+          if (fromOrigDesc && toOrig) {
+            const fi = happyPath.indexOf(fromOrigDesc);
+            const ti = happyPath.indexOf(toOrig);
+            if (ti === fi + 1) {
+              return { ...el, strokeColor: '#dc2626', strokeWidth: 2.5, opacity: 100 } as ExcalidrawElement;
+            }
+          }
+        }
+        return el;
+      });
+
+      // Numbered step badges on happy path nodes
+      const happyOverlayEls: unknown[] = [];
+      let badgeSeed = seed + 500000;
+
+      happyPath.forEach((origId, idx) => {
+        const newId = origToNewId.get(origId);
+        if (!newId) return;
+        const el = flowElsMutable.find(e => e.id === newId) as (ExcalidrawElement & { x: number; y: number; width: number; height: number }) | undefined;
+        if (!el || el.type !== 'rectangle') return;
+
+        const badgeSize = 20;
+        happyOverlayEls.push({
+          type: 'rectangle', id: `flow-hp-badge-rect-${depth}-${idx}`,
+          x: el.x - badgeSize / 2, y: el.y - badgeSize / 2,
+          width: badgeSize, height: badgeSize,
+          strokeColor: '#dc2626', backgroundColor: '#dc2626',
+          fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
+          angle: 0, roughness: 0.8, opacity: 100,
+          roundness: { type: 3 }, groupIds: [],
+          frameId: null, seed: badgeSeed++, version: 1, versionNonce: badgeSeed++,
+          isDeleted: false, boundElements: [], updated: Date.now(), link: null, locked: false,
+        });
+        const stepNum = String(idx + 1);
+        happyOverlayEls.push({
+          type: 'text', id: `flow-hp-badge-text-${depth}-${idx}`,
+          x: el.x - badgeSize / 2, y: el.y - badgeSize / 2 + 2,
+          width: badgeSize, height: badgeSize - 2,
+          text: stepNum, originalText: stepNum,
+          fontSize: 11, fontFamily: 1, textAlign: 'center', verticalAlign: 'middle',
+          strokeColor: '#ffffff', backgroundColor: 'transparent',
+          fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
+          angle: 0, roughness: 0, opacity: 100, roundness: null, groupIds: [],
+          frameId: null, seed: badgeSeed++, version: 1, versionNonce: badgeSeed++,
+          isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false,
+          containerId: null, lineHeight: 1.2, baseline: 9,
+        });
+      });
+
+      seed = badgeSeed;
+
       // Dashed green connector from anchor node to the flow panel
       const flowMinX = flowEls.filter(e => e.type === 'rectangle')
         .reduce((m, e) => Math.min(m, (e as { x: number }).x), Infinity);
@@ -745,10 +869,13 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
         startBinding: null, endBinding: null, roundness: { type: 2 }, elbowed: false,
       }] : [];
 
+      const labelText = happyPath.length > 0
+        ? `⟳ Code Flow: ${name}  ·  🔴 = happy path (read in order)`
+        : `⟳ Code Flow: ${name}`;
       const labelEls: unknown[] = [{
         type: 'text', id: `flow-label-d${depth}`,
-        x: panelOffsetX, y: panelY - 26, width: 400, height: 20,
-        text: `⟳ Code Flow: ${name}`, originalText: `⟳ Code Flow: ${name}`,
+        x: panelOffsetX, y: panelY - 26, width: 520, height: 20,
+        text: labelText, originalText: labelText,
         fontSize: 13, fontFamily: 1, textAlign: 'left', verticalAlign: 'top',
         strokeColor: '#16a34a', backgroundColor: 'transparent',
         fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
@@ -760,11 +887,11 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
 
       const withoutLoading = (api.getSceneElements() as unknown as ExcalidrawElement[])
         .filter(e => !e.id.startsWith('flow-loading'));
-      const finalEls = [...withoutLoading, ...connEls, ...labelEls, ...flowEls];
+      const finalEls = [...withoutLoading, ...connEls, ...labelEls, ...flowElsMutable, ...happyOverlayEls];
 
       flowStackRef.current.push(withoutLoading as ExcalidrawElement[]);
 
-      for (const e of flowEls) {
+      for (const e of flowElsMutable) {
         const dn = (e as ExcalidrawElement & { customData?: { drillName?: string } }).customData?.drillName;
         if (dn && e.type === 'rectangle') idToNameRef.current[e.id] = dn;
         if (e.type === 'text') {

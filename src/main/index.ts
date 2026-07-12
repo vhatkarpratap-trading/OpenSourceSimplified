@@ -904,8 +904,13 @@ function buildCodeFlowPrompt(name: string, sourceCode: string): string {
     '- Cross-class edges go between the description node of one class and the function node of another',
     '- 5–12 function nodes total. Every node connected.',
     '',
+    'Also return "happyPath": ordered list of node IDs that form the optimistic success path (no errors, no retries).',
+    '  - Include ONLY function node IDs (not description node IDs)',
+    '  - List them in reading order: entry point first, final output last',
+    '  - Example: ["A", "B", "C", "D"]',
+    '',
     'Schema:',
-    '{"mermaid":"flowchart TD string — use \\n for newlines"}',
+    '{"mermaid":"flowchart TD string — use \\n for newlines","happyPath":["nodeId1","nodeId2","nodeId3"]}',
     '',
     `SOURCE CODE of ${name}:`,
     '```',
@@ -922,8 +927,14 @@ ipcMain.handle('component:codeflow', async (_e, rawName: string) => {
   try {
     const cached = loadCache(currentFolder);
     const cachedValue = cached?.codeflows?.[name];
-    if (typeof cachedValue === 'string' && cachedValue.includes('flowchart')) {
-      return { ok: true, mermaid: cachedValue, fromCache: true };
+    if (typeof cachedValue === 'string') {
+      try {
+        const p = JSON.parse(cachedValue) as { mermaid: string; happyPath: string[] };
+        if (p?.mermaid) return { ok: true, mermaid: p.mermaid, happyPath: p.happyPath ?? [], fromCache: true };
+      } catch {
+        // old format was raw mermaid string
+        if (cachedValue.includes('flowchart')) return { ok: true, mermaid: cachedValue, happyPath: [], fromCache: true };
+      }
     }
 
     const structure = extractStructure(currentFolder);
@@ -944,11 +955,12 @@ ipcMain.handle('component:codeflow', async (_e, rawName: string) => {
       : `// No source file found for "${name}" — using project structure.\n${toClaudePromptJSON(structure).slice(0, 4000)}`;
 
     const raw = await runCapture(buildCodeFlowPrompt(name, context), currentFolder);
-    const parsed = extractJson(raw) as { mermaid?: string } | null;
+    const parsed = extractJson(raw) as { mermaid?: string; happyPath?: string[] } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
 
-    saveCodeFlow(currentFolder, name, parsed.mermaid);
-    return { ok: true, mermaid: parsed.mermaid };
+    const happyPath = parsed.happyPath ?? [];
+    saveCodeFlow(currentFolder, name, JSON.stringify({ mermaid: parsed.mermaid, happyPath }));
+    return { ok: true, mermaid: parsed.mermaid, happyPath };
   } catch (err: unknown) {
     return { error: err instanceof Error ? err.message : String(err) };
   }
