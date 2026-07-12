@@ -17,16 +17,16 @@ import { convertToExcalidrawElements } from '@excalidraw/excalidraw';
 import { FlatScene, ExcalidrawElement } from './diagramBuilder';
 
 /** Strip ```mermaid fences and stray whitespace an LLM may wrap around the code. */
-export function cleanMermaid(src: string): string {
+export function cleanMermaid(src: string, keepSubgraphs = false): string {
   let s = src
     .replace(/^\s*```(?:mermaid)?\s*/i, '')
     .replace(/```\s*$/i, '')
-    .replace(/\\n/g, '\n')   // un-escape literal \n that slipped through JSON
+    .replace(/\\n/g, '\n')
     .trim();
-  // Normalise legacy `graph` keyword to `flowchart` (mermaid-to-excalidraw requires the latter).
-  // classDiagram and sequenceDiagram are supported natively — leave them untouched.
   s = s.replace(/^graph\b/im, 'flowchart');
-  // mermaid-to-excalidraw does not support subgraphs — strip them, keeping their nodes.
+  if (keepSubgraphs) return s;
+  // Convert subgraphs to header nodes before stripping, so class names are preserved
+  s = convertSubgraphsToHeaderNodes(s);
   s = stripSubgraphs(s);
   return s;
 }
@@ -60,14 +60,17 @@ function stripSubgraphs(src: string): string {
  */
 function sanitizeMermaid(src: string): string {
   // Step 1: fix node IDs — alphanumeric + underscore only before the bracket
-  // Matches: WordPart.ext[Label] or Word-Part[Label] etc.
   let out = src.replace(/([A-Za-z0-9_][A-Za-z0-9_.\-]*)(\s*[\[\(\{])/g, (_m, id, bracket) => {
     const safeId = id.replace(/[^A-Za-z0-9_]/g, '_');
     return safeId + bracket;
   });
 
   // Step 2: clean content inside bracket node labels [ ] ( ) { }
+  // SKIP double-quoted labels like ["text"] — Mermaid supports these natively
+  // and they may contain intentional newlines and special chars.
   out = out.replace(/([\[\(\{])([^\]\)\}]*)([\]\)\}])/g, (_m, open, inner, close) => {
+    // If the inner content starts with a double-quote, leave it untouched
+    if (String(inner).trimStart().startsWith('"')) return `${open}${inner}${close}`;
     const safe = String(inner)
       .replace(/<br\s*\/?>/gi, ' ')
       .replace(/["'`]/g, '')
@@ -88,6 +91,61 @@ function sanitizeMermaid(src: string): string {
   });
 
   return out;
+}
+
+/**
+ * Convert subgraph blocks into a class-header node pattern the library can render.
+ * Each `subgraph ClassName ... end` becomes:
+ *   - A header node:  ClsHdr_N{{"ClassName"}}
+ *   - A dotted edge from that header to every first-level node inside the subgraph
+ * This guarantees class names always render even when the library rejects subgraphs.
+ */
+function convertSubgraphsToHeaderNodes(src: string): string {
+  const lines = src.split('\n');
+  const out: string[] = [];
+  let insideSubgraph = false;
+  let hdrId = '';
+  let firstChildren: string[] = [];
+  let hdrEdgesDeferred: string[] = [];
+  let headerCounter = 0;
+
+  for (const line of lines) {
+    const t = line.trim();
+
+    if (/^subgraph\b/i.test(t)) {
+      insideSubgraph = true;
+      firstChildren = [];
+      const labelMatch = t.match(/^subgraph\s+(.+)$/i);
+      const label = labelMatch ? labelMatch[1].replace(/["']/g, '').trim() : `Class${headerCounter}`;
+      hdrId = `_ClsHdr${headerCounter++}`;
+      // Hexagon shape for class header — visually distinct
+      out.push(`  ${hdrId}{{"${label}"}}`);
+      hdrEdgesDeferred = [];
+      continue;
+    }
+
+    if (/^end\b/i.test(t) && insideSubgraph) {
+      insideSubgraph = false;
+      // Emit dotted edges from header to first-level children
+      for (const child of firstChildren) {
+        out.push(`  ${hdrId} -.-> ${child}`);
+      }
+      firstChildren = [];
+      continue;
+    }
+
+    if (insideSubgraph) {
+      // Collect node ids that appear at the start of a line (first node in an edge or standalone)
+      const nodeMatch = t.match(/^([A-Za-z0-9_]+)\s*[\[(\{>]/);
+      if (nodeMatch && !firstChildren.includes(nodeMatch[1])) {
+        firstChildren.push(nodeMatch[1]);
+      }
+    }
+
+    out.push(line);
+  }
+
+  return out.join('\n');
 }
 
 /**
@@ -156,9 +214,16 @@ async function tryParse(def: string): Promise<{ type?: string }[] | null> {
 
 export async function buildMermaidScene(mermaid: string, descriptions?: Record<string, string>): Promise<FlatScene> {
   const cleaned = cleanMermaid(mermaid);
+  // cleanMermaid strips subgraphs — for diagrams that intentionally use them (code flow),
+  // try the original cleaned version without stripping first, then fall back.
+  const cleanedNoStrip = cleanMermaid(mermaid, /* keepSubgraphs */ true);
 
-  let skeletons = await tryParse(cleaned);
-  if (!skeletons) skeletons = await tryParse(sanitizeMermaid(cleaned));
+  let skeletons =
+    await tryParse(cleanedNoStrip) ??
+    await tryParse(cleaned) ??
+    await tryParse(sanitizeMermaid(cleanedNoStrip)) ??
+    await tryParse(sanitizeMermaid(cleaned));
+
   if (!skeletons) {
     console.error('[mermaidScene] FAILED to render. Raw input was:\n' + mermaid +
                   '\n--- cleaned ---\n' + cleaned +
@@ -168,11 +233,14 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
 
   const converted = convertToExcalidrawElements(skeletons as never) as unknown as ExcalidrawElement[];
 
-  const NODE_BG = '#eff6ff', NODE_STROKE = '#3b5b8c', NODE_TEXT = '#1e293b';
-  const EDGE = '#7c8aa0', EDGE_LABEL = '#475569';
-  const LAYER_BG = '#f8fafc', LAYER_STROKE = '#cbd5e1', LAYER_TEXT = '#64748b';
+  const NODE_BG = '#fffbe6', NODE_STROKE = '#1e1e2e', NODE_TEXT = '#1e1e2e';
+  const EDGE = '#1e1e2e', EDGE_LABEL = '#555577';
+  const LAYER_BG = '#f5f5f5', LAYER_STROKE = '#aaaabc', LAYER_TEXT = '#888899';
   const CHANGED_FILLS = new Set(['#fef3c7', '#fffbeb', '#fef9c3']);
-  const DESC_TEXT = '#64748b';
+  const DESC_TEXT = '#666677';
+  // Sketch feel: slight roughness + hand-drawn font (Virgil = fontFamily 1)
+  const ROUGHNESS = 1.2;
+  const FONT = 1;
 
   const isLayer = (el: ExcalidrawElement): boolean =>
     el.type === 'rectangle' && Array.isArray(el.groupIds) &&
@@ -203,13 +271,22 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
   const extraElements: ExcalidrawElement[] = [];
   let descSeed = 8000000;
 
+  // Per-node group ID: rect + its bound label text + description overlay all share
+  // this so they move together when dragged. Key = rectangle element ID.
+  const nodeGroupId = new Map<string, string>();
+  for (const el of converted) {
+    if (el.type === 'rectangle' && !layerIds.has(el.id)) {
+      nodeGroupId.set(el.id, `node-group-${el.id}`);
+    }
+  }
+
   const elements = converted.map(el => {
     if (el.type === 'rectangle') {
       if (layerIds.has(el.id)) {
         return {
           ...el,
-          backgroundColor: LAYER_BG, strokeColor: LAYER_STROKE, strokeWidth: 1,
-          fillStyle: 'solid', roughness: 0, strokeStyle: 'dashed',
+          backgroundColor: LAYER_BG, strokeColor: LAYER_STROKE, strokeWidth: 1.5,
+          fillStyle: 'solid', roughness: ROUGHNESS, strokeStyle: 'dashed',
           customData: { ...el.customData, isLayer: true },
         } as ExcalidrawElement;
       }
@@ -220,20 +297,22 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
       const desc = label ? (descNorm[label.toLowerCase()] ?? null) : null;
       const extraH = desc ? DESC_EXTRA_HEIGHT : 0;
       const box = el as ExcalidrawElement & { x: number; y: number; width: number; height: number };
+      const grp = nodeGroupId.get(el.id)!;
+      // Merge the node's own group ID with the library-assigned groups (e.g. subgraph group)
+      const mergedGroupIds = [...new Set([grp, ...el.groupIds])];
 
       if (desc && extraH > 0) {
-        // Add a floating description text element below the label, inside the box
         extraElements.push({
           type: 'text',
           id: `desc-${el.id}`,
           x: box.x + 8,
-          y: box.y + box.height + 6,  // just below existing box bottom
+          y: box.y + box.height + 6,
           width: box.width - 16,
           height: extraH - 8,
           text: desc,
           originalText: desc,
           fontSize: 10,
-          fontFamily: 2,
+          fontFamily: FONT,
           textAlign: 'center',
           verticalAlign: 'top',
           strokeColor: DESC_TEXT,
@@ -245,7 +324,7 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
           roughness: 0,
           opacity: 85,
           roundness: null,
-          groupIds: el.groupIds,
+          groupIds: mergedGroupIds,
           frameId: null,
           seed: descSeed++,
           version: 1,
@@ -265,24 +344,50 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
       return {
         ...el,
         height: (el as { height: number }).height + extraH,
+        groupIds: mergedGroupIds,
         backgroundColor: isChanged ? '#fef3c7' : NODE_BG,
         strokeColor:     isChanged ? '#d97706' : NODE_STROKE,
-        strokeWidth:     isChanged ? 2 : 1.5,
+        strokeWidth:     isChanged ? 2.5 : 2,
         fillStyle: 'solid',
-        roughness: 0,
+        roughness: ROUGHNESS,
         customData: { ...el.customData, nodeType: 'component', changed: isChanged },
       } as ExcalidrawElement;
     }
     if (el.type === 'text') {
       const boundTo = (el as { containerId?: string | null }).containerId;
       if (boundTo && layerIds.has(boundTo)) {
-        return { ...el, strokeColor: LAYER_TEXT, opacity: 100 } as ExcalidrawElement;
+        return { ...el, strokeColor: LAYER_TEXT, fontFamily: FONT, opacity: 100 } as ExcalidrawElement;
       }
       const isEdgeLabel = !boundTo;
-      return { ...el, strokeColor: isEdgeLabel ? EDGE_LABEL : NODE_TEXT, opacity: 100 } as ExcalidrawElement;
+      const nodeGrp = boundTo ? nodeGroupId.get(boundTo) : undefined;
+      // Check if this text belongs to a class header diamond
+      const parentEl = boundTo ? converted.find(e => e.id === boundTo) : null;
+      const isClassHeaderText = parentEl && (parentEl as { type: string }).type === 'diamond';
+      const mergedGroupIds = nodeGrp
+        ? [...new Set([nodeGrp, ...el.groupIds])]
+        : el.groupIds;
+      return {
+        ...el,
+        groupIds: mergedGroupIds,
+        fontFamily: FONT,
+        fontSize: isClassHeaderText ? 13 : (el as { fontSize?: number }).fontSize,
+        strokeColor: isClassHeaderText ? '#ffffff' : isEdgeLabel ? EDGE_LABEL : NODE_TEXT,
+        opacity: 100,
+      } as ExcalidrawElement;
     }
     if (el.type === 'arrow') {
-      return { ...el, strokeColor: EDGE, strokeWidth: 1.5, opacity: 90, roughness: 0 } as ExcalidrawElement;
+      // Dotted arrows are class-header connectors — style them subtly
+      const isDotted = (el as { strokeStyle?: string }).strokeStyle === 'dashed';
+      return { ...el, strokeColor: isDotted ? '#94a3b8' : EDGE, strokeWidth: isDotted ? 1 : 2, opacity: isDotted ? 50 : 90, roughness: ROUGHNESS } as ExcalidrawElement;
+    }
+    // Diamond/hexagon = class header node (from {{ClassName}} syntax) — passthrough with dark styling
+    if ((el as unknown as { type: string }).type === 'diamond') {
+      return {
+        ...(el as unknown as Record<string, unknown>),
+        backgroundColor: '#1e293b', strokeColor: '#1e293b', strokeWidth: 2,
+        fillStyle: 'solid', roughness: ROUGHNESS,
+        customData: { ...(el as unknown as { customData?: object }).customData, isClassHeader: true },
+      } as unknown as ExcalidrawElement;
     }
     return el;
   });

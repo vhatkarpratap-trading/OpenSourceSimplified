@@ -11,9 +11,12 @@ interface CanvasProps {
   onAPIReady?: (api: ExcalidrawImperativeAPI) => void;
   onRenderError?: (message: string | null) => void;
   onDrilldownChange?: (active: boolean) => void;
+  onCodeFlowChange?: (active: boolean) => void;
   onSelectionChange?: (name: string | null) => void;
   clearDrilldownRef?: React.MutableRefObject<(() => void) | null>;
+  clearCodeFlowRef?: React.MutableRefObject<(() => void) | null>;
   renderDrilldownRef?: React.MutableRefObject<((name: string) => void) | null>;
+  renderCodeFlowRef?: React.MutableRefObject<((name: string) => void) | null>;
 }
 
 interface GitAnnotation { name: string; summary: string; added: number; removed: number }
@@ -116,7 +119,7 @@ function applyZoomAndGit(
   });
 }
 
-export default function Canvas({ diagramData, activeKind = 'structure', onAPIReady, onRenderError, onDrilldownChange, onSelectionChange, clearDrilldownRef, renderDrilldownRef }: CanvasProps) {
+export default function Canvas({ diagramData, activeKind = 'structure', onAPIReady, onRenderError, onDrilldownChange, onCodeFlowChange, onSelectionChange, clearDrilldownRef, clearCodeFlowRef, renderDrilldownRef, renderCodeFlowRef }: CanvasProps) {
   const [apiReady, setApiReady] = useState(false);
   const apiRef          = useRef<ExcalidrawImperativeAPI | null>(null);
   const lastDataRef     = useRef<DiagramData | null>(null);
@@ -132,10 +135,11 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
   const idToNameRef        = useRef<Record<string, string>>({});
   const selectedNameRef    = useRef<string | null>(null);
   const drillBusyRef       = useRef(false);
-  // drilldownActiveRef is true whenever drillStackRef has entries
   const drilldownActiveRef = useRef(false);
-  // Stack of scene snapshots — each push saves the full element list before adding a drill level
   const drillStackRef      = useRef<ExcalidrawElement[][]>([]);
+  // Code flow has its own independent stack — both panels live on canvas simultaneously
+  const flowActiveRef      = useRef(false);
+  const flowStackRef       = useRef<ExcalidrawElement[][]>([]);
 
   // Load scene when data, active diagram kind, or API changes
   useEffect(() => {
@@ -157,8 +161,8 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     // Fingerprint = active kind + its mermaid source; redraw only when it changes
     const key = `${activeKind}|${mermaid.length}|${mermaid.slice(0, 64)}`;
     if (key === lastDiagramKey.current) return;
-    // Don't reload base scene while drilldown is active — it would wipe the overlay
-    if (drilldownActiveRef.current) return;
+    // Don't reload base scene while drilldown or code flow is active — it would wipe the overlay
+    if (drilldownActiveRef.current || flowActiveRef.current) return;
     lastDiagramKey.current = key;
     lastDataRef.current = diagramData;
 
@@ -222,7 +226,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       const api  = apiRef.current;
       const flat = flatRef.current;
       if (!api || !flat) return;
-      if (drilldownActiveRef.current) return; // drilldown owns the scene — don't overwrite
+      if (drilldownActiveRef.current || flowActiveRef.current) return; // overlays own the scene
 
       const zoom = (api.getAppState().zoom as { value: number }).value;
       if (Math.abs(zoom - lastZoomRef.current) < 0.001) return;
@@ -233,7 +237,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       debounceRef.current = setTimeout(() => {
         const api2 = apiRef.current;
         const flat2 = flatRef.current;
-        if (!api2 || !flat2 || drilldownActiveRef.current) return;
+        if (!api2 || !flat2 || drilldownActiveRef.current || flowActiveRef.current) return;
         const z = (api2.getAppState().zoom as { value: number }).value;
         const updated = applyZoomAndGit(flat2, z, gitRef.current, claudeRef.current);
         flatRef.current = { ...flat2, elements: updated };
@@ -248,7 +252,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
   useEffect(() => {
     window.electronAPI.onGitStatus((changedNames: string[]) => {
       gitRef.current = changedNames;
-      if (drilldownActiveRef.current) return; // don't overwrite drilldown scene
+      if (drilldownActiveRef.current || flowActiveRef.current) return; // don't overwrite drill/flow scene
       const api  = apiRef.current;
       const flat = flatRef.current;
       if (!api || !flat) return;
@@ -266,7 +270,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     window.electronAPI.onClaudeChanges((changes: ClaudeHighlights) => {
       claudeRef.current = changes;
       gitRef.current = null;
-      if (drilldownActiveRef.current) return; // don't overwrite drilldown scene
+      if (drilldownActiveRef.current || flowActiveRef.current) return; // don't overwrite drill/flow scene
       const api  = apiRef.current;
       const flat = flatRef.current;
       if (!api || !flat) return;
@@ -359,9 +363,8 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     onSelectionChange?.(null);
   }, [onSelectionChange]);
 
-  // ── Inline drilldown ──────────────────────────────────────────────────────────
+  // ── Drilldown clear/back ─────────────────────────────────────────────────────
 
-  // Pop one drill level (Back button). If stack empties, exit drill mode.
   const clearDrilldown = useCallback(() => {
     const api = apiRef.current;
     if (!api || drillStackRef.current.length === 0) return;
@@ -370,20 +373,23 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     const prev = drillStackRef.current[drillStackRef.current.length - 1] ?? null;
 
     if (prev) {
-      // Restore previous drill level
       api.updateScene({ elements: prev as unknown as EXEl[] });
     } else {
-      // Stack empty — fully exit drilldown, restore base scene
       drilldownActiveRef.current = false;
       onDrilldownChange?.(false);
-      lastDiagramKey.current = ''; // allow scene-load effect to re-run
-      // Restore base elements from flatRef
-      const flat = flatRef.current;
-      if (flat) {
-        const els = applyZoomAndGit(flat, lastZoomRef.current, gitRef.current, claudeRef.current);
-        api.updateScene({ elements: els as unknown as EXEl[] });
+      lastDiagramKey.current = '';
+      // If flow is still active, restore to the flow snapshot; else restore base scene
+      if (flowActiveRef.current && flowStackRef.current.length > 0) {
+        const flowBase = flowStackRef.current[0];
+        api.updateScene({ elements: flowBase as unknown as EXEl[] });
       } else {
-        api.resetScene();
+        const flat = flatRef.current;
+        if (flat) {
+          const els = applyZoomAndGit(flat, lastZoomRef.current, gitRef.current, claudeRef.current);
+          api.updateScene({ elements: els as unknown as EXEl[] });
+        } else {
+          api.resetScene();
+        }
       }
     }
 
@@ -396,6 +402,46 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
   useEffect(() => {
     if (clearDrilldownRef) clearDrilldownRef.current = clearDrilldown;
   }, [clearDrilldown, clearDrilldownRef]);
+
+  // ── Code flow clear/back ──────────────────────────────────────────────────────
+
+  const clearCodeFlow = useCallback(() => {
+    const api = apiRef.current;
+    if (!api || flowStackRef.current.length === 0) return;
+
+    flowStackRef.current.pop();
+    const prev = flowStackRef.current[flowStackRef.current.length - 1] ?? null;
+
+    if (prev) {
+      api.updateScene({ elements: prev as unknown as EXEl[] });
+    } else {
+      flowActiveRef.current = false;
+      onCodeFlowChange?.(false);
+      lastDiagramKey.current = '';
+      // If drill is still active, restore to drill snapshot; else restore base scene
+      if (drilldownActiveRef.current && drillStackRef.current.length > 0) {
+        const drillBase = drillStackRef.current[0];
+        api.updateScene({ elements: drillBase as unknown as EXEl[] });
+      } else {
+        const flat = flatRef.current;
+        if (flat) {
+          const els = applyZoomAndGit(flat, lastZoomRef.current, gitRef.current, claudeRef.current);
+          api.updateScene({ elements: els as unknown as EXEl[] });
+        } else {
+          api.resetScene();
+        }
+      }
+    }
+
+    setTimeout(() => {
+      const els = api.getSceneElements().filter(e => (e.opacity ?? 100) > 5);
+      if (els.length > 0) api.scrollToContent(els as EXEl[], { fitToContent: true, animate: true });
+    }, 100);
+  }, [onCodeFlowChange]);
+
+  useEffect(() => {
+    if (clearCodeFlowRef) clearCodeFlowRef.current = clearCodeFlow;
+  }, [clearCodeFlow, clearCodeFlowRef]);
 
   const renderDrilldown = useCallback(async (rawName: string) => {
     const name = rawName.trim();
@@ -590,6 +636,168 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     if (renderDrilldownRef) renderDrilldownRef.current = renderDrilldown;
   }, [renderDrilldown, renderDrilldownRef]);
 
+  const renderCodeFlow = useCallback(async (rawName: string) => {
+    const name = rawName.trim();
+    const api = apiRef.current;
+    if (!api) return;
+
+    const currentEls = api.getSceneElements() as unknown as ExcalidrawElement[];
+
+    // Find anchor box for the dashed connector
+    const nameLC = name.toLowerCase();
+    const matchingIds = Object.entries(idToNameRef.current)
+      .filter(([, n]) => n.toLowerCase() === nameLC).map(([id]) => id);
+    const nodeElIds = new Set(matchingIds);
+    const box = currentEls.find(e => {
+      if (e.type !== 'rectangle') return false;
+      if (nodeElIds.has(e.id)) return true;
+      const dn = (e as ExcalidrawElement & { customData?: { drillName?: string } }).customData?.drillName;
+      return dn && dn.toLowerCase() === nameLC;
+    }) as (ExcalidrawElement & { x: number; y: number; width: number; height: number }) | undefined;
+
+    // Loading indicator
+    const allRects = currentEls.filter(e => e.type === 'rectangle') as
+      (ExcalidrawElement & { x: number; y: number; width: number; height: number })[];
+    const maxX = allRects.reduce((m, e) => Math.max(m, e.x + e.width), box ? box.x + box.width : 0);
+    const loadX = maxX + 80;
+    const loadY = box ? box.y : allRects.reduce((m, e) => Math.min(m, e.y), 200);
+    let seed = 7000000 + flowStackRef.current.length * 100000;
+
+    const loadingEls: unknown[] = [{
+      type: 'rectangle', id: `flow-loading-rect-${seed}`,
+      x: loadX, y: loadY, width: 240, height: 40,
+      strokeColor: '#16a34a', backgroundColor: '#dcfce7',
+      fillStyle: 'solid', strokeWidth: 2, strokeStyle: 'dashed',
+      angle: 0, roughness: 1, opacity: 100, roundness: { type: 3 }, groupIds: [],
+      frameId: null, seed: seed++, version: 1, versionNonce: seed++,
+      isDeleted: false, boundElements: [], updated: Date.now(), link: null, locked: false,
+    }, {
+      type: 'text', id: `flow-loading-text-${seed}`,
+      x: loadX + 10, y: loadY + 11, width: 220, height: 18,
+      text: `Tracing flow of ${name}…`, originalText: `Tracing flow of ${name}…`,
+      fontSize: 12, fontFamily: 1, textAlign: 'left', verticalAlign: 'top',
+      strokeColor: '#15803d', backgroundColor: 'transparent',
+      fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
+      angle: 0, roughness: 0, opacity: 100, roundness: null, groupIds: [],
+      frameId: null, seed: seed++, version: 1, versionNonce: seed++,
+      isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false,
+      containerId: null, lineHeight: 1.25, baseline: 10,
+    }];
+    api.updateScene({ elements: [...currentEls, ...loadingEls] as unknown as EXEl[] });
+
+    try {
+      const res = await window.electronAPI.getComponentCodeFlow(name);
+      console.log('[codeflow] ok:', res?.ok, 'error:', res?.error);
+      if (!res?.ok || !res.mermaid) throw new Error(res?.error || 'no mermaid');
+
+      const { buildMermaidScene: bms } = await import('./mermaidScene');
+      const flowScene = await bms(res.mermaid);
+
+      const freshEls = api.getSceneElements() as unknown as ExcalidrawElement[];
+      const freshRects = freshEls.filter(e =>
+        e.type === 'rectangle' && !e.id.startsWith('flow-loading')
+      ) as (ExcalidrawElement & { x: number; y: number; width: number; height: number })[];
+      const panelOffsetX = freshRects.reduce((m, e) => Math.max(m, e.x + e.width), 0) + 100;
+      const panelOffsetY = freshRects.reduce((m, e) => Math.min(m, e.y), Infinity);
+      const panelY = isFinite(panelOffsetY) ? panelOffsetY : 0;
+
+      const depth = flowStackRef.current.length;
+      seed = 7000000 + depth * 100000;
+
+      const flowEls = flowScene.elements.map((e, i) => ({
+        ...e,
+        id: `flow-d${depth}-${i}-${e.id}`,
+        x: (e as { x: number }).x + panelOffsetX,
+        y: (e as { y: number }).y + panelY,
+        _baseOpacity: 100, opacity: 100,
+        customData: {
+          ...(e as { customData?: object }).customData,
+          drillDepth: depth,
+          drillName: (e as { type?: string }).type === 'rectangle'
+            ? (() => {
+                const t = flowScene.elements.find(t =>
+                  (t as { type?: string; containerId?: string }).type === 'text' &&
+                  (t as { containerId?: string }).containerId === (e as { id: string }).id
+                );
+                return t ? (t as { text?: string }).text?.split('\n')[0].trim() : undefined;
+              })()
+            : undefined,
+        },
+      })) as unknown as ExcalidrawElement[];
+
+      // Dashed green connector from anchor node to the flow panel
+      const flowMinX = flowEls.filter(e => e.type === 'rectangle')
+        .reduce((m, e) => Math.min(m, (e as { x: number }).x), Infinity);
+      const flowMidY = flowEls.filter(e => e.type === 'rectangle')
+        .reduce((acc, e, _, arr) => acc + ((e as { y: number; height: number }).y + (e as { height: number }).height / 2) / arr.length, 0);
+
+      const connEls: unknown[] = box ? [{
+        type: 'arrow', id: `flow-conn-d${depth}`,
+        x: box.x + box.width, y: box.y + box.height / 2,
+        width: flowMinX - (box.x + box.width),
+        height: flowMidY - (box.y + box.height / 2),
+        points: [[0, 0], [flowMinX - (box.x + box.width), flowMidY - (box.y + box.height / 2)]],
+        strokeColor: '#16a34a', backgroundColor: 'transparent', fillStyle: 'solid',
+        strokeWidth: 2, strokeStyle: 'dashed', angle: 0, roughness: 0, opacity: 70,
+        startArrowhead: null, endArrowhead: 'arrow', boundElements: null,
+        groupIds: [], frameId: null, seed: seed++, version: 1, versionNonce: seed++,
+        isDeleted: false, updated: Date.now(), link: null, locked: false,
+        startBinding: null, endBinding: null, roundness: { type: 2 }, elbowed: false,
+      }] : [];
+
+      const labelEls: unknown[] = [{
+        type: 'text', id: `flow-label-d${depth}`,
+        x: panelOffsetX, y: panelY - 26, width: 400, height: 20,
+        text: `⟳ Code Flow: ${name}`, originalText: `⟳ Code Flow: ${name}`,
+        fontSize: 13, fontFamily: 1, textAlign: 'left', verticalAlign: 'top',
+        strokeColor: '#16a34a', backgroundColor: 'transparent',
+        fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
+        angle: 0, roughness: 0, opacity: 100, roundness: null, groupIds: [],
+        frameId: null, seed: seed++, version: 1, versionNonce: seed++,
+        isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false,
+        containerId: null, lineHeight: 1.25, baseline: 10,
+      }];
+
+      const withoutLoading = (api.getSceneElements() as unknown as ExcalidrawElement[])
+        .filter(e => !e.id.startsWith('flow-loading'));
+      const finalEls = [...withoutLoading, ...connEls, ...labelEls, ...flowEls];
+
+      flowStackRef.current.push(withoutLoading as ExcalidrawElement[]);
+
+      for (const e of flowEls) {
+        const dn = (e as ExcalidrawElement & { customData?: { drillName?: string } }).customData?.drillName;
+        if (dn && e.type === 'rectangle') idToNameRef.current[e.id] = dn;
+        if (e.type === 'text') {
+          const text = (e as { text?: string }).text?.split('\n')[0].trim();
+          if (text) idToNameRef.current[e.id] = text;
+        }
+      }
+
+      flowActiveRef.current = true;
+      onCodeFlowChange?.(true);
+
+      api.updateScene({ elements: finalEls as unknown as EXEl[] });
+      setTimeout(() => {
+        const newEls = (finalEls as ExcalidrawElement[]).filter((e: ExcalidrawElement) =>
+          e.id.startsWith(`flow-d${depth}`) || e.id === `flow-conn-d${depth}` || e.id === `flow-label-d${depth}`
+        );
+        if (newEls.length > 0)
+          api.scrollToContent(newEls as unknown as EXEl[], { fitToContent: false, animate: true });
+      }, 150);
+
+    } catch (err) {
+      console.error('[codeflow] failed:', err);
+      const withoutLoading = (api.getSceneElements() as unknown as ExcalidrawElement[])
+        .filter(e => !e.id.startsWith('flow-loading'));
+      api.updateScene({ elements: withoutLoading as unknown as EXEl[] });
+    }
+  }, [onCodeFlowChange]);
+
+
+  useEffect(() => {
+    if (renderCodeFlowRef) renderCodeFlowRef.current = renderCodeFlow;
+  }, [renderCodeFlow, renderCodeFlowRef]);
+
   const handleChange = useCallback((_els: readonly EXEl[], appState: { selectedElementIds?: Record<string, boolean> }) => {
     const selectedIds = Object.keys(appState.selectedElementIds || {}).filter(id => appState.selectedElementIds![id]);
     if (selectedIds.length === 0) {
@@ -618,7 +826,6 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
   return (
     <div style={{ width: '100%', height: '100%' }}>
       <style>{`
-        .excalidraw .App-toolbar,
         .excalidraw .App-menu__left,
         .excalidraw .App-menu__right,
         .excalidraw .layer-ui__wrapper__footer,
@@ -630,7 +837,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       <Excalidraw
         excalidrawAPI={handleAPI}
         onChange={handleChange as unknown as React.ComponentProps<typeof Excalidraw>['onChange']}
-        initialData={{ appState: { viewBackgroundColor: '#f8fafc' } }}
+        initialData={{ appState: { viewBackgroundColor: '#fafaf7' } }}
         UIOptions={{
           tools: { image: false },
           canvasActions: {

@@ -18,11 +18,14 @@ let patchInProgress = false;
 // One JSON file per project, keyed by a hash of the extracted structure.
 // Drilldown results are cached inside the same file under `drilldowns[name]`.
 
+interface CodeFlowStep { fn: string; what: string; data: string }
+
 interface CacheFile {
-  structureHash: string;           // SHA-256 of structureJson — invalidates when code changes
-  diagram: object;                 // full DiagramData returned by Claude
-  drilldowns: Record<string, string>;  // componentName → mermaid string
-  savedAt: number;                 // Date.now() at write time
+  structureHash: string;
+  diagram: object;
+  drilldowns: Record<string, string>;
+  codeflows: Record<string, string>;
+  savedAt: number;
 }
 
 function cacheDir(): string {
@@ -54,6 +57,7 @@ function saveCache(folder: string, data: Partial<CacheFile> & { diagram: object;
       structureHash: data.structureHash,
       diagram: data.diagram,
       drilldowns: { ...(existing?.drilldowns ?? {}), ...(data.drilldowns ?? {}) },
+      codeflows: { ...(existing?.codeflows ?? {}), ...(data.codeflows ?? {}) },
       savedAt: Date.now(),
     };
     fs.writeFileSync(cacheFile(folder), JSON.stringify(merged, null, 2), 'utf8');
@@ -75,6 +79,18 @@ function invalidateDrilldowns(folder: string) {
     const existing = loadCache(folder);
     if (!existing) return;
     existing.drilldowns = {};
+    existing.codeflows = {};
+    existing.savedAt = Date.now();
+    fs.writeFileSync(cacheFile(folder), JSON.stringify(existing, null, 2), 'utf8');
+  } catch { /* ignore */ }
+}
+
+function saveCodeFlow(folder: string, componentName: string, mermaid: string) {
+  try {
+    const existing = loadCache(folder);
+    if (!existing) return;
+    existing.codeflows = existing.codeflows ?? {};
+    existing.codeflows[componentName] = mermaid;
     existing.savedAt = Date.now();
     fs.writeFileSync(cacheFile(folder), JSON.stringify(existing, null, 2), 'utf8');
   } catch { /* ignore */ }
@@ -488,7 +504,7 @@ function createWindow() {
     width: 1400,
     height: 900,
     titleBarStyle: 'hiddenInset',
-    trafficLightPosition: { x: 16, y: 16 },
+    trafficLightPosition: { x: 16, y: 18 },
     backgroundColor: '#1a1a2e',
     webPreferences: {
       nodeIntegration: false,
@@ -843,6 +859,95 @@ ipcMain.handle('component:drilldown', async (_e, rawName: string) => {
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
 
     saveDrilldown(currentFolder, name, parsed.mermaid);
+    return { ok: true, mermaid: parsed.mermaid };
+  } catch (err: unknown) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+// ── Code flow ─────────────────────────────────────────────────────────────────
+
+function buildCodeFlowPrompt(name: string, sourceCode: string): string {
+  return [
+    `Produce a code flow diagram for the "${name}" feature. Group functions by class using subgraphs. Each function gets TWO nodes: a function node and a description note below it.`,
+    'Output ONLY the JSON below — no fences, no prose.',
+    '',
+    'FOR EACH FUNCTION, create two nodes:',
+    '  1. A function node (rectangle):  Id["functionName()\\nkey code line"]',
+    '     - Line 1: exact function name with ()',
+    '     - Line 2: the single most important line of real code from that function',
+    '  2. A description note (stadium shape):  IdDesc(["what this code line does in plain English"])',
+    '     - One sentence, active voice: "Fetches all visits with pending changes before sync"',
+    '     - Connect it directly below the function node: Id --> IdDesc',
+    '',
+    'Then connect function nodes to the NEXT function node with a labelled edge:',
+    '  IdDesc -->|variableName| NextId',
+    '  Edge label = the exact variable or type being passed (e.g. "allPendingVisits", "AuthToken", "mergedDiffMap")',
+    '',
+    'EXAMPLE (two functions in same class):',
+    '  subgraph SyncManager',
+    '    A["preProcess()\\nconst visits = await fetchAllWithPending(api)"]',
+    '    ADesc(["Loads every offline visit that has uncommitted changes"])',
+    '    B["prepareSync()\\nconst diff = mergeAllDiffs(server, client, ids)"]',
+    '    BDesc(["Merges server and client diffs into a single conflict-resolved map"])',
+    '    A --> ADesc',
+    '    ADesc -->|allPendingVisits| B',
+    '    B --> BDesc',
+    '  end',
+    '',
+    'MERMAID SYNTAX:',
+    '- Start with `flowchart TD`',
+    '- Subgraph per class: `subgraph ClassName\\n  ...\\nend`',
+    '- Function node: `Id["fnName()\\ncode line"]`  — double quotes, \\n between lines',
+    '- Description node: `IdDesc(["plain sentence"])`  — stadium shape with double quotes',
+    '- Node ids: letters/digits/underscore only, unique across all subgraphs',
+    '- Cross-class edges go between the description node of one class and the function node of another',
+    '- 5–12 function nodes total. Every node connected.',
+    '',
+    'Schema:',
+    '{"mermaid":"flowchart TD string — use \\n for newlines"}',
+    '',
+    `SOURCE CODE of ${name}:`,
+    '```',
+    sourceCode.slice(0, 8000),
+    '```',
+    '',
+    'JSON only.',
+  ].join('\n');
+}
+
+ipcMain.handle('component:codeflow', async (_e, rawName: string) => {
+  const name = rawName.trim();
+  if (!currentFolder || !name) return { error: 'no component' };
+  try {
+    const cached = loadCache(currentFolder);
+    const cachedValue = cached?.codeflows?.[name];
+    if (typeof cachedValue === 'string' && cachedValue.includes('flowchart')) {
+      return { ok: true, mermaid: cachedValue, fromCache: true };
+    }
+
+    const structure = extractStructure(currentFolder);
+    const sourceFiles = findSourceFiles(name, structure.nodePaths, currentFolder);
+
+    let sourceCode = '';
+    let budget = 8000;
+    for (const { filePath, content } of sourceFiles) {
+      const rel = path.relative(currentFolder, filePath);
+      const chunk = content.slice(0, budget);
+      sourceCode += `\n// ── ${rel} ──\n${chunk}`;
+      budget -= chunk.length;
+      if (budget <= 0) break;
+    }
+
+    const context = sourceCode.trim()
+      ? sourceCode
+      : `// No source file found for "${name}" — using project structure.\n${toClaudePromptJSON(structure).slice(0, 4000)}`;
+
+    const raw = await runCapture(buildCodeFlowPrompt(name, context), currentFolder);
+    const parsed = extractJson(raw) as { mermaid?: string } | null;
+    if (!parsed?.mermaid) return { error: 'no mermaid in response' };
+
+    saveCodeFlow(currentFolder, name, parsed.mermaid);
     return { ok: true, mermaid: parsed.mermaid };
   } catch (err: unknown) {
     return { error: err instanceof Error ? err.message : String(err) };

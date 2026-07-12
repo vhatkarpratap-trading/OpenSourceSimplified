@@ -41,13 +41,19 @@ export default function App() {
   const [renderError, setRenderError]       = useState<string | null>(null);
   const [drilldownActive, setDrilldownActive] = useState(false);
   const [drillDepth, setDrillDepth]           = useState(0);
+  const [codeFlowActive, setCodeFlowActive]   = useState(false);
+  const [codeFlowDepth, setCodeFlowDepth]     = useState(0);
   const [selectedComponent, setSelectedComponent] = useState<string | null>(null);
   const [drilling, setDrilling]               = useState(false);
+  const [codeFlowLoading, setCodeFlowLoading] = useState(false);
+  const [terminalMinimized, setTerminalMinimized] = useState(false);
 
-  const excalidrawAPIRef  = useRef<ExcalidrawImperativeAPI | null>(null);
-  const clearDrilldownRef = useRef<(() => void) | null>(null);
+  const excalidrawAPIRef   = useRef<ExcalidrawImperativeAPI | null>(null);
+  const clearDrilldownRef  = useRef<(() => void) | null>(null);
+  const clearCodeFlowRef   = useRef<(() => void) | null>(null);
   const renderDrilldownRef = useRef<((name: string) => void) | null>(null);
-  const listenersAttached = useRef(false);
+  const renderCodeFlowRef  = useRef<((name: string) => void) | null>(null);
+  const listenersAttached  = useRef(false);
 
   if (!listenersAttached.current) {
     listenersAttached.current = true;
@@ -56,7 +62,6 @@ export default function App() {
       const data = d as DiagramData | null;
       setDiagram(data);
       setRenderError(null);
-      // Prefer showing the git-diff explanation when a change produced one
       if (data?.diagrams) {
         if (data.diagrams.gitDiff) setActiveKind('gitDiff');
         else if (data.diagrams.structure) setActiveKind('structure');
@@ -94,13 +99,18 @@ export default function App() {
 
   const folderName = folder ? folder.split('/').filter(Boolean).pop() : null;
   const busy = status === 'running' || status === 'patching';
-  const canvasLabel = drilldownActive
-    ? `Drill: ${selectedComponent ?? ''}`
+  const canvasLabel = (drilldownActive || codeFlowActive)
+    ? [drilldownActive && `Drill: ${selectedComponent ?? ''}`, codeFlowActive && `Flow: ${selectedComponent ?? ''}`].filter(Boolean).join(' · ')
     : (diagram ? diagram.pattern : 'Canvas');
 
   const handleBack = useCallback(() => {
     clearDrilldownRef.current?.();
     setDrillDepth(d => Math.max(0, d - 1));
+  }, []);
+
+  const handleBackFlow = useCallback(() => {
+    clearCodeFlowRef.current?.();
+    setCodeFlowDepth(d => Math.max(0, d - 1));
   }, []);
 
   const handleDrill = useCallback(async () => {
@@ -111,19 +121,29 @@ export default function App() {
     setDrilling(false);
   }, [selectedComponent, drilling]);
 
+  const handleCodeFlow = useCallback(async () => {
+    if (!selectedComponent || codeFlowLoading) return;
+    setCodeFlowLoading(true);
+    await renderCodeFlowRef.current?.(selectedComponent);
+    setCodeFlowDepth(d => d + 1);
+    setCodeFlowLoading(false);
+  }, [selectedComponent, codeFlowLoading]);
+
+  const canFlow = !!selectedComponent && !codeFlowLoading;
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', width: '100vw', height: '100vh', background: '#0f0f1a' }}>
 
       {/* ── Toolbar ── */}
       <div style={{
         display: 'flex', alignItems: 'center', gap: 10,
-        padding: '0 16px', height: 44,
+        padding: '0 16px', height: 52,
         background: '#13131f', borderBottom: '1px solid #1e1e3a',
         flexShrink: 0,
         // @ts-ignore
         WebkitAppRegion: 'drag',
       }}>
-        <div style={{ width: 72, flexShrink: 0 }} />
+        <div style={{ width: 80, flexShrink: 0 }} />
 
         {/* Open Project */}
         <button onClick={handleOpenFolder} style={{
@@ -167,11 +187,11 @@ export default function App() {
           )}
         </div>
 
-        {/* Drill button — enabled only when a component is selected */}
+        {/* Drill button */}
         <button
           onClick={handleDrill}
           disabled={!selectedComponent || drilling || drilldownActive}
-          title={selectedComponent ? `Drill into ${selectedComponent}` : 'Select a component on the canvas first'}
+          title={selectedComponent ? `Drill into ${selectedComponent}` : 'Select a component first'}
           style={{
             display: 'flex', alignItems: 'center', gap: 6,
             padding: '5px 14px', background: selectedComponent && !drilldownActive ? '#0f4c75' : '#13131f',
@@ -187,6 +207,29 @@ export default function App() {
         >
           <DrillIcon />
           {drilling ? 'Drilling…' : selectedComponent ? `Drill: ${selectedComponent}` : 'Drill'}
+        </button>
+
+        {/* Code Flow button */}
+        <button
+          onClick={handleCodeFlow}
+          disabled={!canFlow}
+          title={selectedComponent ? `Trace code flow of ${selectedComponent}` : 'Select a component first'}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 6,
+            padding: '5px 14px',
+            background: canFlow ? '#1a3a1a' : '#13131f',
+            border: `1px solid ${canFlow ? '#16a34a' : '#2a2a50'}`, borderRadius: 6,
+            color: canFlow ? '#86efac' : '#444466', fontSize: 12,
+            fontFamily: 'system-ui, -apple-system, sans-serif',
+            cursor: canFlow ? 'pointer' : 'not-allowed',
+            opacity: canFlow ? 1 : 0.45, flexShrink: 0,
+            transition: 'all 0.2s',
+            // @ts-ignore
+            WebkitAppRegion: 'no-drag',
+          }}
+        >
+          <FlowIcon />
+          {codeFlowLoading ? 'Tracing…' : 'Code Flow'}
         </button>
 
         {/* Analyse */}
@@ -254,9 +297,13 @@ export default function App() {
 
         {/* Terminal */}
         <div style={{
-          width: '38%', minWidth: 300, display: 'flex', flexDirection: 'column',
+          width: terminalMinimized ? 32 : '38%',
+          minWidth: terminalMinimized ? 32 : 300,
+          display: 'flex', flexDirection: 'column',
           background: '#0d0d1a', borderRadius: 10,
           border: '1px solid #2a2a4a', overflow: 'hidden',
+          transition: 'width 0.2s ease, min-width 0.2s ease',
+          flexShrink: 0,
         }}>
           <div style={{
             padding: '6px 12px', fontSize: 10,
@@ -264,10 +311,23 @@ export default function App() {
             color: '#444466', letterSpacing: '0.1em',
             textTransform: 'uppercase', borderBottom: '1px solid #1a1a30',
             flexShrink: 0, userSelect: 'none',
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
           }}>
-            {folderName ? `Terminal · ${folderName}` : 'Terminal'}
+            {!terminalMinimized && (folderName ? `Terminal · ${folderName}` : 'Terminal')}
+            <button
+              onClick={() => setTerminalMinimized(m => !m)}
+              title={terminalMinimized ? 'Expand terminal' : 'Minimize terminal'}
+              style={{
+                background: 'none', border: 'none', cursor: 'pointer',
+                color: '#444466', padding: '0 2px', lineHeight: 1,
+                fontSize: 14, display: 'flex', alignItems: 'center',
+                marginLeft: terminalMinimized ? 0 : 'auto',
+              }}
+            >
+              {terminalMinimized ? '▶' : '◀'}
+            </button>
           </div>
-          <div style={{ flex: 1, overflow: 'hidden', padding: 4 }}>
+          <div style={{ flex: 1, overflow: 'hidden', padding: terminalMinimized ? 0 : 4, display: terminalMinimized ? 'none' : 'block' }}>
             <Terminal />
           </div>
         </div>
@@ -284,7 +344,6 @@ export default function App() {
             borderBottom: '1px solid #ebebf5',
             flexShrink: 0, userSelect: 'none',
           }}>
-            {/* Back button — shown only when a drilldown is active on the canvas */}
             {drilldownActive && (
               <button onClick={handleBack} style={{
                 display: 'flex', alignItems: 'center', gap: 4,
@@ -293,7 +352,18 @@ export default function App() {
                 border: '1px solid #1a73b5', background: '#e0f2fe',
                 color: '#0369a1', cursor: 'pointer', flexShrink: 0,
               }}>
-                ← Back {drillDepth > 1 ? `(${drillDepth} levels)` : ''}
+                ← Drill {drillDepth > 1 ? `(${drillDepth})` : ''}
+              </button>
+            )}
+            {codeFlowActive && (
+              <button onClick={handleBackFlow} style={{
+                display: 'flex', alignItems: 'center', gap: 4,
+                padding: '3px 10px', fontSize: 11, borderRadius: 5,
+                fontFamily: 'system-ui, -apple-system, sans-serif',
+                border: '1px solid #16a34a', background: '#dcfce7',
+                color: '#15803d', cursor: 'pointer', flexShrink: 0,
+              }}>
+                ← Flow {codeFlowDepth > 1 ? `(${codeFlowDepth})` : ''}
               </button>
             )}
 
@@ -306,8 +376,7 @@ export default function App() {
               {canvasLabel}
             </span>
 
-            {/* Diagram-type switcher — hidden during drilldown */}
-            {!drilldownActive && (
+            {!drilldownActive && !codeFlowActive && (
               <div style={{ display: 'flex', gap: 4, marginLeft: 'auto' }}>
                 {DIAGRAM_TABS.map(({ kind, label }) => {
                   const available = !!diagram?.diagrams?.[kind];
@@ -350,9 +419,12 @@ export default function App() {
               onAPIReady={(api) => { excalidrawAPIRef.current = api; }}
               onRenderError={setRenderError}
               onDrilldownChange={(active) => { setDrilldownActive(active); if (!active) setDrillDepth(0); }}
+              onCodeFlowChange={(active) => { setCodeFlowActive(active); if (!active) setCodeFlowDepth(0); }}
               onSelectionChange={setSelectedComponent}
               clearDrilldownRef={clearDrilldownRef}
+              clearCodeFlowRef={clearCodeFlowRef}
               renderDrilldownRef={renderDrilldownRef}
+              renderCodeFlowRef={renderCodeFlowRef}
             />
           </div>
         </div>
@@ -372,6 +444,14 @@ function DrillIcon() {
   );
 }
 
+function FlowIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+    </svg>
+  );
+}
+
 function FolderIcon() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -387,3 +467,4 @@ function SparkleIcon() {
     </svg>
   );
 }
+
