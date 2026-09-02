@@ -161,6 +161,25 @@ function labelToName(raw: string): string {
     .trim();
 }
 
+/** Wrap explanatory text so it remains readable inside an Excalidraw node. */
+function wrapDescription(text: string, width: number): string {
+  const maxChars = Math.max(24, Math.floor(width / 6));
+  const words = text.replace(/\s+/g, ' ').trim().split(' ');
+  const lines: string[] = [];
+  let line = '';
+  for (const word of words) {
+    const next = line ? line + ' ' + word : word;
+    if (line && next.length > maxChars) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = next;
+    }
+  }
+  if (line) lines.push(line);
+  return lines.join('\n');
+}
+
 /**
  * Build a name → element-ids map so Canvas.applyZoomAndGit can highlight the
  * boxes/labels belonging to a changed component. We index every rectangle by
@@ -267,7 +286,6 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
     }
   }
 
-  const DESC_EXTRA_HEIGHT = descriptions && Object.keys(descriptions).length > 0 ? 28 : 0;
   const extraElements: ExcalidrawElement[] = [];
   let descSeed = 8000000;
 
@@ -295,8 +313,9 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
       // Expand height if we have a description for this node
       const label = containerLabel.get(el.id);
       const desc = label ? (descNorm[label.toLowerCase()] ?? null) : null;
-      const extraH = desc ? DESC_EXTRA_HEIGHT : 0;
       const box = el as ExcalidrawElement & { x: number; y: number; width: number; height: number };
+      const wrappedDesc = desc ? wrapDescription(desc, box.width - 16) : '';
+      const extraH = wrappedDesc ? Math.max(30, wrappedDesc.split('\n').length * 13 + 12) : 0;
       const grp = nodeGroupId.get(el.id)!;
       // Merge the node's own group ID with the library-assigned groups (e.g. subgraph group)
       const mergedGroupIds = [...new Set([grp, ...el.groupIds])];
@@ -309,9 +328,9 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
           y: box.y + box.height + 6,
           width: box.width - 16,
           height: extraH - 8,
-          text: desc,
-          originalText: desc,
-          fontSize: 10,
+          text: wrappedDesc,
+          originalText: wrappedDesc,
+          fontSize: 11,
           fontFamily: FONT,
           textAlign: 'center',
           verticalAlign: 'top',

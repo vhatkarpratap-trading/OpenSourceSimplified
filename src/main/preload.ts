@@ -14,6 +14,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Folder
   openFolder: (): Promise<{ folder: string; hasCachedDiagram: boolean } | null> =>
     ipcRenderer.invoke('folder:open'),
+  clearProjectCache: (): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('cache:clearProject'),
+
+  // AI provider used for all canvas analysis and question requests
+  getAiProvider: (): Promise<{ provider: string; providers: { id: string; label: string }[] }> =>
+    ipcRenderer.invoke('ai:getProvider'),
+  setAiProvider: (provider: string): Promise<{ provider: string; providers: { id: string; label: string }[] }> =>
+    ipcRenderer.invoke('ai:setProvider', provider),
 
   // Analysis
   runAnalysis: (): Promise<{ ok?: boolean; error?: string }> =>
@@ -28,8 +36,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('component:drilldown', name),
 
   // Code flow: structured class/function/data trace rendered onto the canvas
-  getComponentCodeFlow: (name: string): Promise<{ ok?: boolean; error?: string; mermaid?: string; happyPath?: string[] }> =>
-    ipcRenderer.invoke('component:codeflow', name),
+  getComponentCodeFlow: (name: string, drillMermaid?: string): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] }> =>
+    ipcRenderer.invoke('component:codeflow', name, drillMermaid),
+  getComponentImplementation: (name: string, drillMermaid?: string): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] }> =>
+    ipcRenderer.invoke('component:implementation', name, drillMermaid),
+
+  // Project orientation: framework, architecture, state, and data/integrations
+  getArchitectureStory: (): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string> }> =>
+    ipcRenderer.invoke('project:architectureStory'),
+  getRepositoryImplementation: (): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string> }> =>
+    ipcRenderer.invoke('project:implementation'),
 
   // Events from main → renderer
   onDiagram: (callback: (diagram: unknown) => void) => {
@@ -64,5 +80,86 @@ contextBridge.exposeInMainWorld('electronAPI', {
         changed: { name: string; type: string; description: string; oldDescription: string }[];
         impacted: { name: string; type: string; description: string; reason: string }[];
       }));
+  },
+
+  // Canvas-aware terminal: execute a natural-language command with canvas context
+  executeCanvasCommand: (req: { command: string; canvasContext: string; nodeNames: string[]; folder: string }): Promise<{ ok: boolean; statusMessage?: string; error?: string }> =>
+    ipcRenderer.invoke('canvas:command', req),
+  onCanvasCommandStatus: (callback: (msg: string) => void) => {
+    ipcRenderer.on('canvas:commandStatus', (_event: unknown, msg: string) => callback(msg));
+  },
+
+  // Git history
+  listGitCommits: (): Promise<{
+    ok: boolean;
+    commits?: Array<{ hash: string; short: string; message: string; author: string; date: string }>;
+    error?: string;
+  }> => ipcRenderer.invoke('git:listCommits'),
+
+  getCommitDiff: (hash: string): Promise<{
+    ok: boolean;
+    changedFiles?: string[];
+    changedNodeNames?: string[];
+    annotations?: Array<{ name: string; summary: string; added: number; removed: number }>;
+    commitInfo?: { hash: string; short: string; message: string; author: string; date: string; filesChanged: number };
+    featureFlow?: { mermaid: string; descriptions?: Record<string, string> };
+    codeFlow?: { mermaid: string; happyPath?: string[] };
+    error?: string;
+  }> => ipcRenderer.invoke('git:commitDiff', hash),
+
+  // MCP: canvas state request (main asks renderer for serialized canvas)
+  onMcpGetCanvasState: (cb: (data: { replyChannel: string }) => void) => {
+    ipcRenderer.on('mcp:getCanvasState', (_event: unknown, data: { replyChannel: string }) => cb(data));
+  },
+  answerMcpGetCanvasState: (replyChannel: string, state: string) => {
+    ipcRenderer.send(replyChannel, state);
+  },
+
+  // MCP: raw elements request (for freehand canvas → mermaid conversion)
+  onMcpGetRawElements: (cb: (data: { replyChannel: string }) => void) => {
+    ipcRenderer.on('mcp:getRawElements', (_event: unknown, data: { replyChannel: string }) => cb(data));
+  },
+  answerMcpGetRawElements: (replyChannel: string, elements: unknown[]) => {
+    ipcRenderer.send(replyChannel, elements);
+  },
+
+  // MCP: canvas action triggers
+  onMcpShowDrilldown: (cb: (data: { name: string }) => void) => {
+    ipcRenderer.on('mcp:showDrilldown', (_event: unknown, data: { name: string }) => cb(data));
+  },
+  onMcpShowCodeFlow: (cb: (data: { name: string }) => void) => {
+    ipcRenderer.on('mcp:showCodeFlow', (_event: unknown, data: { name: string }) => cb(data));
+  },
+  onMcpUpdateNodeDescription: (cb: (data: { name: string; description: string }) => void) => {
+    ipcRenderer.on('mcp:updateNodeDescription', (_event: unknown, data: { name: string; description: string }) => cb(data));
+  },
+  onCanvasAddNote: (cb: (data: { text: string; bg: string; stroke: string; textColor: string }) => void) => {
+    ipcRenderer.on('canvas:addNote', (_event: unknown, data: unknown) => cb(data as { text: string; bg: string; stroke: string; textColor: string }));
+  },
+  onCanvasClear: (cb: () => void) => {
+    ipcRenderer.on('canvas:clear', () => cb());
+  },
+
+  // PR Review
+  listPRs: (): Promise<{ ok: boolean; prs: unknown[]; error?: string }> =>
+    ipcRenderer.invoke('pr:list'),
+  reviewPR: (pr: unknown): Promise<unknown> =>
+    ipcRenderer.invoke('pr:review', pr),
+
+  // Answer a focused question about selected canvas components as a flowchart
+  askAboutComponents: (req: { question: string; components: string[]; canvasContext: string; folder: string }): Promise<{ ok: boolean; diagram?: unknown; error?: string }> =>
+    ipcRenderer.invoke('selection:ask', req),
+
+  // Diagram type preference for completed response diagrams
+  setPreferredDiagramType: (type: string) => ipcRenderer.send('canvas:setPreferredDiagramType', type),
+
+  // Change context (ambient panel — fires after Claude edits)
+  onChangeContext: (cb: (nodes: unknown[]) => void) => {
+    ipcRenderer.on('canvas:changeContext', (_event: unknown, nodes: unknown[]) => cb(nodes));
+  },
+
+  // Build/test error annotations
+  onErrorAnnotations: (cb: (annotations: unknown[]) => void) => {
+    ipcRenderer.on('canvas:errorAnnotations', (_event: unknown, annotations: unknown[]) => cb(annotations));
   },
 });

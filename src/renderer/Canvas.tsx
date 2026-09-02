@@ -4,6 +4,8 @@ import type { ExcalidrawImperativeAPI } from '@excalidraw/excalidraw/types/types
 import type { ExcalidrawElement as EXEl } from '@excalidraw/excalidraw/types/element/types';
 import { DiagramData, DiagramKind, FlatScene, ExcalidrawElement, TYPE_COLORS } from './diagramBuilder';
 import { buildMermaidScene } from './mermaidScene';
+import { serializeCanvasContext } from './canvasSerializer';
+import type { CommitDiffResult } from './global';
 
 interface CanvasProps {
   diagramData?: DiagramData | null;
@@ -12,11 +14,19 @@ interface CanvasProps {
   onRenderError?: (message: string | null) => void;
   onDrilldownChange?: (active: boolean) => void;
   onCodeFlowChange?: (active: boolean) => void;
-  onSelectionChange?: (name: string | null) => void;
+  onSelectionChange?: (names: string[]) => void;
   clearDrilldownRef?: React.MutableRefObject<(() => void) | null>;
   clearCodeFlowRef?: React.MutableRefObject<(() => void) | null>;
+  clearAllCodeFlowsRef?: React.MutableRefObject<(() => void) | null>;
   renderDrilldownRef?: React.MutableRefObject<((name: string) => void) | null>;
-  renderCodeFlowRef?: React.MutableRefObject<((name: string) => void) | null>;
+  renderCodeFlowRef?: React.MutableRefObject<((name: string, mode?: 'story' | 'implementation', drillMermaid?: string) => Promise<void>) | null>;
+  canvasContextRef?: React.MutableRefObject<(() => string) | null>;
+  rawElementsRef?: React.MutableRefObject<(() => unknown[]) | null>;
+  renderCommitDiffRef?: React.MutableRefObject<((diff: CommitDiffResult) => Promise<void>) | null>;
+  clearCommitDiffRef?: React.MutableRefObject<(() => void) | null>;
+  addNoteRef?: React.MutableRefObject<((data: { text: string; bg: string; stroke: string; textColor: string }) => void) | null>;
+  selectionAnswerRef?: React.MutableRefObject<((diagram: DiagramData) => Promise<void>) | null>;
+  errorAnnotations?: { node: string; error: string }[];
 }
 
 interface GitAnnotation { name: string; summary: string; added: number; removed: number }
@@ -119,7 +129,7 @@ function applyZoomAndGit(
   });
 }
 
-export default function Canvas({ diagramData, activeKind = 'structure', onAPIReady, onRenderError, onDrilldownChange, onCodeFlowChange, onSelectionChange, clearDrilldownRef, clearCodeFlowRef, renderDrilldownRef, renderCodeFlowRef }: CanvasProps) {
+export default function Canvas({ diagramData, activeKind = 'structure', onAPIReady, onRenderError, onDrilldownChange, onCodeFlowChange, onSelectionChange, clearDrilldownRef, clearCodeFlowRef, clearAllCodeFlowsRef, renderDrilldownRef, renderCodeFlowRef, canvasContextRef, rawElementsRef, renderCommitDiffRef, clearCommitDiffRef, addNoteRef, selectionAnswerRef, errorAnnotations }: CanvasProps) {
   const [apiReady, setApiReady] = useState(false);
   const apiRef          = useRef<ExcalidrawImperativeAPI | null>(null);
   const lastDataRef     = useRef<DiagramData | null>(null);
@@ -133,13 +143,14 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
 
   // Selection + drilldown state
   const idToNameRef        = useRef<Record<string, string>>({});
-  const selectedNameRef    = useRef<string | null>(null);
+  const selectedNameRef    = useRef<string>('');
   const drillBusyRef       = useRef(false);
   const drilldownActiveRef = useRef(false);
   const drillStackRef      = useRef<ExcalidrawElement[][]>([]);
   // Code flow has its own independent stack — both panels live on canvas simultaneously
   const flowActiveRef      = useRef(false);
   const flowStackRef       = useRef<ExcalidrawElement[][]>([]);
+  const commitHighlightActiveRef = useRef(false);
 
   // Load scene when data, active diagram kind, or API changes
   useEffect(() => {
@@ -196,7 +207,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
         for (const id of ids) rev[id] = name;
       }
       idToNameRef.current = rev;
-      selectedNameRef.current = null;
+      selectedNameRef.current = '';
 
       const zoom = (api.getAppState().zoom as { value: number }).value;
       lastZoomRef.current = zoom;
@@ -226,7 +237,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       const api  = apiRef.current;
       const flat = flatRef.current;
       if (!api || !flat) return;
-      if (drilldownActiveRef.current || flowActiveRef.current) return; // overlays own the scene
+      if (drilldownActiveRef.current || flowActiveRef.current || commitHighlightActiveRef.current) return; // overlays own the scene
 
       const zoom = (api.getAppState().zoom as { value: number }).value;
       if (Math.abs(zoom - lastZoomRef.current) < 0.001) return;
@@ -237,7 +248,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       debounceRef.current = setTimeout(() => {
         const api2 = apiRef.current;
         const flat2 = flatRef.current;
-        if (!api2 || !flat2 || drilldownActiveRef.current || flowActiveRef.current) return;
+        if (!api2 || !flat2 || drilldownActiveRef.current || flowActiveRef.current || commitHighlightActiveRef.current) return;
         const z = (api2.getAppState().zoom as { value: number }).value;
         const updated = applyZoomAndGit(flat2, z, gitRef.current, claudeRef.current);
         flatRef.current = { ...flat2, elements: updated };
@@ -252,7 +263,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
   useEffect(() => {
     window.electronAPI.onGitStatus((changedNames: string[]) => {
       gitRef.current = changedNames;
-      if (drilldownActiveRef.current || flowActiveRef.current) return; // don't overwrite drill/flow scene
+      if (drilldownActiveRef.current || flowActiveRef.current || commitHighlightActiveRef.current) return; // don't overwrite drill/flow/commit scene
       const api  = apiRef.current;
       const flat = flatRef.current;
       if (!api || !flat) return;
@@ -270,7 +281,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     window.electronAPI.onClaudeChanges((changes: ClaudeHighlights) => {
       claudeRef.current = changes;
       gitRef.current = null;
-      if (drilldownActiveRef.current || flowActiveRef.current) return; // don't overwrite drill/flow scene
+      if (drilldownActiveRef.current || flowActiveRef.current || commitHighlightActiveRef.current) return;
       const api  = apiRef.current;
       const flat = flatRef.current;
       if (!api || !flat) return;
@@ -278,6 +289,21 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       const updated = applyZoomAndGit(flat, zoom, null, changes);
       flatRef.current = { ...flat, elements: updated };
       api.updateScene({ elements: updated as unknown as EXEl[] });
+
+      // Auto-zoom: pan+fit to the changed nodes so developer immediately sees what moved
+      setTimeout(() => {
+        const changedIds = new Set<string>();
+        for (const name of changes.changedNames) {
+          (flat.nodeIds[name] || []).forEach(id => changedIds.add(id));
+        }
+        for (const name of changes.impactedNames) {
+          (flat.nodeIds[name] || []).forEach(id => changedIds.add(id));
+        }
+        const changedEls = api.getSceneElements().filter(e => changedIds.has(e.id)) as EXEl[];
+        if (changedEls.length > 0) {
+          api.scrollToContent(changedEls, { fitToContent: true, animate: true });
+        }
+      }, 100);
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -356,11 +382,271 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     }
   }, []);
 
+  // ── Commit diff overlay ───────────────────────────────────────────────────────
+
+  const renderCommitDiff = useCallback(async (diff: CommitDiffResult) => {
+    const api = apiRef.current;
+    if (!api || !diff.ok) return;
+
+    commitHighlightActiveRef.current = true;
+
+    let seed = 8500000;
+    const allEls: unknown[] = [];
+
+    const info = diff.commitInfo;
+    const short = info?.short ?? diff.changedFiles?.[0]?.slice(0, 7) ?? '?';
+    const commitMsg = info?.message ?? '';
+
+    // ── Feature Flow panel (left) ──────────────────────────────────────────
+    if (diff.featureFlow?.mermaid) {
+      let featureScene: FlatScene | null = null;
+      try {
+        const { buildMermaidScene: bms } = await import('./mermaidScene');
+        featureScene = await bms(diff.featureFlow.mermaid, diff.featureFlow.descriptions);
+      } catch { /* fall through */ }
+
+      if (featureScene) {
+        const fEls = featureScene.elements.map((e, i) => ({
+          ...e,
+          id: `commit-ff-${i}-${e.id}`,
+          _baseOpacity: 100, opacity: 100,
+        }));
+
+        const minX = fEls.filter(e => e.type === 'rectangle').reduce((m, e) => Math.min(m, (e as { x: number }).x), Infinity);
+        const minY = fEls.filter(e => e.type === 'rectangle').reduce((m, e) => Math.min(m, (e as { y: number }).y), Infinity);
+        const labelY = isFinite(minY) ? minY - 28 : -28;
+        const labelX = isFinite(minX) ? minX : 0;
+
+        const labelText = `⊡ Feature Flow · ${short}${commitMsg ? '  ·  ' + commitMsg.slice(0, 50) : ''}`;
+        allEls.push({
+          type: 'text', id: 'commit-ff-label',
+          x: labelX, y: labelY, width: 600, height: 20,
+          text: labelText, originalText: labelText,
+          fontSize: 13, fontFamily: 1, textAlign: 'left', verticalAlign: 'top',
+          strokeColor: '#6d28d9', backgroundColor: 'transparent',
+          fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
+          angle: 0, roughness: 0, opacity: 100, roundness: null, groupIds: [],
+          frameId: null, seed: seed++, version: 1, versionNonce: seed++,
+          isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false,
+          containerId: null, lineHeight: 1.25, baseline: 10,
+        });
+        allEls.push(...fEls);
+      }
+    }
+
+    // ── Code Flow panel (right, offset from feature flow) ─────────────────
+    if (diff.codeFlow?.mermaid) {
+      let codeScene: FlatScene | null = null;
+      try {
+        const { buildMermaidScene: bms } = await import('./mermaidScene');
+        codeScene = await bms(diff.codeFlow.mermaid);
+      } catch { /* fall through */ }
+
+      if (codeScene) {
+        // Place to the right of the feature flow panel
+        type RectEl = { type: string; x: number; y: number; width: number };
+        const ffRects = allEls.filter((e): e is RectEl => (e as RectEl).type === 'rectangle') as RectEl[];
+        const ffMaxX: number = ffRects.reduce((m, e) => Math.max(m, e.x + (e.width ?? 0)), 0);
+        const ffMinY: number = ffRects.reduce((m, e) => Math.min(m, e.y), Infinity);
+
+        const offsetX: number = isFinite(ffMaxX) ? ffMaxX + 120 : 800;
+        const offsetY: number = isFinite(ffMinY) ? ffMinY : 0;
+
+        // Parse mermaid node labels for happy-path matching (same pattern as renderCodeFlow)
+        const happyPath: string[] = diff.codeFlow.happyPath ?? [];
+        const mermaidNodeLabels = new Map<string, string>();
+        for (const line of (diff.codeFlow.mermaid || '').split('\n')) {
+          const m = line.trim().match(/^([A-Za-z0-9_]+)\s*[\[({]+"?([^\\"\\n]+)/);
+          if (m) mermaidNodeLabels.set(m[1], m[2].replace(/["]/g, '').trim());
+        }
+
+        const cEls = codeScene.elements.map((e, i) => ({
+          ...e,
+          id: `commit-cf-${i}-${e.id}`,
+          x: (e as { x: number }).x + offsetX,
+          y: (e as { y: number }).y + offsetY,
+          _baseOpacity: 100, opacity: 100,
+          customData: {
+            ...(e as { customData?: object }).customData,
+            drillName: (e as { type?: string }).type === 'rectangle'
+              ? (() => {
+                  const t = codeScene!.elements.find(t =>
+                    (t as { type?: string; containerId?: string }).type === 'text' &&
+                    (t as { containerId?: string }).containerId === (e as { id: string }).id
+                  );
+                  return t ? (t as { text?: string }).text?.split('\n')[0].trim() : undefined;
+                })()
+              : undefined,
+          },
+        })) as unknown as ExcalidrawElement[];
+
+        // Happy path: match labels → element ids
+        const rectTexts = new Map<string, string>();
+        for (const el of cEls) {
+          if (el.type !== 'text') continue;
+          const cid = (el as { containerId?: string | null }).containerId;
+          const txt = ((el as { text?: string }).text ?? '').split('\n')[0].trim().toLowerCase().replace(/[().\s]/g, '');
+          if (cid) rectTexts.set(cid, txt);
+        }
+        const origToNewId = new Map<string, string>();
+        for (const [mermaidId, labelText] of mermaidNodeLabels.entries()) {
+          if (mermaidId.endsWith('Desc')) continue;
+          const needle = labelText.toLowerCase().replace(/[().\s]/g, '').slice(0, 14);
+          const match = cEls.find(el => el.type === 'rectangle' && (rectTexts.get(el.id) ?? '').startsWith(needle));
+          if (match) origToNewId.set(mermaidId, match.id);
+        }
+        const happyNodeIds = new Set(happyPath.map(id => origToNewId.get(id)).filter(Boolean) as string[]);
+
+        const cElsMutable = cEls.map(el => {
+          if (happyNodeIds.has(el.id) && el.type === 'rectangle')
+            return { ...el, strokeColor: '#dc2626', strokeWidth: 2.5 } as ExcalidrawElement;
+          if (el.type === 'arrow') {
+            const sb = (el as { startBinding?: { elementId: string } | null }).startBinding;
+            const eb = (el as { endBinding?: { elementId: string } | null }).endBinding;
+            if (sb && eb) {
+              const from = happyPath.find(id => origToNewId.get(id + 'Desc') === sb.elementId || origToNewId.get(id) === sb.elementId);
+              const to = happyPath.find(id => origToNewId.get(id) === eb.elementId);
+              if (from && to && happyPath.indexOf(to) === happyPath.indexOf(from) + 1)
+                return { ...el, strokeColor: '#dc2626', strokeWidth: 2.5, opacity: 100 } as ExcalidrawElement;
+            }
+          }
+          return el;
+        });
+
+        // Numbered badges on happy path nodes
+        let badgeSeed = seed + 300000;
+        happyPath.forEach((origId, idx) => {
+          const newId = origToNewId.get(origId);
+          if (!newId) return;
+          const el = cElsMutable.find(e => e.id === newId) as (ExcalidrawElement & { x: number; y: number }) | undefined;
+          if (!el || el.type !== 'rectangle') return;
+          const bSize = 20;
+          allEls.push(
+            { type: 'rectangle', id: `commit-hp-rect-${idx}`, x: el.x - bSize / 2, y: el.y - bSize / 2, width: bSize, height: bSize, strokeColor: '#dc2626', backgroundColor: '#dc2626', fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid', angle: 0, roughness: 0.8, opacity: 100, roundness: { type: 3 }, groupIds: [], frameId: null, seed: badgeSeed++, version: 1, versionNonce: badgeSeed++, isDeleted: false, boundElements: [], updated: Date.now(), link: null, locked: false },
+            { type: 'text', id: `commit-hp-text-${idx}`, x: el.x - bSize / 2, y: el.y - bSize / 2 + 2, width: bSize, height: bSize - 2, text: String(idx + 1), originalText: String(idx + 1), fontSize: 11, fontFamily: 1, textAlign: 'center', verticalAlign: 'middle', strokeColor: '#ffffff', backgroundColor: 'transparent', fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid', angle: 0, roughness: 0, opacity: 100, roundness: null, groupIds: [], frameId: null, seed: badgeSeed++, version: 1, versionNonce: badgeSeed++, isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false, containerId: null, lineHeight: 1.2, baseline: 9 },
+          );
+        });
+        seed = badgeSeed;
+
+        const cfMinX = cEls.filter(e => e.type === 'rectangle').reduce((m, e) => Math.min(m, (e as { x: number }).x), Infinity);
+        const cfMinY = cEls.filter(e => e.type === 'rectangle').reduce((m, e) => Math.min(m, (e as { y: number }).y), Infinity);
+        const cfLabelY = isFinite(cfMinY) ? cfMinY - 28 : offsetY - 28;
+        const cfLabelX = isFinite(cfMinX) ? cfMinX : offsetX;
+        const cfLabel = happyPath.length > 0
+          ? `⟳ Code Flow · ${short}  ·  🔴 = happy path`
+          : `⟳ Code Flow · ${short}`;
+        allEls.push({
+          type: 'text', id: 'commit-cf-label',
+          x: cfLabelX, y: cfLabelY, width: 520, height: 20,
+          text: cfLabel, originalText: cfLabel,
+          fontSize: 13, fontFamily: 1, textAlign: 'left', verticalAlign: 'top',
+          strokeColor: '#16a34a', backgroundColor: 'transparent',
+          fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
+          angle: 0, roughness: 0, opacity: 100, roundness: null, groupIds: [],
+          frameId: null, seed: seed++, version: 1, versionNonce: seed++,
+          isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false,
+          containerId: null, lineHeight: 1.25, baseline: 10,
+        });
+        allEls.push(...cElsMutable);
+      }
+    }
+
+    // Clear old commit elements and set new scene
+    api.updateScene({ elements: allEls as unknown as EXEl[] });
+
+    // Fit to the new content — retry a few times to ensure scene has settled
+    const tryFit = (attempts: number) => {
+      const els = api.getSceneElements().filter(e => (e.opacity ?? 100) > 0);
+      if (els.length > 0) {
+        api.scrollToContent(els as EXEl[], { fitToContent: true, animate: false });
+      } else if (attempts > 0) {
+        setTimeout(() => tryFit(attempts - 1), 200);
+      }
+    };
+    setTimeout(() => tryFit(5), 100);
+
+  }, []);
+
+  const clearCommitDiff = useCallback(() => {
+    commitHighlightActiveRef.current = false;
+    const api  = apiRef.current;
+    const flat = flatRef.current;
+    if (!api) return;
+
+    if (flat) {
+      const zoom = (api.getAppState().zoom as { value: number }).value;
+      const restored = applyZoomAndGit(flat, zoom, gitRef.current, claudeRef.current);
+      api.updateScene({ elements: restored as unknown as EXEl[] });
+      if (annotationsRef.current.length > 0) {
+        setTimeout(() => renderAnnotationBadges(annotationsRef.current), 80);
+      }
+    } else {
+      api.updateScene({ elements: [] });
+    }
+
+    // Fit back to restored content
+    setTimeout(() => {
+      const els = api.getSceneElements().filter(e => (e.opacity ?? 100) > 0);
+      if (els.length > 0) api.scrollToContent(els as EXEl[], { fitToContent: true, animate: true });
+    }, 100);
+  }, [renderAnnotationBadges]);
+
+  useEffect(() => {
+    if (renderCommitDiffRef) renderCommitDiffRef.current = renderCommitDiff;
+  }, [renderCommitDiff, renderCommitDiffRef]);
+
+  useEffect(() => {
+    if (clearCommitDiffRef) clearCommitDiffRef.current = clearCommitDiff;
+  }, [clearCommitDiff, clearCommitDiffRef]);
+
+  const renderSelectionAnswer = useCallback(async (answer: DiagramData) => {
+    const api = apiRef.current;
+    const mermaid = answer.diagrams?.structure;
+    if (!api || !mermaid) return;
+
+    const scene = await buildMermaidScene(mermaid, answer.descriptions);
+    const existing = api.getSceneElements() as unknown as ExcalidrawElement[];
+    const existingRects = existing.filter(e => e.type === 'rectangle') as (ExcalidrawElement & { x: number; y: number; width: number; height: number })[];
+    const offsetX = existingRects.reduce((max, e) => Math.max(max, e.x + e.width), 0) + 140;
+    const offsetY = existingRects.reduce((min, e) => Math.min(min, e.y), Infinity);
+    const panelY = isFinite(offsetY) ? offsetY : 0;
+    const seedBase = 9200000 + existing.length;
+
+    const answerElements = scene.elements.map((el, index) => ({
+      ...el,
+      id: `selection-answer-${index}-${el.id}`,
+      x: (el as { x: number }).x + offsetX,
+      y: (el as { y: number }).y + panelY,
+    })) as unknown as ExcalidrawElement[];
+
+    const title: ExcalidrawElement = {
+      type: 'text', id: `selection-answer-title-${seedBase}`,
+      x: offsetX, y: panelY - 30, width: 520, height: 22,
+      text: `Answer: ${answer.pattern || 'Selected components'}`, originalText: `Answer: ${answer.pattern || 'Selected components'}`,
+      fontSize: 14, fontFamily: 2, textAlign: 'left', verticalAlign: 'top',
+      strokeColor: '#4f46e5', backgroundColor: 'transparent', fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
+      angle: 0, roughness: 0, opacity: 100, roundness: null, groupIds: [], frameId: null,
+      seed: seedBase, version: 1, versionNonce: seedBase + 1, isDeleted: false, boundElements: null,
+      updated: Date.now(), link: null, locked: false, containerId: null, lineHeight: 1.25, baseline: 11,
+    } as ExcalidrawElement;
+
+    for (const [name, ids] of Object.entries(scene.nodeIds)) {
+      for (const id of ids) idToNameRef.current[`selection-answer-${scene.elements.findIndex(el => el.id === id)}-${id}`] = name;
+    }
+    api.updateScene({ elements: [...existing, title, ...answerElements] as unknown as EXEl[] });
+    setTimeout(() => api.scrollToContent([title, ...answerElements] as unknown as EXEl[], { fitToContent: false, animate: true }), 50);
+  }, []);
+
+  useEffect(() => {
+    if (selectionAnswerRef) selectionAnswerRef.current = renderSelectionAnswer;
+  }, [renderSelectionAnswer, selectionAnswerRef]);
+
   // ── Selection tracking ────────────────────────────────────────────────────────
 
   const clearSelection = useCallback(() => {
-    selectedNameRef.current = null;
-    onSelectionChange?.(null);
+    if (selectedNameRef.current === '') return;
+    selectedNameRef.current = '';
+    onSelectionChange?.([]);
   }, [onSelectionChange]);
 
   // ── Drilldown clear/back ─────────────────────────────────────────────────────
@@ -442,6 +728,22 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
   useEffect(() => {
     if (clearCodeFlowRef) clearCodeFlowRef.current = clearCodeFlow;
   }, [clearCodeFlow, clearCodeFlowRef]);
+
+  const clearAllCodeFlows = useCallback(() => {
+    const api = apiRef.current;
+    if (!api || flowStackRef.current.length === 0) return;
+    flowStackRef.current = [];
+    flowActiveRef.current = false;
+    onCodeFlowChange?.(false);
+    lastDiagramKey.current = '';
+    const flat = flatRef.current;
+    if (flat) api.updateScene({ elements: applyZoomAndGit(flat, lastZoomRef.current, gitRef.current, claudeRef.current) as unknown as EXEl[] });
+    else api.resetScene();
+  }, [onCodeFlowChange]);
+
+  useEffect(() => {
+    if (clearAllCodeFlowsRef) clearAllCodeFlowsRef.current = clearAllCodeFlows;
+  }, [clearAllCodeFlows, clearAllCodeFlowsRef]);
 
   const renderDrilldown = useCallback(async (rawName: string) => {
     const name = rawName.trim();
@@ -622,6 +924,13 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
           api.scrollToContent(newPanelEls as unknown as EXEl[], { fitToContent: false, animate: true });
       }, 150);
 
+      // The drill flow is the feature boundary. Build both companion views from
+      // it so Story and Implementation describe the same complete feature.
+      void (async () => {
+        await renderCodeFlowRef?.current?.(name, 'story', res.mermaid);
+        await renderCodeFlowRef?.current?.(name, 'implementation', res.mermaid);
+      })();
+
     } catch {
       // Remove loading indicator on failure, restore clean state
       const withoutLoading = (api.getSceneElements() as unknown as ExcalidrawElement[])
@@ -630,16 +939,17 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     } finally {
       drillBusyRef.current = false;
     }
-  }, [onDrilldownChange]);
+  }, [onDrilldownChange, renderCodeFlowRef]);
 
   useEffect(() => {
     if (renderDrilldownRef) renderDrilldownRef.current = renderDrilldown;
   }, [renderDrilldown, renderDrilldownRef]);
 
-  const renderCodeFlow = useCallback(async (rawName: string) => {
+  const renderCodeFlow = useCallback(async (rawName: string, mode: 'story' | 'implementation' = 'story', drillMermaid = '') => {
     const name = rawName.trim();
     const api = apiRef.current;
     if (!api) return;
+    onRenderError?.(null);
 
     const currentEls = api.getSceneElements() as unknown as ExcalidrawElement[];
 
@@ -674,7 +984,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     }, {
       type: 'text', id: `flow-loading-text-${seed}`,
       x: loadX + 10, y: loadY + 11, width: 220, height: 18,
-      text: `Tracing flow of ${name}…`, originalText: `Tracing flow of ${name}…`,
+      text: `${mode === 'implementation' ? 'Explaining implementation' : 'Tracing behavior'} of ${name}…`, originalText: `${mode === 'implementation' ? 'Explaining implementation' : 'Tracing behavior'} of ${name}…`,
       fontSize: 12, fontFamily: 1, textAlign: 'left', verticalAlign: 'top',
       strokeColor: '#15803d', backgroundColor: 'transparent',
       fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
@@ -686,12 +996,14 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     api.updateScene({ elements: [...currentEls, ...loadingEls] as unknown as EXEl[] });
 
     try {
-      const res = await window.electronAPI.getComponentCodeFlow(name);
+      const res = mode === 'implementation'
+        ? await window.electronAPI.getComponentImplementation(name, drillMermaid)
+        : await window.electronAPI.getComponentCodeFlow(name, drillMermaid);
       console.log('[codeflow] ok:', res?.ok, 'error:', res?.error);
       if (!res?.ok || !res.mermaid) throw new Error(res?.error || 'no mermaid');
 
       const { buildMermaidScene: bms } = await import('./mermaidScene');
-      const flowScene = await bms(res.mermaid);
+      const flowScene = await bms(res.mermaid, res.descriptions);
 
       const freshEls = api.getSceneElements() as unknown as ExcalidrawElement[];
       const freshRects = freshEls.filter(e =>
@@ -869,9 +1181,10 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
         startBinding: null, endBinding: null, roundness: { type: 2 }, elbowed: false,
       }] : [];
 
+      const title = mode === 'implementation' ? 'Implementation' : 'Code Story';
       const labelText = happyPath.length > 0
-        ? `⟳ Code Flow: ${name}  ·  🔴 = happy path (read in order)`
-        : `⟳ Code Flow: ${name}`;
+        ? `⟳ ${title}: ${name}  ·  🔴 = main path (read in order)`
+        : `⟳ ${title}: ${name}`;
       const labelEls: unknown[] = [{
         type: 'text', id: `flow-label-d${depth}`,
         x: panelOffsetX, y: panelY - 26, width: 520, height: 20,
@@ -914,16 +1227,168 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
 
     } catch (err) {
       console.error('[codeflow] failed:', err);
+      onRenderError?.(err instanceof Error ? err.message : String(err));
       const withoutLoading = (api.getSceneElements() as unknown as ExcalidrawElement[])
         .filter(e => !e.id.startsWith('flow-loading'));
       api.updateScene({ elements: withoutLoading as unknown as EXEl[] });
     }
-  }, [onCodeFlowChange]);
+  }, [onCodeFlowChange, onRenderError]);
 
 
   useEffect(() => {
     if (renderCodeFlowRef) renderCodeFlowRef.current = renderCodeFlow;
   }, [renderCodeFlow, renderCodeFlowRef]);
+
+  // ── Error annotation badges ───────────────────────────────────────────────────
+
+  useEffect(() => {
+    const api = apiRef.current;
+    const flat = flatRef.current;
+    if (!api || !flat) return;
+
+    // Remove old error badges
+    const existing = api.getSceneElements() as unknown as (EXEl & { id: string })[];
+    const withoutErr = existing.filter(e => !e.id.startsWith('err-badge-'));
+
+    if (!errorAnnotations || errorAnnotations.length === 0) {
+      if (existing.length !== withoutErr.length) {
+        api.updateScene({ elements: withoutErr });
+      }
+      return;
+    }
+
+    let seed = 6000000;
+    const newEls: unknown[] = [];
+
+    for (const ann of errorAnnotations) {
+      const nodeElIds = flat.nodeIds[ann.node] || [];
+      const boxEl = (existing as unknown as (ExcalidrawElement & { x: number; y: number; width: number; height: number })[])
+        .find(e => nodeElIds.includes(e.id) && e.type === 'rectangle') as
+        (ExcalidrawElement & { x: number; y: number; width: number; height: number }) | undefined;
+      if (!boxEl) continue;
+
+      const badgeW = 180;
+      const lines = ann.error.slice(0, 100).match(/.{1,28}/g) ?? [ann.error.slice(0, 28)];
+      const badgeH = 18 + lines.length * 13 + 8;
+      const bx = boxEl.x + boxEl.width + 10;
+      const by = boxEl.y;
+
+      newEls.push({
+        type: 'rectangle', id: `err-badge-rect-${ann.node}`,
+        x: bx, y: by, width: badgeW, height: badgeH,
+        strokeColor: '#dc2626', backgroundColor: '#fef2f2',
+        fillStyle: 'solid', strokeWidth: 2, strokeStyle: 'solid',
+        angle: 0, roughness: 0, opacity: 100,
+        roundness: { type: 3 }, groupIds: [],
+        frameId: null, seed: seed++, version: 1, versionNonce: seed++,
+        isDeleted: false, boundElements: [], updated: Date.now(), link: null, locked: false,
+        customData: { isErrorBadge: true },
+      });
+
+      const fullText = `✗ ${ann.node}\n${lines.join('\n')}`;
+      newEls.push({
+        type: 'text', id: `err-badge-text-${ann.node}`,
+        x: bx + 7, y: by + 5, width: badgeW - 14, height: badgeH - 10,
+        text: fullText, originalText: fullText,
+        fontSize: 10, fontFamily: 1,
+        textAlign: 'left', verticalAlign: 'top',
+        strokeColor: '#b91c1c', backgroundColor: 'transparent',
+        fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
+        angle: 0, roughness: 0, opacity: 100, roundness: null,
+        groupIds: [], frameId: null, seed: seed++, version: 1, versionNonce: seed++,
+        isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false,
+        containerId: null, lineHeight: 1.4, baseline: 8,
+        customData: { isErrorBadge: true },
+      });
+    }
+
+    api.updateScene({
+      elements: [...withoutErr, ...newEls] as Parameters<typeof api.updateScene>[0]['elements'],
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [errorAnnotations]);
+
+  // ── Add sticky note (from MCP add_canvas_note) ───────────────────────────────
+
+  const addNote = useCallback((data: { text: string; bg: string; stroke: string; textColor: string }) => {
+    const api = apiRef.current;
+    if (!api) return;
+
+    const existing = api.getSceneElements() as unknown as (EXEl & { x: number; y: number; width: number; height: number })[];
+
+    // Place note to the right of all existing content, or at a default position
+    const maxX = existing.reduce((m, e) => Math.max(m, (e as { x?: number }).x ?? 0 + ((e as { width?: number }).width ?? 0)), 80);
+    const minY = existing.reduce((m, e) => Math.min(m, (e as { y?: number }).y ?? 0), 80);
+    const nx = existing.length > 0 ? maxX + 40 : 80;
+    const ny = existing.length > 0 ? minY : 80;
+
+    const lines = data.text.split('\n');
+    const noteW = Math.min(240, Math.max(140, lines.reduce((m, l) => Math.max(m, l.length * 7), 0) + 24));
+    const noteH = 28 + lines.length * 18;
+    let seed = 5500000 + Date.now() % 100000;
+
+    const rectId = `note-rect-${seed}`;
+    const textId = `note-text-${seed}`;
+
+    const newEls: unknown[] = [
+      {
+        type: 'rectangle', id: rectId,
+        x: nx, y: ny, width: noteW, height: noteH,
+        strokeColor: data.stroke, backgroundColor: data.bg,
+        fillStyle: 'solid', strokeWidth: 2, strokeStyle: 'solid',
+        angle: 0, roughness: 1.2, opacity: 100,
+        roundness: { type: 3 }, groupIds: [rectId],
+        frameId: null, seed: seed++, version: 1, versionNonce: seed++,
+        isDeleted: false, boundElements: [], updated: Date.now(), link: null, locked: false,
+        customData: { isNote: true },
+      },
+      {
+        type: 'text', id: textId,
+        x: nx + 10, y: ny + 8, width: noteW - 20, height: noteH - 16,
+        text: data.text, originalText: data.text,
+        fontSize: 13, fontFamily: 1,
+        textAlign: 'left', verticalAlign: 'top',
+        strokeColor: data.textColor, backgroundColor: 'transparent',
+        fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
+        angle: 0, roughness: 0, opacity: 100, roundness: null,
+        groupIds: [rectId], frameId: null, seed: seed++, version: 1, versionNonce: seed++,
+        isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false,
+        containerId: null, lineHeight: 1.4, baseline: 11,
+        customData: { isNote: true },
+      },
+    ];
+
+    api.updateScene({
+      elements: [...existing, ...newEls] as Parameters<typeof api.updateScene>[0]['elements'],
+    });
+
+    // Scroll to show the new note
+    setTimeout(() => {
+      api.scrollToContent(newEls.slice(0, 1) as unknown as EXEl[], { fitToContent: false, animate: true });
+    }, 100);
+  }, []);
+
+  useEffect(() => {
+    if (addNoteRef) addNoteRef.current = addNote;
+  }, [addNote, addNoteRef]);
+
+  const getCanvasContext = useCallback((): string => {
+    const flat = flatRef.current;
+    if (!flat || Object.keys(flat.nodeIds).length === 0) return '';
+    const elements = flat.elements;
+    return serializeCanvasContext(elements, flat.nodeIds, diagramData?.descriptions);
+  }, [diagramData]);
+
+  useEffect(() => {
+    if (canvasContextRef) canvasContextRef.current = getCanvasContext;
+  }, [getCanvasContext, canvasContextRef]);
+
+  useEffect(() => {
+    if (rawElementsRef) {
+      rawElementsRef.current = () =>
+        apiRef.current ? (apiRef.current.getSceneElements() as unknown as unknown[]) : [];
+    }
+  }, [rawElementsRef]);
 
   const handleChange = useCallback((_els: readonly EXEl[], appState: { selectedElementIds?: Record<string, boolean> }) => {
     const selectedIds = Object.keys(appState.selectedElementIds || {}).filter(id => appState.selectedElementIds![id]);
@@ -931,17 +1396,19 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       clearSelection();
       return;
     }
-    // Find the first selected element that maps to a known component name
-    let name: string | undefined;
+    // Find every selected element that maps to a known component name.
+    const names = new Set<string>();
     for (const id of selectedIds) {
       const n = idToNameRef.current[id];
-      if (n) { name = n; break; }
+      if (n) names.add(n.trim());
     }
-    if (!name) { clearSelection(); return; }
-    if (name === selectedNameRef.current) return;
-    selectedNameRef.current = name;
-    console.log('[canvas] selected component:', name, '— ids:', selectedIds);
-    onSelectionChange?.(name.trim());
+    const selectedNames = Array.from(names);
+    if (selectedNames.length === 0) { clearSelection(); return; }
+    const key = selectedNames.slice().sort().join('\n');
+    if (key === selectedNameRef.current) return;
+    selectedNameRef.current = key;
+    console.log('[canvas] selected components:', selectedNames, '— ids:', selectedIds);
+    onSelectionChange?.(selectedNames);
   }, [clearSelection, onSelectionChange]);
 
   const handleAPI = useCallback((api: ExcalidrawImperativeAPI) => {

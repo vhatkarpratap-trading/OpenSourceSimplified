@@ -1,8 +1,64 @@
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import type { ExcalidrawImperativeAPI } from '@excalidraw/excalidraw/types/types';
 import Terminal from './Terminal';
 import Canvas from './Canvas';
+import MermaidRenderer from './MermaidRenderer';
 import { DiagramData, DiagramKind } from './diagramBuilder';
+import type { CommitInfo, CommitDiffResult, PRInfo, PRReviewResult, ChangeContextNode } from './global';
+
+// Diagram types that render natively via mermaid SVG (not Excalidraw shapes)
+const NATIVE_MERMAID_PREFIXES = [
+  'sequencediagram', 'classdiagram', 'statediagram', 'erdiagram',
+  'gantt', 'pie', 'gitgraph', 'mindmap', 'timeline', 'xychart',
+  'kanban', 'block', 'sankey', 'quadrantchart', 'requirementdiagram',
+  'c4context', 'c4container', 'c4component',
+];
+
+function getDiagramTypePrefix(mermaid: string): string {
+  return mermaid.trim().split('\n')[0].trim().toLowerCase().replace(/\s.*$/, '');
+}
+
+function isNativeMermaid(mermaid: string | undefined): boolean {
+  if (!mermaid) return false;
+  const prefix = getDiagramTypePrefix(mermaid);
+  return NATIVE_MERMAID_PREFIXES.some(p => prefix.startsWith(p));
+}
+
+const DIAGRAM_TYPES: { id: string; label: string; emoji: string; description: string; template: string }[] = [
+  { id: 'flowchart', label: 'Flow Chart', emoji: '⬡', description: 'Steps, decisions, processes',
+    template: 'flowchart TD\n  A[Start] --> B{Decision}\n  B -->|Yes| C[Do it]\n  B -->|No| D[Skip]\n  C --> E[Done]\n  D --> E' },
+  { id: 'sequenceDiagram', label: 'Sequence', emoji: '↔', description: 'Who talks to who, in order',
+    template: 'sequenceDiagram\n  actor User\n  participant App\n  participant Server\n  User->>App: Open page\n  App->>Server: Fetch data\n  Server-->>App: Return data\n  App-->>User: Show results' },
+  { id: 'mindmap', label: 'Mind Map', emoji: '✦', description: 'Ideas branching from a centre',
+    template: 'mindmap\n  root((Main Idea))\n    Branch One\n      Detail A\n      Detail B\n    Branch Two\n      Detail C\n    Branch Three' },
+  { id: 'timeline', label: 'Timeline', emoji: '→', description: 'Events in chronological order',
+    template: 'timeline\n  title Project Timeline\n  section Phase 1\n    Jan : Kickoff\n    Feb : Design\n  section Phase 2\n    Mar : Build\n    Apr : Test\n  section Phase 3\n    May : Launch' },
+  { id: 'classDiagram', label: 'Class', emoji: '▣', description: 'Objects, fields, relationships',
+    template: 'classDiagram\n  class User {\n    +String name\n    +String email\n    +login()\n    +logout()\n  }\n  class Post {\n    +String title\n    +String body\n    +publish()\n  }\n  User "1" --> "many" Post : writes' },
+  { id: 'erDiagram', label: 'ER Diagram', emoji: '⬜', description: 'Database tables and relations',
+    template: 'erDiagram\n  USER {\n    int id PK\n    string name\n    string email\n  }\n  POST {\n    int id PK\n    string title\n    int user_id FK\n  }\n  USER ||--o{ POST : writes' },
+  { id: 'gitGraph', label: 'Git Graph', emoji: '⌥', description: 'Branches and commits',
+    template: 'gitGraph\n  commit id: "Initial"\n  branch feature\n  checkout feature\n  commit id: "Add feature"\n  commit id: "Fix bug"\n  checkout main\n  merge feature\n  commit id: "Release"' },
+  { id: 'gantt', label: 'Gantt', emoji: '▬', description: 'Tasks and schedule',
+    template: 'gantt\n  title Project Schedule\n  dateFormat YYYY-MM-DD\n  section Design\n    Research      : 2024-01-01, 7d\n    Wireframes    : 7d\n  section Build\n    Frontend      : 2024-01-15, 14d\n    Backend       : 2024-01-15, 14d\n  section Launch\n    Testing       : 5d\n    Deploy        : 2d' },
+  { id: 'kanban', label: 'Kanban', emoji: '▦', description: 'Tasks by status',
+    template: 'kanban\n  title Team Board\n  column Todo\n    task1: Write tests\n    task2: Update docs\n  column In Progress\n    task3: Build feature\n  column Done\n    task4: Fix login bug' },
+  { id: 'pie', label: 'Pie Chart', emoji: '◔', description: 'Proportions and percentages',
+    template: 'pie title Distribution\n  "Feature Work" : 45\n  "Bug Fixes" : 25\n  "Refactoring" : 20\n  "Meetings" : 10' },
+];
+
+function extractNodeNamesFromDiagram(diagram: DiagramData | null): string[] {
+  const structure = diagram?.diagrams?.structure;
+  if (!structure) return [];
+  const names = new Set<string>();
+  const re = /([A-Za-z0-9_]+)\s*[\[\(\{]([^\]\)\}]+)[\]\)\}]/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(structure))) {
+    names.add(m[2].trim());
+    names.add(m[1].trim());
+  }
+  return Array.from(names).filter(n => n && !/^(TD|LR|TB|RL|flowchart|classDef|changed)$/i.test(n));
+}
 
 type AnalysisStatus = 'idle' | 'running' | 'patching' | 'done' | 'error';
 
@@ -44,15 +100,100 @@ export default function App() {
   const [codeFlowActive, setCodeFlowActive]   = useState(false);
   const [codeFlowDepth, setCodeFlowDepth]     = useState(0);
   const [selectedComponent, setSelectedComponent] = useState<string | null>(null);
+  const [selectedComponents, setSelectedComponents] = useState<string[]>([]);
+  const [selectionQuestion, setSelectionQuestion] = useState('');
+  const [selectionQuestionOpen, setSelectionQuestionOpen] = useState(false);
+  const [selectionAnswering, setSelectionAnswering] = useState(false);
   const [drilling, setDrilling]               = useState(false);
   const [codeFlowLoading, setCodeFlowLoading] = useState(false);
   const [terminalMinimized, setTerminalMinimized] = useState(false);
+  const [aiProvider, setAiProvider] = useState('claude');
+  const [aiProviders, setAiProviders] = useState<{ id: string; label: string }[]>([
+    { id: 'claude', label: 'Claude' }, { id: 'codex', label: 'OpenAI Codex' }, { id: 'gemini', label: 'Google Gemini' },
+  ]);
 
+  // Canvas history — every diagram Claude draws gets appended here
+  const [canvasHistory, setCanvasHistory] = useState<{ diagram: DiagramData; timestamp: number; index: number }[]>([]);
+  const [canvasHistoryOpen, setCanvasHistoryOpen] = useState(false);
+  const [canvasHistoryIndex, setCanvasHistoryIndex] = useState<number | null>(null); // null = live
+  const lastHistoryMermaid = useRef<string>('');
+
+  // Diagram type picker — what type Claude should draw next
+  const [preferredDiagramType, setPreferredDiagramType] = useState<string>('flowchart');
+  const [typePickerOpen, setTypePickerOpen] = useState(false);
+
+  // Wrapped setDiagram that also appends to canvas history
+  const setDiagramAndRecord = useCallback((data: DiagramData | null) => {
+    setDiagram(data);
+    if (!data?.diagrams?.structure) return;
+    const mermaid = data.diagrams.structure;
+    // Deduplicate: skip if same mermaid as last entry
+    if (mermaid === lastHistoryMermaid.current) return;
+    lastHistoryMermaid.current = mermaid;
+    setCanvasHistory(prev => {
+      const next = [...prev, { diagram: data, timestamp: Date.now(), index: prev.length }];
+      return next.slice(-50); // keep last 50
+    });
+    setCanvasHistoryIndex(null); // jump to live
+  }, []);
+
+  const [historyActive, setHistoryActive]         = useState(false);
+  const [commits, setCommits]                     = useState<CommitInfo[]>([]);
+  const [commitsLoading, setCommitsLoading]       = useState(false);
+  const [selectedCommitHash, setSelectedCommitHash] = useState<string | null>(null);
+  const [commitDiffLoading, setCommitDiffLoading] = useState(false);
+  const commitDiffLoadingRef = useRef(false);
+
+  // Change story mode (a selected PR or branch)
+  const [prActive, setPrActive]                   = useState(false);
+  const [prs, setPrs]                             = useState<PRInfo[]>([]);
+  const [prsLoading, setPrsLoading]               = useState(false);
+  const [prPickerOpen, setPrPickerOpen]           = useState(false);
+  const [changeStoryMode, setChangeStoryMode]     = useState<'pr' | 'branch'>('pr');
+  const [activePR, setActivePR]                   = useState<PRInfo | null>(null);
+  const [prReviewing, setPrReviewing]             = useState(false);
+  const [prResult, setPrResult]                   = useState<PRReviewResult | null>(null);
+  const [prView, setPrView]                       = useState<'feature' | 'code'>('feature');
+
+  // Ambient change context panel
+  const [changeContext, setChangeContext]         = useState<ChangeContextNode[] | null>(null);
+  const [changeContextOpen, setChangeContextOpen] = useState(false);
+
+  // Terminal error annotations
+  const [errorAnnotations, setErrorAnnotations] = useState<{ node: string; error: string }[]>([]);
+
+  const typePickerRef = useRef<HTMLDivElement>(null);
+
+  // Close type picker when clicking outside
+  useEffect(() => {
+    if (!typePickerOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (typePickerRef.current && !typePickerRef.current.contains(e.target as Node)) {
+        setTypePickerOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [typePickerOpen]);
+
+  useEffect(() => {
+    window.electronAPI.getAiProvider().then(({ provider, providers }) => {
+      setAiProvider(provider);
+      setAiProviders(providers);
+    }).catch(() => undefined);
+  }, []);
   const excalidrawAPIRef   = useRef<ExcalidrawImperativeAPI | null>(null);
   const clearDrilldownRef  = useRef<(() => void) | null>(null);
   const clearCodeFlowRef   = useRef<(() => void) | null>(null);
+  const clearAllCodeFlowsRef = useRef<(() => void) | null>(null);
   const renderDrilldownRef = useRef<((name: string) => void) | null>(null);
-  const renderCodeFlowRef  = useRef<((name: string) => void) | null>(null);
+  const renderCodeFlowRef  = useRef<((name: string, mode?: 'story' | 'implementation', drillMermaid?: string) => Promise<void>) | null>(null);
+  const canvasContextRef   = useRef<(() => string) | null>(null);
+  const rawElementsRef     = useRef<(() => unknown[]) | null>(null);
+  const renderCommitDiffRef = useRef<((diff: CommitDiffResult) => Promise<void>) | null>(null);
+  const clearCommitDiffRef  = useRef<(() => void) | null>(null);
+  const addNoteRef          = useRef<((data: { text: string; bg: string; stroke: string; textColor: string }) => void) | null>(null);
+  const selectionAnswerRef  = useRef<((diagram: DiagramData) => Promise<void>) | null>(null);
   const listenersAttached  = useRef(false);
 
   if (!listenersAttached.current) {
@@ -60,7 +201,7 @@ export default function App() {
 
     window.electronAPI.onDiagram((d) => {
       const data = d as DiagramData | null;
-      setDiagram(data);
+      setDiagramAndRecord(data);
       setRenderError(null);
       if (data?.diagrams) {
         if (data.diagrams.gitDiff) setActiveKind('gitDiff');
@@ -71,17 +212,86 @@ export default function App() {
 
     window.electronAPI.onAnalysisStatus((s) => {
       setStatus(s as AnalysisStatus);
-      if (s === 'running') setImpactSummary(null);
+      if (s === 'running') { setImpactSummary(null); setChangeContextOpen(false); }
     });
 
     window.electronAPI.onAnalysisStatusDetail((d) => setStatusDetail(d));
 
     window.electronAPI.onFolderRestored((result) => {
       setFolder(result.folder);
-      if (!result.hasCachedDiagram) { setStatus('idle'); setDiagram(null); }
+      // A previous project's failure must not remain visible after opening another project.
+      setStatus('idle');
+      setStatusDetail(null);
+      setRenderError(null);
+      if (!result.hasCachedDiagram) setDiagram(null);
     });
 
     window.electronAPI.onImpactSummary((summary) => setImpactSummary(summary));
+
+    // MCP: respond to canvas state requests from main process
+    window.electronAPI.onMcpGetCanvasState(({ replyChannel }) => {
+      const state = canvasContextRef.current?.() ?? '';
+      window.electronAPI.answerMcpGetCanvasState(replyChannel, state);
+    });
+
+    // MCP: respond to raw elements requests (freehand canvas → mermaid)
+    window.electronAPI.onMcpGetRawElements(({ replyChannel }) => {
+      const elements = rawElementsRef.current?.() ?? [];
+      window.electronAPI.answerMcpGetRawElements(replyChannel, elements);
+    });
+
+    // MCP: show drilldown overlay for a named component
+    window.electronAPI.onMcpShowDrilldown(({ name }) => {
+      setSelectedComponent(name);
+      setSelectedComponents([name]);
+      renderDrilldownRef.current?.(name);
+      setDrillDepth(d => d + 1);
+      setDrilldownActive(true);
+    });
+
+    // MCP: show code flow overlay for a named component
+    window.electronAPI.onMcpShowCodeFlow(({ name }) => {
+      setSelectedComponent(name);
+      setSelectedComponents([name]);
+      renderCodeFlowRef.current?.(name);
+      setCodeFlowDepth(d => d + 1);
+      setCodeFlowActive(true);
+    });
+
+    // MCP: update a node description in the live diagram
+    window.electronAPI.onMcpUpdateNodeDescription(({ name, description }) => {
+      setDiagram(prev => {
+        if (!prev) return prev;
+        return { ...prev, descriptions: { ...(prev.descriptions ?? {}), [name]: description } };
+      });
+    });
+
+    // MCP: add a sticky note to the canvas
+    window.electronAPI.onCanvasAddNote((data) => {
+      addNoteRef.current?.(data);
+    });
+
+    // MCP: clear the canvas
+    window.electronAPI.onCanvasClear(() => {
+      setDiagram(null);
+      setRenderError(null);
+      setDrilldownActive(false);
+      setCodeFlowActive(false);
+      setDrillDepth(0);
+      setCodeFlowDepth(0);
+      setSelectedComponent(null);
+      clearDrilldownRef.current?.();
+      clearAllCodeFlowsRef.current?.();
+    });
+
+    window.electronAPI.onChangeContext((nodes) => {
+      setChangeContext(nodes as ChangeContextNode[]);
+      setChangeContextOpen(true);
+    });
+
+    window.electronAPI.onErrorAnnotations((annotations) => {
+      setErrorAnnotations(annotations as { node: string; error: string }[]);
+    });
   }
 
   const handleOpenFolder = useCallback(async () => {
@@ -92,16 +302,76 @@ export default function App() {
     }
   }, []);
 
+  const handleClearProjectCache = useCallback(async () => {
+    if (!folder || status === 'running' || status === 'patching') return;
+    const result = await window.electronAPI.clearProjectCache();
+    if (!result.ok) { setRenderError(result.error ?? 'Could not clear the project cache'); return; }
+    clearDrilldownRef.current?.();
+    clearAllCodeFlowsRef.current?.();
+    setDiagram(null);
+    setSelectedComponent(null);
+    setSelectedComponents([]);
+    setStatus('idle');
+    setStatusDetail('Project cache cleared — run Analyse to create a new map.');
+  }, [folder, status]);
+
   const handleAnalyse = useCallback(async () => {
     if (!folder || status === 'running' || status === 'patching') return;
     await window.electronAPI.runAnalysis();
   }, [folder, status]);
 
+  const handleCanvasCommand = useCallback(async (command: string) => {
+    if (!folder) return;
+    const canvasContext = canvasContextRef.current?.() ?? '';
+    const nodeNames = extractNodeNamesFromDiagram(diagram);
+    setStatus('patching');
+    setStatusDetail(`Canvas: ${command}`);
+    const result = await window.electronAPI.executeCanvasCommand({ command, canvasContext, nodeNames, folder });
+    if (!result.ok) {
+      setStatus('error');
+      setStatusDetail(result.error ?? 'Canvas command failed');
+    }
+  }, [folder, diagram]);
+
+  const askAboutSelection = useCallback(async () => {
+    if (!selectionQuestion.trim() || selectedComponents.length === 0) return;
+    setSelectionAnswering(true);
+    try {
+      const canvasContext = canvasContextRef.current?.() ?? '';
+      const result = await window.electronAPI.askAboutComponents({
+        question: selectionQuestion.trim(),
+        components: selectedComponents,
+        canvasContext,
+        folder: folder ?? '',
+      });
+      if (result.ok && result.diagram) {
+        await selectionAnswerRef.current?.(result.diagram);
+        setSelectionQuestionOpen(false);
+        setSelectionQuestion('');
+      } else {
+        setRenderError(result.error ?? 'Could not create an answer diagram');
+      }
+    } finally {
+      setSelectionAnswering(false);
+    }
+  }, [folder, selectedComponents, selectionQuestion, setDiagramAndRecord]);
+
+  const handleSelectionChange = useCallback((names: string[]) => {
+    setSelectedComponents(names);
+    setSelectedComponent(names[0] ?? null);
+    if (names.length === 0) setSelectionQuestionOpen(false);
+  }, []);
+
   const folderName = folder ? folder.split('/').filter(Boolean).pop() : null;
   const busy = status === 'running' || status === 'patching';
   const canvasLabel = (drilldownActive || codeFlowActive)
     ? [drilldownActive && `Drill: ${selectedComponent ?? ''}`, codeFlowActive && `Flow: ${selectedComponent ?? ''}`].filter(Boolean).join(' · ')
-    : (diagram ? diagram.pattern : 'Canvas');
+    : prActive && activePR
+      ? `PR #${activePR.number}: ${activePR.title}`
+      : (diagram ? diagram.pattern : 'Canvas');
+
+  // Only show diagram type tabs when a code-analysis result is loaded (has multiple diagram kinds)
+  const isCodeAnalysisDiagram = !!(diagram?.diagrams?.sequence || diagram?.diagrams?.gitDiff);
 
   const handleBack = useCallback(() => {
     clearDrilldownRef.current?.();
@@ -129,10 +399,214 @@ export default function App() {
     setCodeFlowLoading(false);
   }, [selectedComponent, codeFlowLoading]);
 
+  const handleImplementation = useCallback(async () => {
+    if (!selectedComponent || codeFlowLoading) return;
+    setCodeFlowLoading(true);
+    await renderCodeFlowRef.current?.(selectedComponent, 'implementation');
+    setCodeFlowDepth(d => d + 1);
+    setCodeFlowLoading(false);
+  }, [selectedComponent, codeFlowLoading]);
+
+  const handleRepositoryCodeStory = useCallback(async () => {
+    if (!folder || codeFlowLoading) return;
+    setCodeFlowLoading(true);
+    setStatus('running');
+    setStatusDetail('Creating whole-repository code story…');
+    try {
+      const result = await window.electronAPI.getComponentCodeFlow('__whole_repo__');
+      if (!result?.ok || !result.mermaid) throw new Error(result?.error || 'No story was returned');
+      clearDrilldownRef.current?.();
+      clearCodeFlowRef.current?.();
+      setDrilldownActive(false);
+      setCodeFlowActive(false);
+      setDiagramAndRecord({
+        pattern: 'Whole repository — Code story',
+        diagrams: { structure: result.mermaid },
+        descriptions: result.descriptions ?? {},
+      });
+      setActiveKind('structure');
+      setRenderError(null);
+    } catch (err) {
+      setRenderError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCodeFlowLoading(false);
+      setStatus('done');
+      setStatusDetail(null);
+    }
+  }, [folder, codeFlowLoading, setDiagramAndRecord]);
+
+  const handleArchitectureStory = useCallback(async () => {
+    if (!folder || codeFlowLoading) return;
+    setCodeFlowLoading(true);
+    setStatus('running');
+    setStatusDetail('Finding the project architecture…');
+    try {
+      const result = await window.electronAPI.getArchitectureStory();
+      if (!result?.ok || !result.mermaid) throw new Error(result?.error || 'No architecture story was returned');
+      clearDrilldownRef.current?.();
+      clearCodeFlowRef.current?.();
+      setDrilldownActive(false);
+      setCodeFlowActive(false);
+      setDiagramAndRecord({
+        pattern: 'Project architecture — Code story',
+        diagrams: { structure: result.mermaid },
+        descriptions: result.descriptions ?? {},
+      });
+      setActiveKind('structure');
+      setRenderError(null);
+    } catch (err) {
+      setRenderError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCodeFlowLoading(false);
+      setStatus('done');
+      setStatusDetail(null);
+    }
+  }, [folder, codeFlowLoading, setDiagramAndRecord]);
+
+  const handleRepositoryImplementation = useCallback(async () => {
+    if (!folder || codeFlowLoading) return;
+    setCodeFlowLoading(true);
+    setStatus('running');
+    setStatusDetail('Mapping the repository implementation…');
+    // This is a full-canvas view, not a component overlay. Clear immediately so
+    // the old Story/Implementation pair cannot remain visible while it runs.
+    clearDrilldownRef.current?.();
+    clearAllCodeFlowsRef.current?.();
+    setDrilldownActive(false);
+    setCodeFlowActive(false);
+    setCodeFlowDepth(0);
+    setSelectedComponent(null);
+    try {
+      const result = await window.electronAPI.getRepositoryImplementation();
+      if (!result?.ok || !result.mermaid) throw new Error(result?.error || 'No implementation map was returned');
+      setDiagramAndRecord({
+        pattern: 'Whole repository — Implementation',
+        diagrams: { structure: result.mermaid },
+        descriptions: result.descriptions ?? {},
+      });
+      setActiveKind('structure');
+      setRenderError(null);
+    } catch (err) {
+      setRenderError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCodeFlowLoading(false);
+      setStatus('done');
+      setStatusDetail(null);
+    }
+  }, [folder, codeFlowLoading, setDiagramAndRecord]);
+
   const canFlow = !!selectedComponent && !codeFlowLoading;
+
+  const handleHistoryTabClick = useCallback(async () => {
+    // If diagrams are showing, re-open the picker; if already open, do nothing
+    if (historyActive) return;
+    setHistoryActive(true);
+    if (commits.length > 0) return; // already loaded
+    setCommitsLoading(true);
+    setCommits([]);
+    setSelectedCommitHash(null);
+    try {
+      const result = await window.electronAPI.listGitCommits();
+      if (result.ok && result.commits) setCommits(result.commits);
+    } finally {
+      setCommitsLoading(false);
+    }
+  }, [historyActive, commits.length]);
+
+  const handleHistoryClear = useCallback(() => {
+    setHistoryActive(false);
+    setCommits([]);
+    setSelectedCommitHash(null);
+    clearCommitDiffRef.current?.();
+  }, []);
+
+  const handleCommitSelect = useCallback(async (hash: string) => {
+    if (commitDiffLoadingRef.current) return;
+    setSelectedCommitHash(hash);
+    setHistoryActive(false); // close dropdown so canvas is fully visible
+    commitDiffLoadingRef.current = true;
+    setCommitDiffLoading(true);
+    setStatus('running');
+    setStatusDetail('Generating commit diagrams…');
+    try {
+      const result = await window.electronAPI.getCommitDiff(hash);
+      if (result.ok) await renderCommitDiffRef.current?.(result as CommitDiffResult);
+    } finally {
+      commitDiffLoadingRef.current = false;
+      setCommitDiffLoading(false);
+      setStatus('done');
+      setStatusDetail(null);
+    }
+  }, []);
+
+  // ── Change story handlers ─────────────────────────────────────────────────────
+
+  const openChangeStoryPicker = useCallback(async (mode: 'pr' | 'branch') => {
+    setChangeStoryMode(mode);
+    setPrActive(true);
+    setPrPickerOpen(true);
+    setActivePR(null);
+    setPrResult(null);
+    setPrView('feature');
+    handleHistoryClear();
+    setPrsLoading(true);
+    try {
+      const result = await window.electronAPI.listPRs();
+      if (result.ok) {
+        const all = result.prs as PRInfo[];
+        setPrs(all.filter(item => mode === 'pr' ? item.number > 0 : item.number < 0));
+      }
+    } finally {
+      setPrsLoading(false);
+    }
+  }, []);
+
+  const handlePRClear = useCallback(() => {
+    setPrActive(false);
+    setPrPickerOpen(false);
+    setPrs([]);
+    setActivePR(null);
+    setPrResult(null);
+    setPrView('feature');
+  }, []);
+
+  const showPRView = useCallback((view: 'feature' | 'code', result: PRReviewResult, pr: PRInfo) => {
+    const flow = view === 'feature' ? result.featureFlow : result.codeFlow;
+    if (!flow?.mermaid) return;
+    setPrView(view);
+    setDiagramAndRecord({
+      pattern: `${pr.number > 0 ? `PR #${pr.number}` : `Branch ${pr.branch}`} — ${view === 'feature' ? 'Feature impact' : 'Code story'}`,
+      diagrams: { structure: flow.mermaid },
+      descriptions: flow.descriptions ?? {},
+    });
+    setActiveKind('structure');
+  }, [setDiagramAndRecord]);
+
+  const handlePRSelect = useCallback(async (pr: PRInfo) => {
+    setActivePR(pr);
+    setPrPickerOpen(false);
+    setPrReviewing(true);
+    setStatus('running');
+    setStatusDetail(`Mapping changes: ${pr.title}…`);
+    try {
+      const result = await window.electronAPI.reviewPR(pr) as PRReviewResult;
+      setPrResult(result);
+      if (result.ok && result.featureFlow?.mermaid) showPRView('feature', result, pr);
+      else if (result.ok && result.codeFlow?.mermaid) showPRView('code', result, pr);
+      else setRenderError(result.error ?? 'The change story could not be drawn. Try selecting it again.');
+    } finally {
+      setPrReviewing(false);
+      setStatus('done');
+      setStatusDetail(null);
+    }
+  }, [showPRView]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', width: '100vw', height: '100vh', background: '#0f0f1a' }}>
+      <style>{`
+        @keyframes slideUpIn { from { opacity: 0; transform: translateX(-50%) translateY(8px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
+        @keyframes slideIn { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: translateX(0); } }
+      `}</style>
 
       {/* ── Toolbar ── */}
       <div style={{
@@ -159,6 +633,32 @@ export default function App() {
           <FolderIcon />
           Open Project
         </button>
+
+        <label title="Choose the AI that handles new analysis and canvas questions" style={{
+          display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0,
+          color: '#8888aa', fontSize: 10, fontFamily: 'system-ui, -apple-system, sans-serif',
+          // @ts-ignore
+          WebkitAppRegion: 'no-drag',
+        }}>
+          AI
+          <select
+            value={aiProvider}
+            onChange={(event) => {
+              const next = event.target.value;
+              setAiProvider(next);
+              window.electronAPI.setAiProvider(next).then(({ provider, providers }) => {
+                setAiProvider(provider);
+                setAiProviders(providers);
+              }).catch(() => setAiProvider(aiProvider));
+            }}
+            style={{
+              background: '#171725', border: '1px solid #36365a', borderRadius: 5, color: '#d8d8ed',
+              fontSize: 11, padding: '4px 24px 4px 7px', cursor: 'pointer', outline: 'none',
+            }}
+          >
+            {aiProviders.map(provider => <option key={provider.id} value={provider.id}>{provider.label}</option>)}
+          </select>
+        </label>
 
         {/* Folder path */}
         <span style={{
@@ -209,11 +709,11 @@ export default function App() {
           {drilling ? 'Drilling…' : selectedComponent ? `Drill: ${selectedComponent}` : 'Drill'}
         </button>
 
-        {/* Code Flow button */}
+        {/* Code Story button */}
         <button
           onClick={handleCodeFlow}
           disabled={!canFlow}
-          title={selectedComponent ? `Trace code flow of ${selectedComponent}` : 'Select a component first'}
+          title={selectedComponent ? `Explain how ${selectedComponent} works` : 'Select a component first'}
           style={{
             display: 'flex', alignItems: 'center', gap: 6,
             padding: '5px 14px',
@@ -229,7 +729,72 @@ export default function App() {
           }}
         >
           <FlowIcon />
-          {codeFlowLoading ? 'Tracing…' : 'Code Flow'}
+          {codeFlowLoading ? 'Explaining…' : 'Code Story'}
+        </button>
+
+        <button
+          onClick={handleImplementation}
+          disabled={!canFlow}
+          title={selectedComponent ? `Explain the implementation details of ${selectedComponent}` : 'Select a component first'}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 6, padding: '5px 14px',
+            background: canFlow ? '#3b2a14' : '#13131f', border: `1px solid ${canFlow ? '#d97706' : '#2a2a50'}`, borderRadius: 6,
+            color: canFlow ? '#fcd34d' : '#444466', fontSize: 12, fontFamily: 'system-ui, -apple-system, sans-serif',
+            cursor: canFlow ? 'pointer' : 'not-allowed', opacity: canFlow ? 1 : 0.45, flexShrink: 0,
+            // @ts-ignore
+            WebkitAppRegion: 'no-drag',
+          }}
+        >
+          <FlowIcon /> {codeFlowLoading ? 'Explaining…' : 'Implementation'}
+        </button>
+
+        <button
+          onClick={handleRepositoryImplementation}
+          disabled={!folder || busy}
+          title="Map the implementation of the whole repository"
+          style={{
+            display: 'flex', alignItems: 'center', gap: 6, padding: '5px 14px',
+            background: '#3b2a14', border: '1px solid #d97706', borderRadius: 6,
+            color: '#fcd34d', fontSize: 12, fontFamily: 'system-ui, -apple-system, sans-serif',
+            cursor: (!folder || busy) ? 'not-allowed' : 'pointer', opacity: (!folder || busy) ? 0.45 : 1, flexShrink: 0,
+            // @ts-ignore
+            WebkitAppRegion: 'no-drag',
+          }}
+        >
+          <FlowIcon /> {codeFlowLoading ? 'Mapping…' : 'Repo Implementation'}
+        </button>
+
+        <button
+          onClick={handleClearProjectCache}
+          disabled={!folder || busy}
+          title="Clear this project's saved analysis, drilldowns, stories, and implementation maps"
+          style={{
+            padding: '5px 10px', background: '#2a1720', border: '1px solid #9f1239', borderRadius: 6,
+            color: '#fda4af', fontSize: 11, fontFamily: 'system-ui, -apple-system, sans-serif',
+            cursor: (!folder || busy) ? 'not-allowed' : 'pointer', opacity: (!folder || busy) ? 0.45 : 1, flexShrink: 0,
+            // @ts-ignore
+            WebkitAppRegion: 'no-drag',
+          }}
+        >
+          Clear cache
+        </button>
+
+        <button
+          onClick={() => setSelectionQuestionOpen(true)}
+          disabled={!selectedComponent}
+          title={selectedComponent ? 'Ask a question about the selected component or components' : 'Select a component first'}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 6, padding: '5px 14px',
+            background: selectedComponent ? '#312e81' : '#13131f',
+            border: `1px solid ${selectedComponent ? '#6366f1' : '#2a2a50'}`, borderRadius: 6,
+            color: selectedComponent ? '#e0e7ff' : '#444466', fontSize: 12,
+            fontFamily: 'system-ui, -apple-system, sans-serif',
+            cursor: selectedComponent ? 'pointer' : 'not-allowed', opacity: selectedComponent ? 1 : 0.45, flexShrink: 0,
+            // @ts-ignore
+            WebkitAppRegion: 'no-drag',
+          }}
+        >
+          Ask selected
         </button>
 
         {/* Analyse */}
@@ -260,7 +825,7 @@ export default function App() {
             marginBottom: 8,
           }}>
             <span style={{ fontSize: 10, color: '#d97706', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
-              Claude changed {impactSummary.changed.length} node{impactSummary.changed.length !== 1 ? 's' : ''}
+              {aiProviders.find(provider => provider.id === aiProvider)?.label ?? 'AI'} changed {impactSummary.changed.length} node{impactSummary.changed.length !== 1 ? 's' : ''}
               {impactSummary.impacted.length > 0 && ` · ${impactSummary.impacted.length} impacted`}
             </span>
             <span onClick={() => setImpactSummary(null)} style={{ fontSize: 11, color: '#444466', cursor: 'pointer', lineHeight: 1 }}>✕</span>
@@ -328,7 +893,7 @@ export default function App() {
             </button>
           </div>
           <div style={{ flex: 1, overflow: 'hidden', padding: terminalMinimized ? 0 : 4, display: terminalMinimized ? 'none' : 'block' }}>
-            <Terminal />
+            <Terminal onCanvasCommand={handleCanvasCommand} />
           </div>
         </div>
 
@@ -337,6 +902,7 @@ export default function App() {
           flex: 1, display: 'flex', flexDirection: 'column',
           background: '#ffffff', borderRadius: 10,
           border: '1px solid #e0e0e8', overflow: 'hidden',
+          position: 'relative',
         }}>
           <div style={{
             display: 'flex', alignItems: 'center', gap: 10,
@@ -377,15 +943,77 @@ export default function App() {
             </span>
 
             {!drilldownActive && !codeFlowActive && (
-              <div style={{ display: 'flex', gap: 4, marginLeft: 'auto' }}>
-                {DIAGRAM_TABS.map(({ kind, label }) => {
+              <div style={{ display: 'flex', gap: 4, marginLeft: 'auto', alignItems: 'center', position: 'relative' }}>
+
+                {/* Diagram type picker */}
+                <div style={{ position: 'relative' }} ref={typePickerRef}>
+                  <button
+                    onClick={() => setTypePickerOpen(o => !o)}
+                    title="Choose diagram type"
+                    style={{
+                      padding: '3px 10px', fontSize: 11, borderRadius: 5,
+                      fontFamily: 'system-ui, -apple-system, sans-serif',
+                      border: typePickerOpen ? '1px solid #7c3aed' : '1px solid #e0e0e8',
+                      background: typePickerOpen ? '#f5f3ff' : '#fff',
+                      color: typePickerOpen ? '#5b21b6' : '#666688',
+                      cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5,
+                    }}
+                  >
+                    {(() => { const t = DIAGRAM_TYPES.find(d => d.id === preferredDiagramType); return t ? `${t.emoji} ${t.label}` : '⬡ Flow Chart'; })()}
+                    <span style={{ fontSize: 8, opacity: 0.6 }}>▾</span>
+                  </button>
+
+                  {typePickerOpen && (
+                    <div style={{
+                      position: 'absolute', top: '100%', right: 0, marginTop: 4,
+                      width: 280, background: '#fff',
+                      border: '1px solid #e0e0e8', borderRadius: 8,
+                      boxShadow: '0 8px 24px rgba(0,0,0,0.12)',
+                      zIndex: 200, overflow: 'hidden',
+                    }}>
+                      <div style={{ padding: '8px 12px 4px', borderBottom: '1px solid #f0f0f8' }}>
+                        <span style={{ fontSize: 9, color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '0.08em', fontFamily: 'system-ui, sans-serif' }}>
+                          Diagram type — the selected AI will use this for the next draw
+                        </span>
+                      </div>
+                      {DIAGRAM_TYPES.map(type => (
+                        <div
+                          key={type.id}
+                          onClick={() => {
+                            setPreferredDiagramType(type.id);
+                            setTypePickerOpen(false);
+                            window.electronAPI.setPreferredDiagramType(type.id);
+                            // Draw the template immediately on the canvas
+                            const data: DiagramData = { pattern: type.label, diagrams: { structure: type.template }, descriptions: {} };
+                            setDiagramAndRecord(data);
+                            setActiveKind('structure');
+                          }}
+                          style={{
+                            display: 'flex', alignItems: 'center', gap: 10,
+                            padding: '7px 12px', cursor: 'pointer',
+                            background: preferredDiagramType === type.id ? '#f5f3ff' : 'transparent',
+                            borderLeft: `3px solid ${preferredDiagramType === type.id ? '#7c3aed' : 'transparent'}`,
+                          }}
+                        >
+                          <span style={{ fontSize: 16, width: 22, textAlign: 'center' }}>{type.emoji}</span>
+                          <div>
+                            <div style={{ fontSize: 12, color: '#1f2937', fontWeight: preferredDiagramType === type.id ? 600 : 400, fontFamily: 'system-ui, sans-serif' }}>{type.label}</div>
+                            <div style={{ fontSize: 10, color: '#9ca3af', fontFamily: 'system-ui, sans-serif' }}>{type.description}</div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {isCodeAnalysisDiagram && DIAGRAM_TABS.map(({ kind, label }) => {
                   const available = !!diagram?.diagrams?.[kind];
-                  const active = activeKind === kind;
+                  const active = activeKind === kind && !historyActive;
                   return (
                     <button
                       key={kind}
                       disabled={!available}
-                      onClick={() => { setActiveKind(kind); setRenderError(null); }}
+                      onClick={() => { handleHistoryClear(); setActiveKind(kind); setRenderError(null); }}
                       style={{
                         padding: '3px 10px', fontSize: 11, borderRadius: 5,
                         fontFamily: 'system-ui, -apple-system, sans-serif',
@@ -399,6 +1027,78 @@ export default function App() {
                     </button>
                   );
                 })}
+                <button
+                  disabled={!folder}
+                  onClick={handleHistoryTabClick}
+                  style={{
+                    padding: '3px 10px', fontSize: 11, borderRadius: 5,
+                    fontFamily: 'system-ui, -apple-system, sans-serif',
+                    border: historyActive ? '1px solid #6d28d9' : '1px solid #e0e0e8',
+                    background: historyActive ? '#ede9fe' : '#ffffff',
+                    color: historyActive ? '#4c1d95' : folder ? '#666688' : '#c8c8d4',
+                    cursor: folder ? 'pointer' : 'not-allowed',
+                  }}
+                >
+                  History
+                </button>
+                <button
+                  disabled={!folder}
+                  onClick={() => void openChangeStoryPicker('pr')}
+                  style={{
+                    padding: '3px 10px', fontSize: 11, borderRadius: 5,
+                    fontFamily: 'system-ui, -apple-system, sans-serif',
+                    border: '1px solid #0ea5e9', background: '#f0f9ff',
+                    color: folder ? '#0369a1' : '#c8c8d4',
+                    cursor: folder ? 'pointer' : 'not-allowed',
+                  }}
+                >
+                  PR story
+                </button>
+                <button
+                  disabled={!folder}
+                  onClick={() => void openChangeStoryPicker('branch')}
+                  style={{
+                    padding: '3px 10px', fontSize: 11, borderRadius: 5,
+                    fontFamily: 'system-ui, -apple-system, sans-serif',
+                    border: '1px solid #0f766e', background: '#f0fdfa',
+                    color: folder ? '#0f766e' : '#c8c8d4', cursor: folder ? 'pointer' : 'not-allowed',
+                  }}
+                >
+                  Branch story
+                </button>
+                {prActive && (
+                  <button
+                    onClick={handlePRClear}
+                    style={{
+                      padding: '3px 10px', fontSize: 11, borderRadius: 5,
+                      fontFamily: 'system-ui, -apple-system, sans-serif',
+                      border: '1px solid #dc2626', background: '#fef2f2', color: '#b91c1c', cursor: 'pointer',
+                    }}
+                  >
+                    Close story ×
+                  </button>
+                )}
+                {canvasHistory.length > 0 && (
+                  <button
+                    onClick={() => setCanvasHistoryOpen(o => !o)}
+                    title={`Canvas history — ${canvasHistory.length} snapshots`}
+                    style={{
+                      padding: '3px 10px', fontSize: 11, borderRadius: 5,
+                      fontFamily: 'system-ui, -apple-system, sans-serif',
+                      border: canvasHistoryOpen ? '1px solid #0369a1' : '1px solid #e0e0e8',
+                      background: canvasHistoryOpen ? '#e0f2fe' : '#ffffff',
+                      color: canvasHistoryOpen ? '#0369a1' : '#666688',
+                      cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4,
+                    }}
+                  >
+                    ◷ {canvasHistory.length}
+                    {canvasHistoryIndex !== null && (
+                      <span style={{ background: '#0369a1', color: '#fff', borderRadius: 3, padding: '0 4px', fontSize: 9 }}>
+                        {canvasHistoryIndex + 1}/{canvasHistory.length}
+                      </span>
+                    )}
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -412,7 +1112,230 @@ export default function App() {
               Diagram render failed: {renderError}
             </div>
           )}
-          <div style={{ flex: 1, overflow: 'hidden' }}>
+
+          {/* ── PR picker — floating dropdown ── */}
+          {prPickerOpen && (
+            <div style={{
+              position: 'absolute', top: 38, right: 0,
+              width: 600, maxHeight: 320, overflowY: 'auto',
+              background: '#ffffff', border: '1px solid #bae6fd',
+              borderRadius: '0 0 8px 8px', boxShadow: '0 8px 24px rgba(0,0,0,0.12)',
+              zIndex: 100,
+            }}>
+              <div style={{ padding: '8px 14px 4px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid #f0f9ff' }}>
+                <span style={{ fontSize: 10, color: '#0369a1', textTransform: 'uppercase', letterSpacing: '0.08em', fontFamily: 'system-ui, sans-serif' }}>
+                  {changeStoryMode === 'pr' ? 'Select a pull request to map' : 'Select a branch to map'}
+                </span>
+                <span onClick={() => { setPrPickerOpen(false); if (!activePR) setPrActive(false); }} style={{ fontSize: 11, color: '#aaa', cursor: 'pointer' }}>✕</span>
+              </div>
+              {prsLoading && <div style={{ padding: '10px 14px', fontSize: 11, color: '#888', fontFamily: 'system-ui, sans-serif' }}>Loading…</div>}
+              {!prsLoading && prs.length === 0 && (
+                <div style={{ padding: '10px 14px', fontSize: 11, color: '#aaa', fontFamily: 'system-ui, sans-serif' }}>
+                  {changeStoryMode === 'pr' ? 'No open pull requests found.' : 'No local branches found.'}
+                </div>
+              )}
+              {prs.map(pr => (
+                <div
+                  key={pr.number}
+                  onClick={() => handlePRSelect(pr)}
+                  style={{
+                    display: 'flex', alignItems: 'baseline', gap: 8,
+                    padding: '7px 14px', cursor: 'pointer',
+                    background: activePR?.number === pr.number ? '#f0f9ff' : 'transparent',
+                    borderLeft: `3px solid ${activePR?.number === pr.number ? '#0369a1' : 'transparent'}`,
+                    borderBottom: '1px solid #f5f5f8',
+                  }}
+                >
+                  <span style={{ fontFamily: 'ui-monospace, monospace', fontSize: 10, color: '#0369a1', background: '#e0f2fe', padding: '1px 5px', borderRadius: 3, flexShrink: 0 }}>
+                    {pr.number > 0 ? `PR #${pr.number}` : 'Branch'}
+                  </span>
+                  <span style={{ fontSize: 11, color: '#222', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'system-ui, sans-serif' }}>
+                    {pr.number > 0 ? pr.title : pr.branch}
+                  </span>
+                  {pr.author && <span style={{ fontSize: 10, color: '#999', flexShrink: 0, fontFamily: 'system-ui, sans-serif' }}>{pr.author}</span>}
+                  <span style={{ fontSize: 10, color: '#16a34a', flexShrink: 0 }}>+{pr.additions}</span>
+                  <span style={{ fontSize: 10, color: '#dc2626', flexShrink: 0 }}>-{pr.deletions}</span>
+                  <span style={{ fontSize: 10, color: '#888', flexShrink: 0 }}>{pr.filesChanged} file{pr.filesChanged !== 1 ? 's' : ''}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* ── Commit list — floating dropdown over canvas ── */}
+          {historyActive && (
+            <div style={{
+              position: 'absolute', top: 38, right: 0,
+              width: 560, maxHeight: 280, overflowY: 'auto',
+              background: '#ffffff', border: '1px solid #d4d4e8',
+              borderRadius: '0 0 8px 8px', boxShadow: '0 8px 24px rgba(0,0,0,0.12)',
+              zIndex: 100, flexShrink: 0,
+            }}>
+              {commitsLoading && (
+                <div style={{ padding: '10px 14px', fontSize: 11, color: '#888', fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+                  Loading commits…
+                </div>
+              )}
+              {!commitsLoading && commits.length === 0 && (
+                <div style={{ padding: '10px 14px', fontSize: 11, color: '#aaa', fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+                  No commits found (not a git repo or no history)
+                </div>
+              )}
+              {commits.map(c => {
+                const isSelected = selectedCommitHash === c.hash;
+                return (
+                  <div
+                    key={c.hash}
+                    onClick={() => handleCommitSelect(c.hash)}
+                    style={{
+                      display: 'flex', alignItems: 'baseline', gap: 8,
+                      padding: '6px 14px', cursor: 'pointer',
+                      background: isSelected ? '#f5f3ff' : 'transparent',
+                      borderLeft: `3px solid ${isSelected ? '#6d28d9' : 'transparent'}`,
+                      borderBottom: '1px solid #f5f5f8',
+                    }}
+                  >
+                    <span style={{
+                      fontFamily: 'ui-monospace, monospace', fontSize: 10,
+                      color: '#6d28d9', background: '#ede9fe',
+                      padding: '1px 5px', borderRadius: 3, flexShrink: 0,
+                    }}>
+                      {c.short}
+                    </span>
+                    <span style={{
+                      fontSize: 11, color: '#333', flex: 1,
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                      fontFamily: 'system-ui, -apple-system, sans-serif',
+                    }}>
+                      {c.message}
+                    </span>
+                    <span style={{ fontSize: 10, color: '#999', flexShrink: 0, fontFamily: 'system-ui, -apple-system, sans-serif' }}>{c.author}</span>
+                    <span style={{ fontSize: 10, color: '#bbb', flexShrink: 0, fontFamily: 'system-ui, -apple-system, sans-serif' }}>{c.date}</span>
+                    {commitDiffLoading && isSelected && (
+                      <span style={{ fontSize: 10, color: '#6d28d9', flexShrink: 0 }}>…</span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          <div style={{ flex: 1, overflow: 'hidden', display: 'flex' }}>
+            <div style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
+
+            {/* ── Canvas node action bar ── */}
+            {selectedComponent && !drilldownActive && !codeFlowActive && (
+              <div style={{
+                position: 'absolute', bottom: 16, left: '50%',
+                transform: 'translateX(-50%)',
+                display: 'flex', alignItems: 'center', gap: 6,
+                background: '#1e1e3a', border: '1px solid #3a3a6a',
+                borderRadius: 10, padding: '6px 10px',
+                boxShadow: '0 4px 20px rgba(0,0,0,0.35)',
+                zIndex: 50, animation: 'slideUpIn 0.15s ease',
+                fontFamily: 'system-ui, -apple-system, sans-serif',
+              }}>
+                <span style={{ fontSize: 11, color: '#9999cc', marginRight: 2, maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {selectedComponents.length > 1 ? `${selectedComponents.length} selected` : selectedComponent}
+                </span>
+                <div style={{ width: 1, height: 16, background: '#3a3a6a' }} />
+                <button
+                  onClick={handleDrill}
+                  disabled={drilling}
+                  title="Drill into this component's user flow"
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 4,
+                    padding: '4px 10px', background: drilling ? '#0f3a5a' : '#0f4c75',
+                    border: '1px solid #1a73b5', borderRadius: 6,
+                    color: '#bae6fd', fontSize: 11, cursor: drilling ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  <DrillIcon /> {drilling ? 'Drilling…' : 'Drill'}
+                </button>
+                <button
+                  onClick={handleCodeFlow}
+                  disabled={codeFlowLoading}
+                  title="Explain how this component works"
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 4,
+                    padding: '4px 10px', background: codeFlowLoading ? '#0f2a0f' : '#1a3a1a',
+                    border: '1px solid #16a34a', borderRadius: 6,
+                    color: '#86efac', fontSize: 11, cursor: codeFlowLoading ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  <FlowIcon /> {codeFlowLoading ? 'Explaining…' : 'Story'}
+                </button>
+                <button
+                  onClick={handleImplementation}
+                  disabled={codeFlowLoading}
+                  title="Show plain-language implementation details"
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 4, padding: '4px 10px',
+                    background: codeFlowLoading ? '#2a1d0b' : '#3b2a14', border: '1px solid #d97706', borderRadius: 6,
+                    color: '#fcd34d', fontSize: 11, cursor: codeFlowLoading ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  <FlowIcon /> {codeFlowLoading ? 'Explaining…' : 'Implementation'}
+                </button>
+                <button
+                  onClick={() => handleCanvasCommand(`Implement or improve the ${selectedComponent} component`)}
+                  disabled={busy}
+                  title="Ask Claude to implement or improve this component"
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 4,
+                    padding: '4px 10px', background: '#3b1d8a',
+                    border: '1px solid #7c3aed', borderRadius: 6,
+                    color: '#ede9fe', fontSize: 11, cursor: busy ? 'not-allowed' : 'pointer',
+                    opacity: busy ? 0.45 : 1,
+                  }}
+                >
+                  <SparkleIcon /> Implement
+                </button>
+                <button
+                  onClick={() => setSelectionQuestionOpen(true)}
+                  disabled={busy}
+                  title="Ask a question about the selected component or components"
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 4,
+                    padding: '4px 10px', background: '#1a1a2e',
+                    border: '1px solid #4a4a8a', borderRadius: 6,
+                    color: '#cdd6f4', fontSize: 11, cursor: busy ? 'not-allowed' : 'pointer',
+                    opacity: busy ? 0.45 : 1,
+                  }}
+                >
+                  Ask
+                </button>
+              </div>
+            )}
+            {selectionQuestionOpen && selectedComponents.length > 0 && (
+              <div style={{
+                position: 'absolute', bottom: 68, left: '50%', transform: 'translateX(-50%)',
+                width: 460, display: 'flex', gap: 8, alignItems: 'center',
+                background: '#ffffff', border: '1px solid #c7d2fe', borderRadius: 10, padding: '8px',
+                boxShadow: '0 8px 28px rgba(0,0,0,0.22)', zIndex: 51,
+              }}>
+                <input
+                  autoFocus
+                  value={selectionQuestion}
+                  onChange={(e) => setSelectionQuestion(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') void askAboutSelection(); if (e.key === 'Escape') setSelectionQuestionOpen(false); }}
+                  placeholder={`Ask about ${selectedComponents.length === 1 ? selectedComponents[0] : `${selectedComponents.length} selected components`}…`}
+                  style={{ flex: 1, border: 'none', outline: 'none', fontSize: 12, fontFamily: 'system-ui, sans-serif', color: '#1e293b' }}
+                />
+                <button
+                  onClick={() => void askAboutSelection()}
+                  disabled={selectionAnswering || !selectionQuestion.trim()}
+                  style={{ border: 'none', borderRadius: 6, padding: '5px 10px', background: '#4f46e5', color: '#fff', fontSize: 11, cursor: 'pointer' }}
+                >
+                  {selectionAnswering ? 'Drawing…' : 'Draw'}
+                </button>
+              </div>
+            )}
+            {isNativeMermaid(diagram?.diagrams?.structure) ? (
+              <MermaidRenderer
+                mermaid={diagram!.diagrams!.structure!}
+                title={diagram?.pattern}
+              />
+            ) : (
             <Canvas
               diagramData={diagram}
               activeKind={activeKind}
@@ -420,12 +1343,281 @@ export default function App() {
               onRenderError={setRenderError}
               onDrilldownChange={(active) => { setDrilldownActive(active); if (!active) setDrillDepth(0); }}
               onCodeFlowChange={(active) => { setCodeFlowActive(active); if (!active) setCodeFlowDepth(0); }}
-              onSelectionChange={setSelectedComponent}
+              onSelectionChange={handleSelectionChange}
               clearDrilldownRef={clearDrilldownRef}
               clearCodeFlowRef={clearCodeFlowRef}
+              clearAllCodeFlowsRef={clearAllCodeFlowsRef}
               renderDrilldownRef={renderDrilldownRef}
               renderCodeFlowRef={renderCodeFlowRef}
+              canvasContextRef={canvasContextRef}
+              rawElementsRef={rawElementsRef}
+              renderCommitDiffRef={renderCommitDiffRef}
+              clearCommitDiffRef={clearCommitDiffRef}
+              addNoteRef={addNoteRef}
+              selectionAnswerRef={selectionAnswerRef}
+              errorAnnotations={errorAnnotations}
             />
+            )}
+            </div>
+
+            {/* ── Canvas history panel ── */}
+            {canvasHistoryOpen && canvasHistory.length > 0 && (
+              <div style={{
+                width: 220, flexShrink: 0, borderLeft: '1px solid #bae6fd',
+                display: 'flex', flexDirection: 'column',
+                background: '#f0f9ff', overflowY: 'auto',
+                animation: 'slideIn 0.15s ease',
+              }}>
+                <div style={{
+                  padding: '8px 12px', borderBottom: '1px solid #bae6fd',
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  background: '#e0f2fe', flexShrink: 0,
+                }}>
+                  <span style={{ fontSize: 10, color: '#0369a1', textTransform: 'uppercase', letterSpacing: '0.08em', fontFamily: 'system-ui, sans-serif', fontWeight: 600 }}>
+                    Canvas History
+                  </span>
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                    {canvasHistoryIndex !== null && (
+                      <span
+                        onClick={() => { setCanvasHistoryIndex(null); setDiagram(canvasHistory[canvasHistory.length - 1].diagram); }}
+                        style={{ fontSize: 10, color: '#0369a1', cursor: 'pointer', fontFamily: 'system-ui, sans-serif' }}
+                        title="Back to live"
+                      >↩ Live</span>
+                    )}
+                    <span onClick={() => setCanvasHistoryOpen(false)} style={{ fontSize: 11, color: '#aaa', cursor: 'pointer' }}>✕</span>
+                  </div>
+                </div>
+                {[...canvasHistory].reverse().map((entry, i) => {
+                  const realIndex = canvasHistory.length - 1 - i;
+                  const isActive = canvasHistoryIndex === realIndex;
+                  const isLive = canvasHistoryIndex === null && realIndex === canvasHistory.length - 1;
+                  const age = Date.now() - entry.timestamp;
+                  const timeLabel = age < 60000
+                    ? `${Math.round(age / 1000)}s ago`
+                    : age < 3600000
+                      ? `${Math.round(age / 60000)}m ago`
+                      : `${Math.round(age / 3600000)}h ago`;
+                  return (
+                    <div
+                      key={entry.index}
+                      onClick={() => {
+                        setCanvasHistoryIndex(realIndex);
+                        setDiagram(entry.diagram);
+                        setActiveKind('structure');
+                        setRenderError(null);
+                      }}
+                      style={{
+                        padding: '8px 12px', borderBottom: '1px solid #e0f2fe',
+                        cursor: 'pointer', background: isActive || isLive ? '#dbeafe' : 'transparent',
+                        borderLeft: `3px solid ${isActive || isLive ? '#0369a1' : 'transparent'}`,
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 2 }}>
+                        <span style={{ fontSize: 10, color: '#0369a1', fontFamily: 'ui-monospace, monospace' }}>
+                          #{realIndex + 1}
+                          {isLive && <span style={{ marginLeft: 4, background: '#16a34a', color: '#fff', borderRadius: 3, padding: '0 4px', fontSize: 8 }}>LIVE</span>}
+                        </span>
+                        <span style={{ fontSize: 9, color: '#94a3b8', fontFamily: 'system-ui, sans-serif' }}>{timeLabel}</span>
+                      </div>
+                      <div style={{ fontSize: 11, color: '#1e3a5f', fontFamily: 'system-ui, sans-serif', fontWeight: isActive || isLive ? 600 : 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {entry.diagram.pattern || 'Canvas'}
+                      </div>
+                      <div style={{ fontSize: 9, color: '#64748b', fontFamily: 'ui-monospace, monospace', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {entry.diagram.diagrams?.structure?.split('\n')[1]?.trim().slice(0, 40) || ''}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* ── Ambient Change Context panel ── */}
+            {changeContextOpen && changeContext && changeContext.length > 0 && (              <div style={{
+                width: 280, flexShrink: 0, borderLeft: '1px solid #e8e8f0',
+                display: 'flex', flexDirection: 'column',
+                background: '#fafafa', overflowY: 'auto',
+                animation: 'slideIn 0.2s ease',
+              }}>
+                <div style={{
+                  padding: '8px 12px', borderBottom: '1px solid #e8e8f0',
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  background: '#fff', flexShrink: 0,
+                }}>
+                  <span style={{ fontSize: 10, color: '#7c3aed', textTransform: 'uppercase', letterSpacing: '0.08em', fontFamily: 'system-ui, sans-serif', fontWeight: 600 }}>
+                    What just changed
+                  </span>
+                  <span onClick={() => setChangeContextOpen(false)} style={{ fontSize: 11, color: '#aaa', cursor: 'pointer' }}>✕</span>
+                </div>
+
+                {changeContext.map((node, i) => (
+                  <div key={i} style={{ padding: '10px 12px', borderBottom: '1px solid #f0f0f5', background: '#fff', marginBottom: 4 }}>
+                    {/* Node name */}
+                    <div style={{ fontSize: 11, fontWeight: 700, color: '#1e1b4b', fontFamily: 'system-ui, sans-serif', marginBottom: 4 }}>
+                      {node.node}
+                    </div>
+                    {/* What it does now */}
+                    <div style={{ fontSize: 11, color: '#374151', fontFamily: 'system-ui, sans-serif', lineHeight: 1.5, marginBottom: 8 }}>
+                      {node.whatNow}
+                    </div>
+
+                    {/* Data flow strip */}
+                    <div style={{ background: '#f5f3ff', borderRadius: 6, padding: '6px 8px', marginBottom: 8 }}>
+                      <div style={{ fontSize: 9, color: '#7c3aed', textTransform: 'uppercase', letterSpacing: '0.08em', fontFamily: 'system-ui, sans-serif', marginBottom: 4 }}>Data flow</div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
+                        <span style={{ fontSize: 10, background: '#ede9fe', color: '#5b21b6', padding: '2px 6px', borderRadius: 4, fontFamily: 'ui-monospace, monospace' }}>
+                          {node.dataIn || '–'}
+                        </span>
+                        <span style={{ fontSize: 10, color: '#9ca3af' }}>→</span>
+                        <span style={{ fontSize: 10, color: '#4b5563', fontFamily: 'system-ui, sans-serif', flex: 1 }}>
+                          {node.transform}
+                        </span>
+                        <span style={{ fontSize: 10, color: '#9ca3af' }}>→</span>
+                        <span style={{ fontSize: 10, background: '#ede9fe', color: '#5b21b6', padding: '2px 6px', borderRadius: 4, fontFamily: 'ui-monospace, monospace' }}>
+                          {node.dataOut || '–'}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Neighbours */}
+                    {node.neighbours && node.neighbours.length > 0 && (
+                      <div>
+                        <div style={{ fontSize: 9, color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '0.08em', fontFamily: 'system-ui, sans-serif', marginBottom: 3 }}>
+                          Connected to
+                        </div>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                          {node.neighbours.map((n, j) => (
+                            <span key={j} style={{ fontSize: 10, background: '#f3f4f6', color: '#374151', padding: '2px 7px', borderRadius: 10, fontFamily: 'system-ui, sans-serif', border: '1px solid #e5e7eb' }}>
+                              {n}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* ── Build/test error annotations panel ── */}
+            {errorAnnotations.length > 0 && (
+              <div style={{
+                width: 240, flexShrink: 0, borderLeft: '1px solid #fee2e2',
+                display: 'flex', flexDirection: 'column',
+                background: '#fffafa', overflowY: 'auto',
+              }}>
+                <div style={{
+                  padding: '8px 12px', borderBottom: '1px solid #fecaca',
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  background: '#fff', flexShrink: 0,
+                }}>
+                  <span style={{ fontSize: 10, color: '#dc2626', textTransform: 'uppercase', letterSpacing: '0.08em', fontFamily: 'system-ui, sans-serif', fontWeight: 600 }}>
+                    Errors · {errorAnnotations.length}
+                  </span>
+                  <span onClick={() => setErrorAnnotations([])} style={{ fontSize: 11, color: '#aaa', cursor: 'pointer' }}>✕</span>
+                </div>
+                {errorAnnotations.map((ann, i) => (
+                  <div key={i} style={{ padding: '8px 12px', borderBottom: '1px solid #fef2f2' }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: '#b91c1c', fontFamily: 'system-ui, sans-serif', marginBottom: 3 }}>
+                      {ann.node}
+                    </div>
+                    <div style={{ fontSize: 10, color: '#7f1d1d', fontFamily: 'ui-monospace, monospace', lineHeight: 1.5, wordBreak: 'break-all' }}>
+                      {ann.error}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* ── Change story sidebar ── */}
+            {prActive && prResult && (
+              <div style={{
+                width: 300, flexShrink: 0, borderLeft: '1px solid #e0e7ef',
+                display: 'flex', flexDirection: 'column',
+                background: '#f8fafc', overflowY: 'auto',
+              }}>
+                {/* Sidebar header */}
+                <div style={{
+                  padding: '8px 12px', borderBottom: '1px solid #e2e8f0',
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  background: '#fff', flexShrink: 0,
+                }}>
+                  <span style={{ fontSize: 10, color: '#0369a1', textTransform: 'uppercase', letterSpacing: '0.08em', fontFamily: 'system-ui, sans-serif', fontWeight: 600 }}>
+                    Change story
+                  </span>
+                  <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                    {activePR && (
+                      <span
+                        onClick={() => setPrPickerOpen(p => !p)}
+                        style={{ fontSize: 10, color: '#0369a1', cursor: 'pointer', fontFamily: 'system-ui, sans-serif' }}
+                        title="Choose another change"
+                      >↔ Change</span>
+                    )}
+                    <span onClick={handlePRClear} style={{ fontSize: 11, color: '#aaa', cursor: 'pointer', lineHeight: 1 }}>✕</span>
+                  </div>
+                </div>
+
+                {activePR && prResult?.ok && (
+                  <div style={{ display: 'flex', gap: 6, padding: '7px 12px', background: '#fff', borderBottom: '1px solid #e2e8f0' }}>
+                    {([
+                      { id: 'feature' as const, label: 'Feature view', available: !!prResult.featureFlow?.mermaid },
+                      { id: 'code' as const, label: 'Code story', available: !!prResult.codeFlow?.mermaid },
+                    ]).map(view => (
+                      <button
+                        key={view.id}
+                        disabled={!view.available}
+                        onClick={() => showPRView(view.id, prResult, activePR)}
+                        style={{
+                          flex: 1, padding: '4px 6px', borderRadius: 4, fontSize: 10,
+                          fontFamily: 'system-ui, sans-serif',
+                          border: prView === view.id ? '1px solid #0369a1' : '1px solid #dbeafe',
+                          background: prView === view.id ? '#e0f2fe' : '#fff',
+                          color: prView === view.id ? '#0369a1' : view.available ? '#475569' : '#cbd5e1',
+                          cursor: view.available ? 'pointer' : 'not-allowed',
+                        }}
+                      >
+                        {view.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {/* PR meta strip */}
+                {activePR && (
+                  <div style={{ padding: '6px 12px', background: '#e0f2fe', borderBottom: '1px solid #bae6fd', flexShrink: 0 }}>
+                    <div style={{ fontSize: 11, color: '#0369a1', fontWeight: 600, fontFamily: 'system-ui, sans-serif', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {activePR.number > 0 ? `#${activePR.number} · ` : ''}{activePR.title}
+                    </div>
+                    <div style={{ fontSize: 10, color: '#0284c7', fontFamily: 'system-ui, sans-serif', marginTop: 2 }}>
+                      {activePR.filesChanged} files · <span style={{ color: '#16a34a' }}>+{activePR.additions}</span> / <span style={{ color: '#dc2626' }}>-{activePR.deletions}</span>
+                      {activePR.author ? ` · ${activePR.author}` : ''}
+                    </div>
+                  </div>
+                )}
+
+                <div style={{ flex: 1, overflowY: 'auto' }}>
+                  {!prResult.ok && (
+                    <div style={{ padding: '12px', fontSize: 11, color: '#dc2626', fontFamily: 'system-ui, sans-serif' }}>
+                      Could not create the change story: {prResult.error}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Loading overlay while creating a change story */}
+            {prReviewing && (
+              <div style={{
+                position: 'absolute', inset: 0, background: 'rgba(255,255,255,0.7)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                zIndex: 50,
+              }}>
+                <div style={{ textAlign: 'center', fontFamily: 'system-ui, sans-serif' }}>
+                  <div style={{ fontSize: 28, marginBottom: 8 }}>🔍</div>
+                  <div style={{ fontSize: 13, color: '#0369a1', fontWeight: 600 }}>Creating change story…</div>
+                  <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>{activePR?.title}</div>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -468,3 +1660,13 @@ function SparkleIcon() {
   );
 }
 
+function PRIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <circle cx="18" cy="18" r="3" />
+      <circle cx="6" cy="6" r="3" />
+      <path d="M13 6h3a2 2 0 0 1 2 2v7" />
+      <line x1="6" y1="9" x2="6" y2="21" />
+    </svg>
+  );
+}

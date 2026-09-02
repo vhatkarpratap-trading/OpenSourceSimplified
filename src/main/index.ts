@@ -4,15 +4,37 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as crypto from 'crypto';
 import { execSync } from 'child_process';
-import { createPty, writeToPty, resizePty, killPty, restartPty, runCapture, setPtyDataCallback, getPtyCwd } from './ptyManager';
+import { createPty, writeToPty, resizePty, killPty, restartPty, runCapture, setPtyDataCallback, getPtyCwd, getAiProvider, setAiProvider, AI_PROVIDERS, AiProvider } from './ptyManager';
 import { startFileWatcher, stopFileWatcher } from './fileWatcher';
 import { extractStructure, toClaudePromptJSON, ExtractedStructure } from './codeExtractor';
+import { startMcpServer, stopMcpServer, recordPtyOutput, updateClaudeJsonMcpConfig } from './mcpServer';
+import { listPRs, listLocalBranches, reviewPR, PRInfo } from './prReviewer';
 
 let mainWindow: BrowserWindow | null = null;
 let currentFolder: string | null = null;
 let currentDiagram: object | null = null;
 let currentNodePaths: Record<string, string> = {};
 let patchInProgress = false;
+let preferredDiagramType = 'flowchart'; // updated by renderer type picker
+
+function aiProviderSettingsFile() { return path.join(app.getPath('userData'), 'ai-provider.json'); }
+
+function loadAiProvider(): AiProvider {
+  try {
+    const { provider } = JSON.parse(fs.readFileSync(aiProviderSettingsFile(), 'utf8')) as { provider?: string };
+    return setAiProvider(provider ?? 'claude');
+  } catch { return getAiProvider(); }
+}
+
+function saveAiProvider(provider: string): AiProvider {
+  const selected = setAiProvider(provider);
+  try { fs.writeFileSync(aiProviderSettingsFile(), JSON.stringify({ provider: selected }), 'utf8'); } catch {}
+  return selected;
+}
+
+function providerLabel() {
+  return AI_PROVIDERS.find(p => p.id === getAiProvider())?.label ?? 'AI';
+}
 
 // ── Diagram cache ─────────────────────────────────────────────────────────────
 // One JSON file per project, keyed by a hash of the extracted structure.
@@ -20,11 +42,18 @@ let patchInProgress = false;
 
 interface CodeFlowStep { fn: string; what: string; data: string }
 
+interface CommitDiagram {
+  featureFlow: { mermaid: string; descriptions?: Record<string, string> };
+  codeFlow:    { mermaid: string; happyPath?: string[] };
+}
+
 interface CacheFile {
   structureHash: string;
+  provider?: AiProvider;
   diagram: object;
   drilldowns: Record<string, string>;
   codeflows: Record<string, string>;
+  commitDiagrams?: Record<string, CommitDiagram>;
   savedAt: number;
 }
 
@@ -55,6 +84,7 @@ function saveCache(folder: string, data: Partial<CacheFile> & { diagram: object;
     const existing = loadCache(folder);
     const merged: CacheFile = {
       structureHash: data.structureHash,
+      provider: getAiProvider(),
       diagram: data.diagram,
       drilldowns: { ...(existing?.drilldowns ?? {}), ...(data.drilldowns ?? {}) },
       codeflows: { ...(existing?.codeflows ?? {}), ...(data.codeflows ?? {}) },
@@ -94,6 +124,34 @@ function saveCodeFlow(folder: string, componentName: string, mermaid: string) {
     existing.savedAt = Date.now();
     fs.writeFileSync(cacheFile(folder), JSON.stringify(existing, null, 2), 'utf8');
   } catch { /* ignore */ }
+}
+
+function clearProjectCache(folder: string): boolean {
+  try {
+    const target = cacheFile(folder);
+    if (fs.existsSync(target)) fs.unlinkSync(target);
+    return true;
+  } catch { return false; }
+}
+
+function saveCommitDiagram(folder: string, hash: string, diagram: CommitDiagram) {
+  try {
+    const existing = loadCache(folder);
+    if (!existing) return;
+    existing.commitDiagrams = existing.commitDiagrams ?? {};
+    existing.commitDiagrams[hash] = diagram;
+    existing.savedAt = Date.now();
+    fs.writeFileSync(cacheFile(folder), JSON.stringify(existing, null, 2), 'utf8');
+  } catch { /* ignore */ }
+}
+
+function persistDiagram(diagram: object) {
+  currentDiagram = diagram;
+  if (currentFolder) {
+    const structureJson = JSON.stringify(diagram);
+    const structureHash = hashStructure(structureJson);
+    saveCache(currentFolder, { structureHash, diagram });
+  }
 }
 
 // ── Last project persistence ──────────────────────────────────────────────────
@@ -213,6 +271,43 @@ function buildClaudePrompt(structureJson: string): string {
   ].join('\n');
 }
 
+// ── Change context prompt ─────────────────────────────────────────────────────
+
+interface ChangeContextNode {
+  node: string;
+  whatNow: string;
+  dataIn: string;
+  transform: string;
+  dataOut: string;
+  neighbours: string[];
+}
+
+function buildChangeContextPrompt(diff: string, nodeNames: string[]): string {
+  const schema = `{"nodes":[{"node":"exact name from list","whatNow":"1 sentence: what this part does now, starting with an active verb","dataIn":"what data/input enters this part (real var/type names from the diff)","transform":"the key thing this part does to that data","dataOut":"what comes out the other end (real var/type name)","neighbours":["names of other nodes that call into this or receive from this"]}]}`;
+
+  return [
+    'A developer just made code changes. Show them where their change fits in the bigger picture.',
+    'Output ONLY the JSON below — no fences, no prose.',
+    '',
+    'RULES:',
+    '- "whatNow": plain English, active voice, what the changed part does NOW. Not what changed — what it does.',
+    '- "dataIn": the real variable or type name that enters this part (grep the diff for it). If unknown, "–".',
+    '- "transform": the single most important thing this part does to that data. One clause.',
+    '- "dataOut": what leaves this part. Real name from the code if possible.',
+    '- "neighbours": which other parts in the architecture directly call into this or directly receive its output.',
+    `  Use EXACT names from this list: ${nodeNames.length ? nodeNames.join(', ') : '(none)'}`,
+    '- Only include nodes that were actually changed in the diff. 1–4 nodes max.',
+    '',
+    'Schema:',
+    schema,
+    '',
+    'DIFF (focus on + lines):',
+    diff.slice(0, 6000),
+    '',
+    'JSON only.',
+  ].join('\n');
+}
+
 /**
  * Prompt for EXPLAINING a code change against the EXISTING base diagram.
  * We do NOT regenerate the diagram — we ask Claude which of the known component
@@ -321,6 +416,43 @@ function computeGitAnnotations(
   return annotations;
 }
 
+const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_PAGER: 'cat', PAGER: 'cat' };
+
+function computeCommitAnnotations(
+  folder: string,
+  hash: string,
+  changedRelPaths: string[],
+  nodePaths: Record<string, string>,
+): GitAnnotation[] {
+  const pathToNode = new Map(Object.entries(nodePaths).map(([n, p]) => [path.relative(folder, p), n]));
+  const statMap = new Map<string, { added: number; removed: number }>();
+
+  try {
+    const numstat = execSync(`git --no-pager show --numstat ${hash}`, { cwd: folder, encoding: 'utf8', timeout: 8000, env: GIT_ENV });
+    for (const line of numstat.split('\n')) {
+      const m = line.match(/^(\d+|-)\t(\d+|-)\t(.+)$/);
+      if (!m) continue;
+      const added   = m[1] === '-' ? 0 : parseInt(m[1], 10);
+      const removed = m[2] === '-' ? 0 : parseInt(m[2], 10);
+      statMap.set(m[3].trim(), { added, removed });
+    }
+  } catch { /* numstat unavailable — proceed with zeros */ }
+
+  return changedRelPaths.map(relPath => {
+    const nodeName = pathToNode.get(relPath) || path.basename(relPath);
+    const stat = statMap.get(relPath) ?? { added: 0, removed: 0 };
+    const { added, removed } = stat;
+
+    const parts: string[] = [];
+    if (added > 0 && removed === 0) parts.push(`+${added} lines added`);
+    else if (removed > 0 && added === 0) parts.push(`-${removed} lines removed`);
+    else if (added > 0 || removed > 0) parts.push(`+${added} / -${removed} lines`);
+    if (parts.length === 0) parts.push('Modified');
+
+    return { name: nodeName, summary: parts.join('\n'), added, removed };
+  });
+}
+
 /** Flatten annotations into a plain-text summary for the change prompt. */
 function gitAnnotationsToText(annotations: GitAnnotation[]): string {
   return annotations
@@ -407,7 +539,7 @@ async function runIncrementalPatch(changedFiles: string) {
       // Check cache before asking Claude
       const cached = loadCache(folder);
       let base: object | null = null;
-      if (cached && cached.structureHash === structureHash && cached.diagram) {
+      if (cached && cached.structureHash === structureHash && cached.diagram && (cached.provider ?? 'claude') === getAiProvider()) {
         base = cached.diagram;
       } else {
         const raw = await runCapture(buildClaudePrompt(structureJson), folder);
@@ -441,9 +573,22 @@ async function runIncrementalPatch(changedFiles: string) {
     win.webContents.send('analysis:statusDetail', 'Explaining what changed…');
 
     const nodeNames = extractNodeNames(currentDiagram);
-    const raw = await runCapture(buildExplainPrompt(changedFiles, gitDiffSummary, nodeNames), folder);
+
+    // Build the full diff text for the change-context prompt
+    let fullDiff = '';
+    try {
+      fullDiff = execSync('git --no-pager diff HEAD', { cwd: folder, encoding: 'utf8', timeout: 8000, env: GIT_ENV }).slice(0, 6000);
+    } catch { /* ignore */ }
+
+    // Run explain + change-context in parallel
+    const [raw, ctxRaw] = await Promise.all([
+      runCapture(buildExplainPrompt(changedFiles, gitDiffSummary, nodeNames), folder),
+      runCapture(buildChangeContextPrompt(fullDiff || gitDiffSummary, nodeNames), folder),
+    ]);
+
     const parsed = extractJson(raw) as { changes?: ChangeExplanation[] } | null;
     const changes = parsed?.changes || [];
+    const ctxParsed = extractJson(ctxRaw) as { nodes?: ChangeContextNode[] } | null;
 
     if (win.isDestroyed()) return;
 
@@ -469,6 +614,9 @@ async function runIncrementalPatch(changedFiles: string) {
       win.webContents.send('canvas:claudeChanges', { changedNames, impactedNames: [] });
       win.webContents.send('analysis:impactSummary', summary);
       win.webContents.send('canvas:gitAnnotations', badges);
+      if (ctxParsed?.nodes?.length) {
+        win.webContents.send('canvas:changeContext', ctxParsed.nodes);
+      }
     } else if (annotations.length > 0) {
       // Fallback: no explanation parsed, still highlight from git facts
       const changedNames = annotations.map(a => a.name);
@@ -500,6 +648,7 @@ function impactSummaryFromAnnotations(annotations: GitAnnotation[]): ImpactSumma
 // ── Window ────────────────────────────────────────────────────────────────────
 
 function createWindow() {
+  loadAiProvider();
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -513,12 +662,31 @@ function createWindow() {
     },
   });
 
+  mainWindow.webContents.on('console-message', (_event, _level, message, line, sourceId) => {
+    console.error(`[renderer:${line}] ${message} (${sourceId})`);
+  });
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    console.error('[renderer] process gone:', details.reason);
+  });
   mainWindow.loadFile(path.join(__dirname, '../../dist/renderer/index.html'));
 
   mainWindow.webContents.on('did-finish-load', () => {
     if (!mainWindow) return;
     createPty(mainWindow);
     setupPtyClaudeDetection();
+
+    startMcpServer({
+      getFolder:  () => currentFolder,
+      getDiagram: () => currentDiagram,
+      getWindow:  () => mainWindow,
+      runAnalysisInternal,
+      runComponentDetail,
+      runComponentDrilldown,
+      runComponentCodeFlow,
+      executeCanvasCommandInternal,
+      persistDiagram,
+    });
+    updateClaudeJsonMcpConfig(path.join(app.getAppPath(), 'mcp-bridge.js'));
 
     const last = loadLastProject();
     if (last) {
@@ -527,7 +695,7 @@ function createWindow() {
 
       // Restore cached diagram immediately — canvas is populated before any analysis
       const cached = loadCache(last);
-      if (cached?.diagram) {
+      if (cached?.diagram && (cached.provider ?? 'claude') === getAiProvider()) {
         currentDiagram = cached.diagram;
         mainWindow.webContents.send('canvas:diagram', cached.diagram);
         mainWindow.webContents.send('folder:restored', { folder: last, hasCachedDiagram: true });
@@ -543,6 +711,7 @@ function createWindow() {
   });
 
   mainWindow.on('closed', () => {
+    stopMcpServer();
     stopFileWatcher();
     killPty();
     mainWindow = null;
@@ -557,6 +726,9 @@ app.on('activate', () => { if (mainWindow === null) createWindow(); });
 
 ipcMain.on('pty:write', (_e, data: string) => writeToPty(data));
 ipcMain.on('pty:resize', (_e, cols: number, rows: number) => resizePty(cols, rows));
+
+ipcMain.handle('ai:getProvider', () => ({ provider: getAiProvider(), providers: AI_PROVIDERS }));
+ipcMain.handle('ai:setProvider', (_e, provider: string) => ({ provider: saveAiProvider(provider), providers: AI_PROVIDERS }));
 
 ipcMain.handle('folder:open', async () => {
   if (!mainWindow) return null;
@@ -578,7 +750,7 @@ ipcMain.handle('folder:open', async () => {
 
   // Restore cached diagram for this project if one exists
   const cached = loadCache(folder);
-  if (cached?.diagram) {
+  if (cached?.diagram && (cached.provider ?? 'claude') === getAiProvider()) {
     currentDiagram = cached.diagram;
     mainWindow.webContents.send('canvas:diagram', cached.diagram);
   }
@@ -591,7 +763,14 @@ ipcMain.handle('folder:open', async () => {
   return { folder, hasCachedDiagram: !!cached?.diagram };
 });
 
-ipcMain.handle('analysis:run', async () => {
+ipcMain.handle('cache:clearProject', () => {
+  if (!currentFolder) return { ok: false, error: 'No project is open' };
+  const ok = clearProjectCache(currentFolder);
+  if (ok) currentDiagram = null;
+  return ok ? { ok: true } : { ok: false, error: 'Could not clear the project cache' };
+});
+
+async function runAnalysisInternal(): Promise<{ ok?: boolean; error?: string; fromCache?: boolean }> {
   if (!mainWindow || !currentFolder) return { error: 'No folder selected' };
 
   mainWindow.webContents.send('analysis:status', 'running');
@@ -611,7 +790,7 @@ ipcMain.handle('analysis:run', async () => {
 
     // ── Cache hit: structure unchanged since last analysis ──
     const cached = loadCache(currentFolder);
-    if (cached && cached.structureHash === structureHash && cached.diagram) {
+    if (cached && cached.structureHash === structureHash && cached.diagram && (cached.provider ?? 'claude') === getAiProvider()) {
       currentDiagram = cached.diagram;
       currentNodePaths = structure.nodePaths;
       normalizeDiagramPattern(cached.diagram as Record<string, unknown>, structure);
@@ -623,7 +802,7 @@ ipcMain.handle('analysis:run', async () => {
     }
 
     // ── Cache miss: ask Claude ──
-    mainWindow.webContents.send('analysis:statusDetail', `Analysing ${structure.totalFiles} files with Claude…`);
+    mainWindow.webContents.send('analysis:statusDetail', `Analysing ${structure.totalFiles} files with ${providerLabel()}…`);
     const prompt = buildClaudePrompt(structureJson);
     const raw = await runCapture(prompt, currentFolder);
     const diagram = extractJson(raw);
@@ -639,7 +818,7 @@ ipcMain.handle('analysis:run', async () => {
 
     if (!diagram) {
       mainWindow.webContents.send('analysis:status', 'error');
-      return { error: 'No JSON found in Claude output' };
+      return { error: `No JSON found in ${providerLabel()} output` };
     }
 
     normalizeDiagramPattern(diagram as Record<string, unknown>, structure);
@@ -660,7 +839,13 @@ ipcMain.handle('analysis:run', async () => {
     mainWindow.webContents.send('analysis:status', 'error');
     return { error: message };
   }
+}
+
+ipcMain.on('canvas:setPreferredDiagramType', (_e, type: string) => {
+  preferredDiagramType = String(type || 'flowchart');
 });
+
+ipcMain.handle('analysis:run', () => runAnalysisInternal());
 
 // ── Component detail (click-to-inspect) ─────────────────────────────────────────
 
@@ -683,7 +868,7 @@ function buildComponentDetailPrompt(name: string, nodeNames: string[]): string {
   ].join('\n');
 }
 
-ipcMain.handle('component:detail', async (_e, name: string) => {
+async function runComponentDetail(name: string): Promise<{ ok?: boolean; error?: string; detail?: unknown }> {
   if (!currentFolder || !name) return { error: 'no component' };
   try {
     const nodeNames = extractNodeNames(currentDiagram);
@@ -695,7 +880,9 @@ ipcMain.handle('component:detail', async (_e, name: string) => {
   } catch (err: unknown) {
     return { error: err instanceof Error ? err.message : String(err) };
   }
-});
+}
+
+ipcMain.handle('component:detail', async (_e, name: string) => runComponentDetail(name));
 
 // ── Component drilldown ───────────────────────────────────────────────────────
 
@@ -711,12 +898,21 @@ function findSourceFiles(
   name: string,
   nodePaths: Record<string, string>,
   projectRoot: string,
+  maxResults = 3,
 ): { filePath: string; content: string }[] {
   const lc = name.toLowerCase();
-  const SOURCE_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.kt', '.java', '.py', '.swift', '.dart', '.go', '.rs', '.vue', '.cs']);
   const IGNORE = new Set(['node_modules', 'dist', 'build', '.git', '.dart_tool', 'Pods', '.next', 'out', 'target', '__pycache__', 'coverage']);
 
-  const read = (fp: string): string => { try { return fs.readFileSync(fp, 'utf8'); } catch { return ''; } };
+  // Projects may store their behavior in any text-based format: source code,
+  // metadata, rules, templates, configuration, or a domain-specific extension.
+  // Read every reasonable text file rather than relying on an extension allow-list.
+  const read = (fp: string): string => {
+    try {
+      if (fs.statSync(fp).size > 2 * 1024 * 1024) return '';
+      const content = fs.readFileSync(fp, 'utf8');
+      return content.includes('\0') ? '' : content;
+    } catch { return ''; }
+  };
 
   const scoreFile = (fileName: string, content: string): number => {
     const fn = fileName.toLowerCase().replace(/\.[^.]+$/, '');
@@ -727,6 +923,13 @@ function findSourceFiles(
       const re = new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
       s += Math.min((content.match(re) || []).length * 3, 45);
     } catch { /* ignore invalid regex */ }
+    // Diagram labels often use readable names (for example, "My Schedule")
+    // while metadata files use a shorter technical name (for example, Schedule.page).
+    for (const word of lc.split(/[^a-z0-9]+/).filter(word => word.length > 2)) {
+      const re = new RegExp(word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+      if (fn.includes(word)) s += 20;
+      s += Math.min((content.match(re) || []).length, 10);
+    }
     return s;
   };
 
@@ -754,7 +957,7 @@ function findSourceFiles(
       for (const e of entries) {
         if (e.isDirectory() && !IGNORE.has(e.name) && !e.name.startsWith('.'))
           walk(path.join(dir, e.name), depth + 1);
-        else if (e.isFile() && SOURCE_EXTS.has(path.extname(e.name).toLowerCase()))
+        else if (e.isFile())
           add(path.join(dir, e.name), e.name);
       }
     };
@@ -762,7 +965,7 @@ function findSourceFiles(
   }
 
   results.sort((a, b) => b.score - a.score);
-  return results.slice(0, 3).filter(r => r.score > 0).map(r => ({ filePath: r.filePath, content: r.content }));
+  return results.slice(0, maxResults).filter(r => r.score > 0).map(r => ({ filePath: r.filePath, content: r.content }));
 }
 
 function buildDrilldownPrompt(name: string, sourceCode: string, imports: string[], calledBy: string[]): string {
@@ -806,7 +1009,7 @@ function buildDrilldownPrompt(name: string, sourceCode: string, imports: string[
   ].filter(Boolean).join('\n');
 }
 
-ipcMain.handle('component:drilldown', async (_e, rawName: string) => {
+async function runComponentDrilldown(rawName: string): Promise<{ ok?: boolean; error?: string; mermaid?: string; fromCache?: boolean }> {
   const name = rawName.trim();
   if (!currentFolder || !name) return { error: 'no component' };
   try {
@@ -863,7 +1066,9 @@ ipcMain.handle('component:drilldown', async (_e, rawName: string) => {
   } catch (err: unknown) {
     return { error: err instanceof Error ? err.message : String(err) };
   }
-});
+}
+
+ipcMain.handle('component:drilldown', (_e, rawName: string) => runComponentDrilldown(rawName));
 
 // ── Code flow ─────────────────────────────────────────────────────────────────
 
@@ -921,7 +1126,252 @@ function buildCodeFlowPrompt(name: string, sourceCode: string): string {
   ].join('\n');
 }
 
-ipcMain.handle('component:codeflow', async (_e, rawName: string) => {
+function buildCodeStoryPrompt(name: string, sourceCode: string): string {
+  return [
+    'Explain how the selected component, "' + name + '", behaves when its code runs. Create a plain-English Code Story, not a feature map or a user journey.',
+    'Output ONLY the JSON below — no fences, no prose.',
+    '',
+    'HARD RULES:',
+    '- Base every step on the supplied source code. Do not invent screens, user journeys, product features, missing-source handling, or hypothetical behaviour.',
+    "- Make the component's behaviour explicit: what triggers it or enters it, what input/state it reads, which decisions it makes, which state/external data it changes or requests, and what result it produces.",
+    '- Tell the story of this program running: trigger/input → read or prepare data → decision → work or side effect → result. Omit a stage only when the source does not prove it.',
+    '- This is NOT a user journey. Do not use actions such as "tap", "open screen", "browse", or "sign in" unless that exact action is the code operation being explained.',
+    '- If the code does not prove a step, leave it out.',
+    '',
+    'WHAT TO SHOW:',
+    '- Tell the complete feature story across all supplied files: entry/input → orchestration → every meaningful decision → local/service/storage work → success result and meaningful failure result.',
+    '- Use 6–12 connected steps, ordered from top to bottom. Do not stop at the first helper when the supplied source shows what it calls next.',
+    '- Each node label is plain English and tells one code action or outcome. Good: "Read the saved map position", "Request places near that position", "Keep only usable results", "Publish nearby places to the view". Bad: "Explore Nearby Map", "Open Survey Screen", "Tap Next", "Show Dashboard".',
+    '- Name conditional behaviour truthfully. If the source branches, show both meaningful outcomes with labels such as "valid data" and "missing data"; do not quietly present only the happy path.',
+    '- Do not use function names, class names, variable names, file paths, or source code in the chart.',
+    '- Edge labels are the data or decision in plain English: "answers", "missing field", "valid survey".',
+    '',
+    'DESCRIPTIONS:',
+    '- Give every node one concise sentence that explains the step in everyday language.',
+    '- Do not mention code names, file paths, design patterns, or developer terminology.',
+    '',
+    'MERMAID:',
+    '- Start with flowchart TD.',
+    '- Use Id[Plain English Step] node syntax.',
+    '- Use A -->|plain English data or decision| B edges.',
+    '- No subgraphs, no code snippets, and no technical boilerplate.',
+    '',
+    'happyPath is the ordered list of node IDs for the main successful path.',
+    '',
+    'Schema:',
+    '{"mermaid":"flowchart TD string — use \\n for newlines","descriptions":{"Node Label":"Plain-English explanation of this step."},"happyPath":["nodeId1","nodeId2"]}',
+    '',
+    'SOURCE CODE of ' + name + ':',
+    sourceCode.slice(0, 16000),
+    '',
+    'JSON only.',
+  ].join('\n');
+}
+
+function buildImplementationPrompt(name: string, sourceCode: string): string {
+  return [
+    'Explain the implementation of the selected component, "' + name + '", as a plain-language technical walkthrough.',
+    'Output ONLY the JSON below — no fences, no prose.', '',
+    'RULES:',
+    '- Use only facts proven by the supplied source.',
+    '- Trace the complete implementation across all supplied files: initialization/entry point → orchestration functions → helper/data/service calls → state or returned result, including meaningful failure paths.',
+    '- Use 6–12 connected steps. Follow calls into relevant local helpers and imported project modules; do not stop at a wrapper function.',
+    '- Node labels must name an implementation responsibility in plain language. Good: "Initialize loading state and read route input", "Look up the cached insight by visit identifier", "Write the service response into view state", "Build sections from the resolved data". Bad: "Open the page", "Show the brief", "User views results".',
+    '- Each description must explain the concrete implementation in plain language, naming the relevant function, data, condition, or external call and a source file reference.',
+    '- Do not make this a user journey. A node may describe rendering only as the final technical result of state/data processing.',
+    '- Show meaningful error or alternative paths when the source proves them.',
+    '- Use flowchart TD, plain-English edge labels, and no subgraphs or code snippets.', '',
+    'Schema:',
+    '{"mermaid":"flowchart TD string — use \n for newlines","descriptions":{"Node Label":"Implementation detail in plain language (path/file)"},"happyPath":["nodeId1","nodeId2"]}', '',
+    'SOURCE CODE of ' + name + ':', sourceCode.slice(0, 16000), '', 'JSON only.',
+  ].join('\n');
+}
+
+function buildRepositoryCodeStoryPrompt(projectStructure: string): string {
+  return [
+    'Create one plain-English Code Story for this entire repository. This is a guided overview for a developer who needs to understand what the application does and how its major parts work together.',
+    'Output ONLY the JSON below — no fences or prose.',
+    '',
+    'WHAT TO SHOW:',
+    '- Show the 5–10 most important responsibilities or feature areas, in the order a request or user action moves through the application.',
+    '- Begin with the app entry or user action and finish with the visible result, stored data, or external effect.',
+    '- Combine implementation details into meaningful steps. Do not create one node per file, class, or function.',
+    '- If the repository has independent feature areas, show the shared entry point splitting into no more than 3 clear paths, then their outcomes.',
+    '- Node labels must be plain English: no function names, class names, source code, or folder paths.',
+    '- Every edge must say what is passed or decided in plain English.',
+    '',
+    'DESCRIPTIONS:',
+    '- Give every node one concise explanation of BOTH how that part works and why it exists.',
+    '- Use this exact shape: "How: [the responsibility, data movement, or decision]. Why: [the purpose] (source references)."',
+    '- End each description with one or two relevant source references from the project structure in parentheses, for example: "How: starts the desktop process and opens the workspace window. Why: provides the application entry point (src/main/index.ts)."',
+    '',
+    'MERMAID:',
+    '- Start with flowchart TD.',
+    '- Use Id[Plain English Step] nodes and labelled A -->|data or decision| B edges.',
+    '- 6–12 connected nodes total. No subgraphs, no code snippets, and no technical boilerplate.',
+    '',
+    'Schema:',
+    '{"mermaid":"flowchart TD string","descriptions":{"Node Label":"How: implementation. Why: purpose (path/file.ts)"},"happyPath":["nodeId1","nodeId2"]}',
+    '',
+    'PROJECT STRUCTURE:',
+    projectStructure.slice(0, 18000),
+    '',
+    'JSON only.',
+  ].join('\n');
+}
+
+function buildArchitectureStoryPrompt(projectContext: string): string {
+  return [
+    "Create an evidence-based Architecture Story for this repository. This is separate from a code-flow story: it explains the project's technical shape so a developer can orient themselves before tracing a feature.",
+    'Output ONLY the JSON below — no fences or prose.',
+    '',
+    'WHAT TO EXPLAIN:',
+    '- Runtime and framework: name the framework, language, package manager, and app/runtime type only when the supplied files prove them.',
+    '- Architectural pattern: identify the closest pattern actually present, such as layered, MVC, MVVM, feature-based, client-server, or modular. State when it is mixed or unclear.',
+    '- State management: explain where UI, domain, or shared state lives and how it changes. If there is no dedicated state library, say so and describe the local mechanism found.',
+    '- Data and integrations: identify database, ORM, API, file storage, auth, or external services. If none are evident, explicitly say "No persistence layer detected" rather than inventing one.',
+    '- Main boundaries: show how the entry point, UI, business logic, and data/integration layers connect.',
+    '',
+    'EVIDENCE RULES:',
+    '- Every claim must be supported by a package manifest, config file, import, or source reference in PROJECT CONTEXT.',
+    '- Do not infer a database from a model name or an architectural pattern from folder names alone.',
+    '- Put specific findings in the node labels and supporting evidence in descriptions.',
+    '',
+    'MERMAID:',
+    '- Start with flowchart TD.',
+    '- Use 5–8 connected Id[Label] nodes. Include nodes for Runtime and architecture, then state and data when relevant.',
+    '- Use short technical labels; framework and pattern names are welcome.',
+    '- Every edge must explain the responsibility or data passed between the layers.',
+    '- No subgraphs, code snippets, or guesses.',
+    '',
+    'DESCRIPTIONS:',
+    '- Give every node one concise explanation in this exact shape: "What: [finding]. Evidence: [specific files or imports]."',
+    '',
+    'Schema:',
+    '{"mermaid":"flowchart TD string","descriptions":{"Node Label":"What: finding. Evidence: path/file"}}',
+    '',
+    'PROJECT CONTEXT:',
+    projectContext.slice(0, 28000),
+    '',
+    'JSON only.',
+  ].join('\n');
+}
+
+function buildRepositoryImplementationPrompt(projectContext: string): string {
+  return [
+    'Create a feature-by-feature Implementation Map for this repository. Explain how EVERY meaningful feature found in the supplied source is implemented, in plain language for a developer.',
+    'Output ONLY the JSON below — no fences or prose.', '',
+    'WHAT TO SHOW:',
+    '- First show the shared startup/entry point. Then create one subgraph for EACH meaningful, independent feature or workflow found in the source. A feature is a cohesive user or domain capability, not an individual file or helper.',
+    '- Treat build scripts, dependency manifests, plugin setup, and generated configuration as infrastructure—not features. Do not devote a feature subgraph to them unless the repository contains no application or domain feature code.',
+    '- For every feature, show its actual implementation path: trigger or entry → important logic/decision → state, data, or API work → result. Use 2–4 connected nodes per feature.',
+    '- Cover all meaningful features the supplied source proves, up to 8 feature subgraphs and 24 nodes total. If there are more, combine closely related minor features and state that in the description.',
+    '- Node labels must be plain English operations, not raw class, function, variable, or file names.',
+    '- Every description explains concrete implementation details in plain language: responsibility, important functions/data/state movement, conditions, and source evidence in parentheses.',
+    '- Show framework, runtime, persistence, API, or external integrations only when the supplied context proves them.',
+    '- Do not invent missing layers. Say no persistence or integration is evident when appropriate.',
+    '- Every edge is labelled with the data, event, or responsibility passed between steps.', '',
+    'MERMAID:',
+    '- Start with flowchart TD.',
+    '- Use one `subgraph FeatureName` block for each feature and Id[Plain English operation] nodes with labelled edges.',
+    '- Connect the shared entry point to every feature entry. No code snippets.', '',
+    'Schema:',
+    '{"mermaid":"flowchart TD string","descriptions":{"Node Label":"Implementation detail in plain language (path/file)"},"happyPath":["nodeId1","nodeId2"]}', '',
+    'PROJECT CONTEXT:', projectContext.slice(0, 50000), '', 'JSON only.',
+  ].join('\n');
+}
+
+function architectureStoryContext(folder: string, structure: ExtractedStructure): string {
+  const context: string[] = [toClaudePromptJSON(structure)];
+  const evidenceFiles = [
+    'package.json', 'composer.json', 'pyproject.toml', 'requirements.txt', 'Pipfile',
+    'build.gradle', 'build.gradle.kts', 'settings.gradle', 'Podfile', 'pubspec.yaml',
+    'docker-compose.yml', 'docker-compose.yaml', 'prisma/schema.prisma',
+  ];
+
+  for (const relative of evidenceFiles) {
+    const filePath = path.join(folder, relative);
+    try {
+      if (fs.statSync(filePath).isFile())
+        context.push('\n// ── ' + relative + ' ──\n' + fs.readFileSync(filePath, 'utf8').slice(0, 7000));
+    } catch { /* optional project evidence */ }
+  }
+
+  const sourceEvidence: string[] = [];
+  for (const filePath of Object.values(structure.nodePaths).slice(0, 30)) {
+    try {
+      const content = fs.readFileSync(filePath, 'utf8');
+      if (/\b(useState|useReducer|createStore|configureStore|Provider|zustand|redux|mobx|pinia|vuex|Context|Room|SQLite|Realm|prisma|typeorm|mongoose|sequelize|supabase|firebase|fetch\(|axios|graphql)\b/i.test(content)) {
+        sourceEvidence.push('\n// ── ' + path.relative(folder, filePath) + ' ──\n' + content.slice(0, 3500));
+      }
+    } catch { /* source file may no longer exist */ }
+    if (sourceEvidence.join('').length > 14000) break;
+  }
+  return [...context, ...sourceEvidence].join('\n');
+}
+
+function repositoryImplementationContext(folder: string, structure: ExtractedStructure): string {
+  const context: string[] = [toClaudePromptJSON(structure)];
+  let remaining = 40000;
+  const paths = Object.values(structure.nodePaths);
+  const infrastructure = /(?:^|\/)(?:build|dist|config|configs|scripts?|gradle|webpack)(?:\/|$)|(?:^|\/)(?:package|settings|build|webpack|vite|babel|metro|podfile|gradle)\.[^/]+$/i;
+  // Feature code goes first: build/config files are useful evidence, but should
+  // not crowd out the workflows the repository actually implements.
+  const orderedPaths = [...paths.filter(p => !infrastructure.test(path.relative(folder, p))), ...paths.filter(p => infrastructure.test(path.relative(folder, p)))];
+  for (const filePath of orderedPaths) {
+    if (remaining <= 0) break;
+    try {
+      const content = fs.readFileSync(filePath, 'utf8');
+      if (content.includes('\0')) continue;
+      const chunk = content.slice(0, Math.min(1800, remaining));
+      context.push('\n// ── ' + path.relative(folder, filePath) + ' ──\n' + chunk);
+      remaining -= chunk.length;
+    } catch { /* source file may no longer exist */ }
+  }
+  return context.join('\n');
+}
+
+async function runArchitectureStory(): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string> }> {
+  if (!currentFolder) return { error: 'no project folder' };
+  const cacheKey = '__architecture_story__';
+  try {
+    const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
+    if (typeof cachedValue === 'string') {
+      const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string> };
+      if (cached.version === 1 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {} };
+    }
+
+    const structure = extractStructure(currentFolder);
+    const raw = await runCapture(buildArchitectureStoryPrompt(architectureStoryContext(currentFolder, structure)), currentFolder);
+    const parsed = extractJson(raw) as { mermaid?: string; descriptions?: Record<string, string> } | null;
+    if (!parsed?.mermaid) return { error: 'no mermaid in response' };
+    const descriptions = parsed.descriptions ?? {};
+    saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 1, mermaid: parsed.mermaid, descriptions }));
+    return { ok: true, mermaid: parsed.mermaid, descriptions };
+  } catch (err: unknown) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+async function runRepositoryImplementation(): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string> }> {
+  if (!currentFolder) return { error: 'no project folder' };
+  const cacheKey = '__repository_implementation__';
+  try {
+    const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
+    if (typeof cachedValue === 'string') {
+      const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string> };
+      if (cached.version === 3 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {} };
+    }
+    const structure = extractStructure(currentFolder);
+    const parsed = extractJson(await runCapture(buildRepositoryImplementationPrompt(repositoryImplementationContext(currentFolder, structure)), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string> } | null;
+    if (!parsed?.mermaid) return { error: 'no mermaid in response' };
+    const result = { version: 3, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {} };
+    saveCodeFlow(currentFolder, cacheKey, JSON.stringify(result));
+    return { ok: true, mermaid: result.mermaid, descriptions: result.descriptions };
+  } catch (err: unknown) { return { error: err instanceof Error ? err.message : String(err) }; }
+}
+
+async function runComponentCodeFlow(rawName: string, drillMermaid = ''): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[]; fromCache?: boolean }> {
   const name = rawName.trim();
   if (!currentFolder || !name) return { error: 'no component' };
   try {
@@ -929,19 +1379,32 @@ ipcMain.handle('component:codeflow', async (_e, rawName: string) => {
     const cachedValue = cached?.codeflows?.[name];
     if (typeof cachedValue === 'string') {
       try {
-        const p = JSON.parse(cachedValue) as { mermaid: string; happyPath: string[] };
-        if (p?.mermaid) return { ok: true, mermaid: p.mermaid, happyPath: p.happyPath ?? [], fromCache: true };
+        const p = JSON.parse(cachedValue) as { version?: number; mermaid: string; descriptions?: Record<string, string>; happyPath: string[] };
+        // Version 7 makes the story describe the selected component's runtime
+        // behaviour (inputs, decisions, effects, and results), rather than a
+        // broad feature or user-flow map.
+        if (!drillMermaid && p?.version === 8 && p.mermaid) return { ok: true, mermaid: p.mermaid, descriptions: p.descriptions ?? {}, happyPath: p.happyPath ?? [], fromCache: true };
       } catch {
-        // old format was raw mermaid string
-        if (cachedValue.includes('flowchart')) return { ok: true, mermaid: cachedValue, happyPath: [], fromCache: true };
+        // Older raw-Mermaid entries were generated as user journeys, not code stories.
+        // Ignore them so they are recreated with the current Code Story rules.
       }
     }
 
     const structure = extractStructure(currentFolder);
-    const sourceFiles = findSourceFiles(name, structure.nodePaths, currentFolder);
+    if (name === '__whole_repo__') {
+      const raw = await runCapture(buildRepositoryCodeStoryPrompt(toClaudePromptJSON(structure)), currentFolder);
+      const parsed = extractJson(raw) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
+      if (!parsed?.mermaid) return { error: 'no mermaid in response' };
+      const happyPath = parsed.happyPath ?? [];
+      const descriptions = parsed.descriptions ?? {};
+      saveCodeFlow(currentFolder, name, JSON.stringify({ version: 3, mermaid: parsed.mermaid, descriptions, happyPath }));
+      return { ok: true, mermaid: parsed.mermaid, descriptions, happyPath };
+    }
+
+    const sourceFiles = findSourceFiles(name, structure.nodePaths, currentFolder, 6);
 
     let sourceCode = '';
-    let budget = 8000;
+    let budget = 16000;
     for (const { filePath, content } of sourceFiles) {
       const rel = path.relative(currentFolder, filePath);
       const chunk = content.slice(0, budget);
@@ -950,19 +1413,279 @@ ipcMain.handle('component:codeflow', async (_e, rawName: string) => {
       if (budget <= 0) break;
     }
 
-    const context = sourceCode.trim()
-      ? sourceCode
-      : `// No source file found for "${name}" — using project structure.\n${toClaudePromptJSON(structure).slice(0, 4000)}`;
+    if (!sourceCode.trim()) {
+      return { error: `No source code was found for "${name}". Select a code component to create a Code Story.` };
+    }
 
-    const raw = await runCapture(buildCodeFlowPrompt(name, context), currentFolder);
-    const parsed = extractJson(raw) as { mermaid?: string; happyPath?: string[] } | null;
+    const raw = await runCapture(buildCodeStoryPrompt(name, sourceCode + (drillMermaid ? '\n\nDRILL FLOW CONTEXT — cover this complete feature path:\n' + drillMermaid : '')), currentFolder);
+    const parsed = extractJson(raw) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
 
     const happyPath = parsed.happyPath ?? [];
-    saveCodeFlow(currentFolder, name, JSON.stringify({ mermaid: parsed.mermaid, happyPath }));
-    return { ok: true, mermaid: parsed.mermaid, happyPath };
+    const descriptions = parsed.descriptions ?? {};
+    saveCodeFlow(currentFolder, name, JSON.stringify({ version: 8, mermaid: parsed.mermaid, descriptions, happyPath }));
+    return { ok: true, mermaid: parsed.mermaid, descriptions, happyPath };
   } catch (err: unknown) {
     return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+ipcMain.handle('component:codeflow', (_e, rawName: string, drillMermaid?: string) => runComponentCodeFlow(rawName, drillMermaid));
+
+async function runComponentImplementation(rawName: string, drillMermaid = ''): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] }> {
+  const name = rawName.trim();
+  if (!currentFolder || !name) return { error: 'no component' };
+  try {
+    const cacheKey = '__implementation__' + name;
+    const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
+    if (typeof cachedValue === 'string') {
+      const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] };
+      if (!drillMermaid && cached.version === 3 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, happyPath: cached.happyPath ?? [] };
+    }
+    const structure = extractStructure(currentFolder);
+    const sourceFiles = findSourceFiles(name, structure.nodePaths, currentFolder, 6);
+    let sourceCode = '';
+    let budget = 16000;
+    for (const { filePath, content } of sourceFiles) {
+      const chunk = content.slice(0, budget);
+      sourceCode += '\n// ── ' + path.relative(currentFolder, filePath) + ' ──\n' + chunk;
+      budget -= chunk.length;
+      if (budget <= 0) break;
+    }
+    if (!sourceCode.trim()) return { error: `No source code was found for "${name}". Select a code component to explain its implementation.` };
+    const parsed = extractJson(await runCapture(buildImplementationPrompt(name, sourceCode + (drillMermaid ? '\n\nDRILL FLOW CONTEXT — implement this complete feature path:\n' + drillMermaid : '')), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
+    if (!parsed?.mermaid) return { error: 'no mermaid in response' };
+    const result = { version: 3, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {}, happyPath: parsed.happyPath ?? [] };
+    saveCodeFlow(currentFolder, cacheKey, JSON.stringify(result));
+    return { ok: true, mermaid: result.mermaid, descriptions: result.descriptions, happyPath: result.happyPath };
+  } catch (err: unknown) { return { error: err instanceof Error ? err.message : String(err) }; }
+}
+
+ipcMain.handle('component:implementation', (_e, rawName: string, drillMermaid?: string) => runComponentImplementation(rawName, drillMermaid));
+ipcMain.handle('project:architectureStory', () => runArchitectureStory());
+ipcMain.handle('project:implementation', () => runRepositoryImplementation());
+
+// ── Git history ───────────────────────────────────────────────────────────────
+
+function buildCommitFeatureFlowPrompt(commitMsg: string, diffSource: string): string {
+  return [
+    `This git commit was just made: "${commitMsg}"`,
+    'Look at the diff below and draw a user-facing feature flow diagram showing WHAT CHANGED for the user.',
+    'Output ONLY the JSON below — no fences, no prose.',
+    '',
+    'WHAT TO SHOW:',
+    '1. The features or user-facing behaviours that changed in this commit.',
+    '2. How the user experience is different now vs before.',
+    '3. Any new steps, screens, or error states added.',
+    '4. Connections to other features that were affected.',
+    '',
+    'NODE LABELS: plain English actions or states a user would recognise.',
+    '   Good: "Enter Email", "Validate Password", "Show Error", "Save Booking"',
+    '   Bad: "AuthViewModel.login()", "apiClient.post()", "useState"',
+    '',
+    'EDGE LABELS: what triggers the transition.',
+    '   Good: "taps submit", "password wrong", "success"',
+    '   Bad: "calls", "returns Promise", "dispatches"',
+    '',
+    'MERMAID SYNTAX (follow exactly):',
+    '- Start with `flowchart TD`.',
+    '- Node id = letters/digits/underscore only. Format: `Id[Label]`.',
+    '- Label: letters, digits, spaces only. NO special chars inside [ ].',
+    '- Edge with label: `A -->|taps submit| B`.',
+    '- NO subgraph, NO classDiagram, NO sequenceDiagram.',
+    '- 6–14 nodes. Every node must be connected.',
+    '',
+    'Schema:',
+    '{"mermaid":"flowchart TD string — use \\n for newlines","descriptions":{"NodeLabel":"1 sentence starting with Lets the user or Shows the user"}}',
+    '',
+    'DIFF:',
+    diffSource.slice(0, 6000),
+    '',
+    'JSON only.',
+  ].join('\n');
+}
+
+function buildCommitCodeFlowPrompt(commitMsg: string, diffSource: string): string {
+  // Extract only added lines from the diff to keep focus tight
+  const addedLines = diffSource.split('\n')
+    .filter(l => l.startsWith('+') && !l.startsWith('+++'))
+    .map(l => l.slice(1))
+    .join('\n')
+    .slice(0, 3000);
+
+  return [
+    `This git commit was just made: "${commitMsg}"`,
+    'Look at the diff and draw a code flow for ONLY the functions that were directly added or modified by this commit.',
+    'DO NOT include helper functions or callers that were not changed. Focus on what is NEW or DIFFERENT.',
+    'Output ONLY the JSON below — no fences, no prose.',
+    '',
+    'FOR EACH CHANGED FUNCTION, create two nodes:',
+    '  1. A function node (rectangle):  Id["functionName()\\nmost important NEW line"]',
+    '     - Line 1: function name with ()',
+    '     - Line 2: the single most important ADDED line (starts with + in the diff)',
+    '  2. A description note (stadium shape):  IdDesc(["what this specific change does"])',
+    '     - One sentence: what is different now vs before',
+    '     - Connect directly below: Id --> IdDesc',
+    '',
+    'Connect function nodes in the order they call each other:',
+    '  IdDesc -->|param or return value| NextId',
+    '',
+    'Group by file using subgraphs: `subgraph FileName\\n  ...\\nend`',
+    '',
+    'happyPath = the ordered node IDs of the main changed flow (entry → exit, no errors).',
+    '',
+    'RULES:',
+    '- ONLY functions that appear in the + lines of the diff',
+    '- 3–8 function nodes max — be selective, not exhaustive',
+    '- No unchanged helper functions, no boilerplate',
+    '',
+    'MERMAID SYNTAX:',
+    '- Start with `flowchart TD`',
+    '- Node ids: letters/digits/underscore only, unique',
+    '- Function node: `Id["fnName()\\ncode line"]` (double quotes, \\n between lines)',
+    '- Description node: `IdDesc(["plain sentence"])`',
+    '',
+    'Schema:',
+    '{"mermaid":"flowchart TD string — use \\n for newlines","happyPath":["nodeId1","nodeId2"]}',
+    '',
+    'ADDED LINES FROM DIFF:',
+    addedLines,
+    '',
+    'FULL DIFF (for context):',
+    diffSource.slice(0, 3000),
+    '',
+    'JSON only.',
+  ].join('\n');
+}
+
+ipcMain.handle('git:listCommits', async () => {
+  if (!currentFolder) return { ok: false, error: 'no folder' };
+  try {
+    const out = execSync(
+      'git --no-pager log --format="%H|%s|%an|%ad" --date=short -20',
+      { cwd: currentFolder, encoding: 'utf8', timeout: 8000, env: GIT_ENV },
+    );
+    const commits = out.trim().split('\n').filter(Boolean).map(line => {
+      const [hash, message, author, date] = line.split('|');
+      return {
+        hash:    hash?.trim()    ?? '',
+        short:   hash?.trim().slice(0, 7) ?? '',
+        message: message?.trim() ?? '',
+        author:  author?.trim()  ?? '',
+        date:    date?.trim()    ?? '',
+      };
+    });
+    return { ok: true, commits };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('git:commitDiff', async (_e, hash: string) => {
+  if (!currentFolder || !hash) return { ok: false, error: 'no folder or hash' };
+  const folder = currentFolder;
+  try {
+    // ── 1. Changed file list ──
+    let changedRelPaths: string[] = [];
+    try {
+      const nameOnly = execSync(
+        `git --no-pager diff --name-only "${hash}^..${hash}"`,
+        { cwd: folder, encoding: 'utf8', timeout: 8000, env: GIT_ENV },
+      );
+      changedRelPaths = nameOnly.trim().split('\n').filter(Boolean);
+    } catch {
+      const showOut = execSync(
+        `git --no-pager show --name-only --format= ${hash}`,
+        { cwd: folder, encoding: 'utf8', timeout: 8000, env: GIT_ENV },
+      );
+      changedRelPaths = showOut.trim().split('\n').filter(Boolean);
+    }
+
+    // ── 2. Commit metadata ──
+    const meta = execSync(
+      `git --no-pager log -1 --format="%s|%an|%ad" --date=short ${hash}`,
+      { cwd: folder, encoding: 'utf8', timeout: 5000, env: GIT_ENV },
+    ).trim();
+    const [message, author, date] = meta.split('|');
+    const commitMsg = message?.trim() ?? '';
+
+    // ── 3. Cache check ──
+    const cached = loadCache(folder);
+    if (cached?.commitDiagrams?.[hash]) {
+      const cd = cached.commitDiagrams[hash];
+      const changedAbsPaths = changedRelPaths.map(r => path.join(folder, r));
+      return {
+        ok: true,
+        changedFiles:     changedRelPaths,
+        changedNodeNames: changedNodeNames(changedAbsPaths, currentNodePaths),
+        annotations:      computeCommitAnnotations(folder, hash, changedRelPaths, currentNodePaths),
+        commitInfo: { hash, short: hash.slice(0, 7), message: commitMsg, author: author?.trim() ?? '', date: date?.trim() ?? '', filesChanged: changedRelPaths.length },
+        featureFlow: cd.featureFlow,
+        codeFlow:    cd.codeFlow,
+        fromCache:   true,
+      };
+    }
+
+    // ── 4. Diff source for Claude ──
+    let diffSource = '';
+    try {
+      diffSource = execSync(
+        `git --no-pager show -p --stat ${hash}`,
+        { cwd: folder, encoding: 'utf8', timeout: 10000, env: GIT_ENV },
+      ).slice(0, 6000);
+    } catch { /* use empty diff */ }
+
+    // Also include current file content for context (up to 3 files, 2000 chars each)
+    let fileContext = '';
+    for (const relPath of changedRelPaths.slice(0, 3)) {
+      try {
+        const absPath = path.join(folder, relPath);
+        const content = fs.readFileSync(absPath, 'utf8').slice(0, 2000);
+        fileContext += `\n// ── ${relPath} (current) ──\n${content}`;
+      } catch { /* skip unreadable */ }
+    }
+    const fullSource = (diffSource + fileContext).slice(0, 8000);
+
+    // ── 5. Two Claude calls in parallel ──
+    const [featureRaw, codeRaw] = await Promise.all([
+      runCapture(buildCommitFeatureFlowPrompt(commitMsg, fullSource), folder),
+      runCapture(buildCommitCodeFlowPrompt(commitMsg, fullSource), folder),
+    ]);
+
+    const featureParsed = extractJson(featureRaw) as { mermaid?: string; descriptions?: Record<string, string> } | null;
+    const codeParsed    = extractJson(codeRaw)    as { mermaid?: string; happyPath?: string[] }               | null;
+
+    const featureFlow = featureParsed?.mermaid
+      ? { mermaid: featureParsed.mermaid, descriptions: featureParsed.descriptions ?? {} }
+      : null;
+    const codeFlow = codeParsed?.mermaid
+      ? { mermaid: codeParsed.mermaid, happyPath: codeParsed.happyPath ?? [] }
+      : null;
+
+    // ── 6. Cache ──
+    if (featureFlow && codeFlow) {
+      saveCommitDiagram(folder, hash, { featureFlow, codeFlow });
+    }
+
+    const changedAbsPaths = changedRelPaths.map(r => path.join(folder, r));
+    return {
+      ok: true,
+      changedFiles:     changedRelPaths,
+      changedNodeNames: changedNodeNames(changedAbsPaths, currentNodePaths),
+      annotations:      computeCommitAnnotations(folder, hash, changedRelPaths, currentNodePaths),
+      commitInfo: {
+        hash,
+        short:        hash.slice(0, 7),
+        message:      commitMsg,
+        author:       author?.trim()  ?? '',
+        date:         date?.trim()    ?? '',
+        filesChanged: changedRelPaths.length,
+      },
+      featureFlow,
+      codeFlow,
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 });
 
@@ -984,6 +1707,105 @@ function normalizeDiagramPattern(diagram: Record<string, unknown>, structure: Ex
   diagram.pattern = inferred;
 }
 
+// ── Canvas-aware terminal command ─────────────────────────────────────────────
+
+function buildCanvasCommandText(req: { command: string; canvasContext: string; nodeNames: string[] }): string {
+  const namesStr = req.nodeNames.join(', ');
+  const contextBlock = req.canvasContext
+    ? `The user has drawn the following system design on their visual architecture canvas:\n\n${req.canvasContext}\n\nUse this as your implementation blueprint.`
+    : '';
+  return [
+    `You are a software engineer working on this codebase. Write code to fulfil the following request:`,
+    '',
+    `"${req.command}"`,
+    '',
+    contextBlock,
+    namesStr ? `Known component names from the design: ${namesStr}` : '',
+    `Implement the code directly — create or edit the necessary files. Do not just describe what to do.`,
+  ].filter(Boolean).join('\n').trim();
+}
+
+async function executeCanvasCommandInternal(command: string, canvasContext: string, nodeNames: string[]): Promise<{ ok: boolean; error?: string }> {
+  if (!mainWindow) return { ok: false, error: 'no window' };
+  if (!currentFolder) return { ok: false, error: 'no folder open' };
+  if (summaryPending) return { ok: false, error: `${providerLabel()} is already running — please wait` };
+  try {
+    const ctxFile = path.join(os.tmpdir(), `rex-canvas-ctx-${Date.now()}.txt`);
+    fs.writeFileSync(ctxFile, buildCanvasCommandText({ command, canvasContext, nodeNames }), 'utf8');
+    const quotedFile = `'${ctxFile.replace(/'/g, "'\\''")}'`;
+    const provider = getAiProvider();
+    const cliCommand = provider === 'claude'
+      ? `claude --dangerously-skip-permissions "$(cat ${quotedFile})"`
+      : provider === 'codex'
+        ? `codex --full-auto --skip-git-repo-check "$(cat ${quotedFile})"`
+        : `gemini --yolo -p "$(cat ${quotedFile})"`;
+    writeToPty(`${cliCommand}\r`);
+    mainWindow.webContents.send('canvas:commandStatus', `Running with ${providerLabel()}: ${command}`);
+    return { ok: true };
+  } catch (err: unknown) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+ipcMain.handle('canvas:command', async (_e, req: { command: string; canvasContext: string; nodeNames: string[]; folder: string }) => {
+  if (!req.folder) return { ok: false, error: 'no folder open' };
+  const result = await executeCanvasCommandInternal(req.command, req.canvasContext, req.nodeNames);
+  return result.ok ? { ok: true, statusMessage: `Sent to ${providerLabel()}: ${req.command}` } : result;
+});
+
+ipcMain.handle('selection:ask', async (_e, req: { question: string; components: string[]; canvasContext: string; folder: string }) => {
+  if (!currentFolder || !req.question.trim() || req.components.length === 0) return { ok: false, error: 'Select at least one component and enter a question' };
+  try {
+    const question = req.question.trim();
+    const normalizedQuestion = question.toLowerCase();
+    const asksHow = /\bhow\b/.test(normalizedQuestion);
+    const asksWhy = /\bwhy\b|\bpurpose\b|\breason\b/.test(normalizedQuestion);
+    const answerMode = asksHow && asksWhy
+      ? 'Explain BOTH how it works and why it exists.'
+      : asksWhy
+        ? 'Explain WHY it exists: its purpose, the problem it prevents or solves, and why the decisions in the code are needed.'
+        : asksHow
+          ? 'Explain HOW it works: the actual operations, data/state changes, and decisions in order.'
+          : 'Choose the explanation style that directly answers the question.';
+    const structure = extractStructure(currentFolder);
+    const sourceChunks: string[] = [];
+    let remaining = 9000;
+    for (const component of req.components.slice(0, 8)) {
+      for (const { filePath, content } of findSourceFiles(component, structure.nodePaths, currentFolder)) {
+        if (remaining <= 0) break;
+        const chunk = content.slice(0, remaining);
+        sourceChunks.push('// ' + path.relative(currentFolder, filePath) + '\n' + chunk);
+        remaining -= chunk.length;
+      }
+    }
+    const prompt = [
+      'Answer a developer question about selected components as a clear Mermaid flowchart.',
+      'Output ONLY JSON. Do not edit files. Do not give prose outside JSON.',
+      '', 'QUESTION:', question, 'SELECTED COMPONENTS:', req.components.join(', '), '',
+      'ANSWER MODE:', answerMode, '',
+      'RULES:', '- Make the diagram directly answer the question. Do not replace it with a generic request lifecycle.',
+      '- First node must state the direct answer in plain English.',
+      '- If the question asks about a response, payload, output, JSON, fields, headers, or data shape: diagram the concrete response structure (status, headers, body and known fields), not the request-processing steps.',
+      '- If the question asks how something works (including just "How?"): diagram the real process in order. Each description must say HOW the code does that step: operation, data/state change, and decision/condition.',
+      '- If the question asks why (including just "Why?"): diagram the purpose and reasoning, not a generic process. Each description must say WHY that step or decision exists and what problem it prevents or solves.',
+      '- If it asks both how and why, every description must use this format: "How: … Why: … (source reference)".',
+      '- Use only facts supported by the provided source/context. Say "not defined here" rather than inventing fields.',
+      '- Use 4–10 short plain-English nodes. Explain behavior before implementation details.',
+      '- Include only the selected components and directly relevant connections.',
+      '- Put real function/file references in descriptions, not node labels. For a How or Why answer, descriptions must contain the requested explanation, not only the reference.',
+      '- Start Mermaid with flowchart TD.', '', 'Schema:',
+      '{"pattern":"short answer title","diagrams":{"structure":"flowchart TD string"},"descriptions":{"Node Label":"How: concrete implementation. Why: purpose (function in file.ts)"}}',
+      '', 'CANVAS CONTEXT:', req.canvasContext.slice(0, 5000),
+      '', 'RELEVANT SOURCE:', sourceChunks.join('\n\n').slice(0, 9000), '', 'JSON only.',
+    ].join('\n');
+    const parsed = extractJson(await runCapture(prompt, currentFolder)) as { pattern?: string; diagrams?: { structure?: string }; descriptions?: Record<string, string> } | null;
+    if (!parsed?.diagrams?.structure) return { ok: false, error: 'Could not create an answer flowchart' };
+    return { ok: true, diagram: { pattern: parsed.pattern || 'Selected components', diagrams: { structure: parsed.diagrams.structure }, descriptions: parsed.descriptions ?? {} } };
+  } catch (err: unknown) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
 // ── Impact summary ────────────────────────────────────────────────────────────
 
 interface ImpactSummary {
@@ -991,25 +1813,431 @@ interface ImpactSummary {
   impacted: { name: string; type: string; description: string; reason: string }[];
 }
 
-// ── PTY Claude detection ──────────────────────────────────────────────────────
+// ── Completed response: convert Claude's final text into a diagram ─────────────
+
+interface StreamNode { id: string; label: string; parent?: string; kind: 'step' | 'option' | 'section' | 'detail' }
+
+function safeId(text: string): string {
+  return text.replace(/[^a-zA-Z0-9]/g, '_').replace(/^_+|_+$/g, '').slice(0, 24) || 'node';
+}
+
+function stripAnsi(text: string): string {
+  return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\r/g, '');
+}
+
+// ── Detect what diagram type fits the content ─────────────────────────────────
+
+function detectDiagramType(text: string, preferred: string): string {
+  const t = text.toLowerCase();
+
+  // Explicit sequence signals
+  if (/\b(sends?|receives?|calls?|requests?|responds?|replies?|messages?|notifies?)\b.*\b(to|from|the|with)\b/i.test(text) &&
+      /\b(user|client|server|api|service|browser|app|backend|frontend)\b/i.test(text)) return 'sequenceDiagram';
+
+  // Timeline signals: dates, phases, chronological language
+  if (/\b(phase|week|month|quarter|january|february|march|april|may|june|july|august|q[1-4]|2024|2025|2026)\b/i.test(text) &&
+      /\b(then|after|next|before|during|milestone|release|launch|deadline)\b/i.test(text)) return 'timeline';
+
+  // Mindmap signals: brainstorm, ideas, topics, categories
+  if (/\b(idea|concept|topic|category|aspect|area|dimension|theme|branch)\b/i.test(t) &&
+      text.split('\n').filter(l => /^\s{2,}/.test(l)).length > 2) return 'mindmap';
+
+  // Class diagram signals: classes, methods, inheritance
+  if (/\b(class|interface|extends|implements|inherits|method|property|field|object|instance)\b/i.test(t) &&
+      /\b(has|contains|references|uses|depends)\b/i.test(t)) return 'classDiagram';
+
+  // Git graph signals: branches, commits, merge
+  if (/\b(branch|commit|merge|checkout|main|master|feature|hotfix|release)\b/i.test(t) &&
+      /\b(git|pr|pull request|push)\b/i.test(t)) return 'gitGraph';
+
+  // Gantt signals: schedule, tasks, duration
+  if (/\b(gantt|schedule|sprint|duration|deadline|milestone|task)\b/i.test(t) &&
+      /\b(days?|weeks?|hours?)\b/i.test(t)) return 'gantt';
+
+  // ER diagram signals: tables, foreign keys, database
+  if (/\b(table|foreign key|primary key|relation|entity|database|schema|column|row)\b/i.test(t)) return 'erDiagram';
+
+  // Pie chart signals: percentages, distribution, proportions
+  if (/\b(\d+)%/.test(text) && /\b(distribution|breakdown|split|proportion|share)\b/i.test(t)) return 'pie';
+
+  // Default: if user picked something specific, use that; otherwise flowchart
+  if (preferred && preferred !== 'flowchart') return preferred;
+  return 'flowchart';
+}
+
+// ── Build mermaid for each diagram type from parsed content ───────────────────
+
+function buildFlowchart(lines: string[], title: string): string {
+  const nodes: StreamNode[] = [];
+  let nodeIndex = 0;
+  let lastParent: string | undefined;
+
+  for (const raw of lines) {
+    const line = stripAnsi(raw).trimEnd();
+
+    const stepMatch = line.match(/^\s*(\d+)[.)]\s+(.+)$/);
+    if (stepMatch) {
+      const label = stepMatch[2].replace(/\*\*/g, '').trim().slice(0, 50);
+      if (label.length < 3) continue;
+      const id = `S${nodeIndex}_${safeId(label)}`;
+      const node: StreamNode = { id, label, kind: 'step', parent: lastParent };
+      if (nodes.length > 0 && nodes[nodes.length - 1].kind === 'step') {
+        node.parent = nodes[nodes.length - 1].id;
+      } else {
+        node.parent = undefined;
+      }
+      nodes.push(node);
+      lastParent = id;
+      nodeIndex++;
+      continue;
+    }
+
+    const headerMatch = line.match(/^\s*(?:\*\*(.+?)\*\*|#{1,3}\s+(.+))$/);
+    const headerText = headerMatch?.[1] || headerMatch?.[2];
+    if (headerText && headerText.length < 60) {
+      const label = headerText.trim();
+      const id = `H${nodeIndex}_${safeId(label)}`;
+      const isOption = /^(option|approach|way|method|alternative|solution)\s*[a-z\d]/i.test(label);
+      nodes.push({ id, label, kind: isOption ? 'option' : 'section' });
+      lastParent = id;
+      nodeIndex++;
+      continue;
+    }
+
+    const bulletMatch = line.match(/^\s*[-•*]\s+(.+)$/);
+    if (bulletMatch) {
+      const label = bulletMatch[1].replace(/\*\*/g, '').trim().slice(0, 50);
+      if (label.length < 4 || label.split(' ').length < 2) continue;
+      const id = `B${nodeIndex}_${safeId(label)}`;
+      nodes.push({ id, label, kind: 'detail', parent: lastParent });
+      nodeIndex++;
+      continue;
+    }
+  }
+
+  if (nodes.length < 3) return '';
+
+  const hasOptions = nodes.some(n => n.kind === 'option');
+  const layout = hasOptions ? 'LR' : 'TD';
+  const out = [`flowchart ${layout}`];
+
+  for (const n of nodes) {
+    const lbl = n.label.replace(/"/g, "'");
+    if (n.kind === 'section' || n.kind === 'option') out.push(`  ${n.id}["**${lbl}**"]`);
+    else if (n.kind === 'detail') out.push(`  ${n.id}("${lbl}")`);
+    else out.push(`  ${n.id}["${lbl}"]`);
+  }
+
+  const withParents = nodes.filter(n => n.parent);
+  if (withParents.length > 0) {
+    for (const n of withParents) out.push(`  ${n.parent} --> ${n.id}`);
+    const roots = nodes.filter(n => !n.parent);
+    for (let i = 1; i < roots.length; i++) out.push(`  ${roots[i-1].id} --> ${roots[i].id}`);
+  } else {
+    for (let i = 1; i < nodes.length; i++) out.push(`  ${nodes[i-1].id} --> ${nodes[i].id}`);
+  }
+
+  return out.join('\n');
+}
+
+function buildSequenceDiagram(lines: string[], title: string): string {
+  const actors = new Set<string>();
+  const messages: string[] = [];
+  const ACTOR_RE = /\b(user|client|server|api|service|browser|app|backend|frontend|database|db|system|claude|assistant)\b/gi;
+
+  for (const raw of lines) {
+    const line = stripAnsi(raw).replace(/\*\*/g, '').trim();
+    if (line.length < 5) continue;
+
+    const found = line.match(ACTOR_RE);
+    if (found) found.forEach(a => actors.add(a.charAt(0).toUpperCase() + a.slice(1).toLowerCase()));
+
+    // "X sends Y to Z" or "X calls Y" patterns
+    const sendMatch = line.match(/\b(\w+)\s+(?:sends?|calls?|requests?|asks?)\s+(.+?)\s+(?:to|from)\s+(\w+)/i);
+    if (sendMatch) {
+      const from = sendMatch[1].charAt(0).toUpperCase() + sendMatch[1].slice(1);
+      const msg  = sendMatch[2].slice(0, 40);
+      const to   = sendMatch[3].charAt(0).toUpperCase() + sendMatch[3].slice(1);
+      actors.add(from); actors.add(to);
+      messages.push(`  ${from}->>${to}: ${msg}`);
+    }
+
+    // "X responds/returns Y" patterns
+    const replyMatch = line.match(/\b(\w+)\s+(?:responds?|returns?|replies?|sends back)\s+(.+)/i);
+    if (replyMatch) {
+      const from = replyMatch[1].charAt(0).toUpperCase() + replyMatch[1].slice(1);
+      const msg  = replyMatch[2].slice(0, 40);
+      if (actors.size > 0) {
+        const to = [...actors].find(a => a !== from) || 'Client';
+        messages.push(`  ${from}-->>${to}: ${msg}`);
+      }
+    }
+  }
+
+  // If no messages parsed, build generic sequence from bullet/numbered items
+  if (messages.length === 0) {
+    const steps = lines
+      .map(l => stripAnsi(l).replace(/^\s*[\d.)\-•*]+\s*/, '').replace(/\*\*/g, '').trim())
+      .filter(l => l.length > 4 && l.length < 60)
+      .slice(0, 8);
+    if (steps.length < 2) return '';
+    const actorList = actors.size >= 2 ? [...actors].slice(0, 3) : ['User', 'System'];
+    steps.forEach((step, i) => {
+      const from = actorList[i % 2];
+      const to   = actorList[(i + 1) % 2];
+      messages.push(`  ${from}->>${to}: ${step}`);
+    });
+    actorList.forEach(a => actors.add(a));
+  }
+
+  if (messages.length < 2) return '';
+  const actorDefs = [...actors].slice(0, 4).map(a => `  participant ${a}`).join('\n');
+  return `sequenceDiagram\n${actorDefs}\n${messages.join('\n')}`;
+}
+
+function buildMindmap(lines: string[], title: string): string {
+  const items: { text: string; depth: number }[] = [];
+
+  for (const raw of lines) {
+    const line = stripAnsi(raw).trimEnd();
+    const clean = line.replace(/^\s*[-•*\d.)]+\s*/, '').replace(/\*\*/g, '').trim();
+    if (clean.length < 3 || clean.length > 50) continue;
+    const indent = line.match(/^(\s*)/)?.[1].length ?? 0;
+    const depth = Math.floor(indent / 2);
+    items.push({ text: clean, depth });
+  }
+
+  if (items.length < 3) return '';
+
+  const out = [`mindmap`, `  root((${title.slice(0, 30)}))`];
+  for (const item of items.slice(0, 12)) {
+    const pad = '  '.repeat(item.depth + 2);
+    out.push(`${pad}${item.text}`);
+  }
+  return out.join('\n');
+}
+
+function buildTimeline(lines: string[], title: string): string {
+  const events: { time: string; event: string }[] = [];
+  const TIME_RE = /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|week\s*\d+|phase\s*\d+|q[1-4]|step\s*\d+|\d{4})/i;
+
+  for (const raw of lines) {
+    const line = stripAnsi(raw).replace(/\*\*/g, '').trim();
+    if (line.length < 4) continue;
+    const timeMatch = line.match(TIME_RE);
+    const clean = line.replace(/^\s*[-•*\d.)]+\s*/, '').trim().slice(0, 50);
+    if (timeMatch) {
+      events.push({ time: timeMatch[0], event: clean.replace(timeMatch[0], '').replace(/^[:\s-]+/, '').trim() || clean });
+    } else if (/^\s*[-•*\d.)]+\s+/.test(raw)) {
+      events.push({ time: `Step ${events.length + 1}`, event: clean });
+    }
+  }
+
+  if (events.length < 2) return '';
+  const out = [`timeline`, `  title ${title.slice(0, 50)}`];
+  events.slice(0, 8).forEach(e => out.push(`  ${e.time} : ${e.event}`));
+  return out.join('\n');
+}
+
+function parseResponseDiagram(text: string, preferred: string): { mermaid: string; title: string; type: string } | null {
+  const lines = text.split('\n').map(l => stripAnsi(l).trimEnd());
+
+  // Extract title from first bold line or first substantive line
+  let title = 'Claude';
+  for (const line of lines.slice(0, 8)) {
+    const bold = line.match(/\*\*(.+?)\*\*/);
+    if (bold && bold[1].length < 60) { title = bold[1]; break; }
+    const clean = line.replace(/[#*`]/g, '').trim();
+    if (clean.length > 8 && clean.length < 80 && !/^[-•\d]/.test(clean)) { title = clean.slice(0, 60); break; }
+  }
+
+  const type = detectDiagramType(text, preferred);
+  let mermaid = '';
+
+  if (type === 'sequenceDiagram') mermaid = buildSequenceDiagram(lines, title);
+  else if (type === 'mindmap')      mermaid = buildMindmap(lines, title);
+  else if (type === 'timeline')     mermaid = buildTimeline(lines, title);
+  else                              mermaid = buildFlowchart(lines, title);
+
+  if (!mermaid) return null;
+  return { mermaid, title, type };
+}
+
+let lastResponseBuffer = '';
+
+function tryAutoVisualize(folder: string, win: BrowserWindow) {
+  void folder;
+  if (!lastResponseBuffer.trim() || lastResponseBuffer.trim().split(/\s+/).length < 20) {
+    lastResponseBuffer = '';
+    return;
+  }
+  const text = lastResponseBuffer;
+  lastResponseBuffer = '';
+  const parsed = parseResponseDiagram(text, preferredDiagramType);
+  if (parsed) {
+    const diagramData = { pattern: parsed.title, diagrams: { structure: parsed.mermaid }, descriptions: {} };
+    win.webContents.send('canvas:diagram', diagramData);
+    persistDiagram(diagramData);
+  }
+}
+
+// ── Terminal error detection ──────────────────────────────────────────────────
+
+// Patterns that indicate a build/test failure and capture a location hint
+const ERROR_PATTERNS = [
+  // TypeScript / tsc
+  /([^(\s]+\.tsx?)\((\d+),\d+\):\s+error\s+TS\d+:\s*(.+)/,
+  // ESLint
+  /([^:\s]+\.[jt]sx?)\s*\n?\s*\d+:\d+\s+error\s+(.+)/,
+  // Jest / Vitest: ● Test name
+  /●\s+(.+)/,
+  // Node.js runtime error
+  /at\s+\S+\s+\(([^)]+\.tsx?):(\d+):\d+\)/,
+  // Generic "Error:" line
+  /(?:^|\s)(Error|FAILED|FAIL):\s*(.+)/m,
+  // Cargo / Rust
+  /error\[E\d+\]:\s*(.+)/,
+  // Python
+  /File "([^"]+\.py)", line (\d+)/,
+  // Go
+  /([^:\s]+\.go):(\d+):\d+:\s+(.+)/,
+];
+
+function detectErrors(text: string, nodePaths: Record<string, string>, folder: string): { node: string; error: string }[] {
+  const results: { node: string; error: string }[] = [];
+  const seen = new Set<string>();
+
+  // Build a reverse map: relative path fragment → node name
+  const pathToNode = new Map<string, string>();
+  for (const [name, absPath] of Object.entries(nodePaths)) {
+    const rel = folder ? absPath.replace(folder + '/', '') : absPath;
+    pathToNode.set(rel, name);
+    pathToNode.set(absPath, name);
+    // also index by basename
+    const base = absPath.split('/').pop() ?? '';
+    if (!pathToNode.has(base)) pathToNode.set(base, name);
+  }
+
+  for (const pattern of ERROR_PATTERNS) {
+    const m = pattern.exec(text);
+    if (!m) continue;
+
+    // First capture group is usually the file path or test name
+    const hint = m[1]?.trim() ?? '';
+    const message = (m[3] ?? m[2] ?? m[1] ?? '').trim().slice(0, 120);
+    if (!message) continue;
+
+    // Try to map hint to a known node
+    let node = '';
+    for (const [key, name] of pathToNode.entries()) {
+      if (hint && key.includes(hint.split('/').pop() ?? hint)) {
+        node = name;
+        break;
+      }
+    }
+    if (!node) node = hint.split('/').pop()?.replace(/\.[^.]+$/, '') || 'Unknown';
+
+    const key = `${node}:${message.slice(0, 40)}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      results.push({ node, error: message });
+    }
+  }
+
+  return results.slice(0, 6);
+}
 
 let summaryPending = false;
+let claudeContextInjected = false;
+let claudeStartDebounce: ReturnType<typeof setTimeout> | null = null;
+let errorDebounce: ReturnType<typeof setTimeout> | null = null;
 
 function setupPtyClaudeDetection() {
   let buffer = '';
+  let claudeResponseBuffer = '';
+  let inClaudeSession = false; // true once Claude Code is running, stays true until shell $ returns
 
   setPtyDataCallback((data: string) => {
+    recordPtyOutput(data);
     buffer += data;
     if (buffer.length > 8000) buffer = buffer.slice(-4000);
 
+    const cleanData = data
+      .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+      .replace(/\x1b\][^\x07]*\x07/g, '')
+      .replace(/\r/g, '');
+
+    // Detect Claude Code startup
+    if (!inClaudeSession && /Welcome to Claude|claude-sonnet|claude-opus|claude-haiku|claude-fable/i.test(cleanData)) {
+      inClaudeSession = true;
+      claudeResponseBuffer = '';
+      if (!claudeContextInjected) {
+        claudeContextInjected = true;
+        if (claudeStartDebounce) clearTimeout(claudeStartDebounce);
+        claudeStartDebounce = setTimeout(() => {
+          const mermaid = (currentDiagram as { diagrams?: { structure?: string } } | null)?.diagrams?.structure;
+          if (mermaid && currentFolder) {
+            const folderName = path.basename(currentFolder);
+            const ctx = `\r\n\x1b[2m[Canvas: ${folderName}]\x1b[0m\r\n\x1b[2m\`\`\`mermaid\r\n${mermaid}\r\n\`\`\`\x1b[0m\r\n`;
+            writeToPty(ctx);
+          }
+        }, 1500);
+      }
+    }
+
+    // New user turn: Claude prints "> " or "? " as the input prompt between turns
+    // Reset the response buffer so we only show the current answer
+    if (inClaudeSession && /^\s*[>?]\s/.test(cleanData.trim())) {
+      claudeResponseBuffer = '';
+    }
+
+    // Accumulate Claude's response — skip tool call / UI chrome lines
+    if (inClaudeSession) {
+      const lines = cleanData.split('\n');
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t) continue;
+        // Skip Claude Code UI chrome: spinner frames, tool blocks, box-drawing chars
+        if (/^[⏺✓✗⟳◆│╭╰·]/.test(t)) continue;
+        if (/^(Tool:|<tool_use|"type"\s*:|"tool_use"|Bash|Read|Write|Edit)\b/.test(t)) continue;
+        if (/^\s*[┌┐└┘├┤┬┴┼─│]/.test(line)) continue;
+        claudeResponseBuffer += line + '\n';
+      }
+      if (claudeResponseBuffer.length > 6000) claudeResponseBuffer = claudeResponseBuffer.slice(-4000);
+    }
+
+    // ── Error detection ──
+    const looksLikeError = /\b(error|FAILED|FAIL|TypeError|SyntaxError)\b/i.test(data);
+    if (looksLikeError && currentFolder) {
+      if (errorDebounce) clearTimeout(errorDebounce);
+      errorDebounce = setTimeout(() => {
+        const errors = detectErrors(buffer.slice(-4000), currentNodePaths, currentFolder!);
+        if (errors.length > 0 && mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('canvas:errorAnnotations', errors);
+        }
+      }, 600);
+    }
+
+    // Claude exits back to shell
+    if (inClaudeSession && /\$\s*$/.test(buffer.slice(-20))) {
+      inClaudeSession = false;
+      claudeContextInjected = false;
+    }
+
+    // Claude finished a response turn
     const done = /\b(?:Worked|Baked|Cooked|Cogitated|Processed|Computed|Thought|Reasoned|Analysed|Analyzed|Simulated|Crafted|Pondered|Simmered|Calculated|Deliberated|Churned|Digested|Mulled|Ruminated)\s+for\s+\d/i.test(buffer);
     if (done && mainWindow && !summaryPending) {
       summaryPending = true;
+
+      lastResponseBuffer = claudeResponseBuffer;
+      claudeResponseBuffer = '';
       buffer = '';
+
       const ptyCwd = getPtyCwd();
       const rawFolder = ptyCwd || currentFolder || os.homedir();
       const folder = findProjectRoot(rawFolder);
       const win = mainWindow;
+
       if (folder !== currentFolder && fs.existsSync(folder)) {
         currentFolder = folder;
         saveLastProject(folder);
@@ -1020,6 +2248,9 @@ function setupPtyClaudeDetection() {
           runIncrementalPatch(changedFiles);
         });
       }
+
+      tryAutoVisualize(folder, win);
+
       setTimeout(() => {
         runPostClaudeUpdate(folder, win).finally(() => { summaryPending = false; });
       }, 2000);
@@ -1040,3 +2271,30 @@ async function runPostClaudeUpdate(folder: string, win: BrowserWindow) {
   const changedFiles = changedPaths.map(p => path.relative(folder, p)).join(', ');
   await runIncrementalPatch(changedFiles || 'recent changes');
 }
+
+// ── PR Review ─────────────────────────────────────────────────────────────────
+
+ipcMain.handle('pr:list', () => {
+  if (!currentFolder) return { ok: false, error: 'no folder', prs: [] };
+  const ghPrs = listPRs(currentFolder);
+  const branches = listLocalBranches(currentFolder);
+  return { ok: true, prs: [...ghPrs, ...branches] };
+});
+
+ipcMain.handle('pr:review', async (_e, pr: PRInfo) => {
+  if (!currentFolder) return { ok: false, error: 'no folder open' };
+  if (!mainWindow) return { ok: false, error: 'no window' };
+
+  mainWindow.webContents.send('analysis:status', 'running');
+  mainWindow.webContents.send('analysis:statusDetail', `Reviewing PR: ${pr.title}…`);
+
+  try {
+    const nodeNames = extractNodeNames(currentDiagram);
+    const result = await reviewPR(currentFolder, pr, nodeNames);
+    mainWindow.webContents.send('analysis:status', result.ok ? 'done' : 'error');
+    return result;
+  } catch (err) {
+    mainWindow.webContents.send('analysis:status', 'error');
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
