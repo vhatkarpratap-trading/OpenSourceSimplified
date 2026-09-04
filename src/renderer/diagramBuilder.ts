@@ -12,8 +12,8 @@ export type DiagramKind = 'structure' | 'sequence' | 'gitDiff';
 export interface DiagramData {
   pattern: string;
   diagrams: {
-    structure?: string;  // Mermaid: flowchart TD — component structure overview
-    sequence?: string;   // Mermaid: flowchart LR — call/data flow of a change
+    structure?: string;  // Mermaid: flowchart TD — feature-centric system architecture
+    sequence?: string;   // Mermaid: flowchart TD — major end-to-end feature flows
     gitDiff?: string;    // Mermaid: flowchart — changed files + +/- lines
   };
   descriptions?: Record<string, string>;  // NodeLabel → 1-sentence description

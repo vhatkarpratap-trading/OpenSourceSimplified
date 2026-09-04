@@ -313,6 +313,8 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
       // Expand height if we have a description for this node
       const label = containerLabel.get(el.id);
       const desc = label ? (descNorm[label.toLowerCase()] ?? null) : null;
+      const isRequestContract = /^REQ\s*(?:—|-|:)/i.test(label || '');
+      const isResponseContract = /^RES\s*(?:—|-|:)/i.test(label || '');
       const box = el as ExcalidrawElement & { x: number; y: number; width: number; height: number };
       const wrappedDesc = desc ? wrapDescription(desc, box.width - 16) : '';
       const extraH = wrappedDesc ? Math.max(30, wrappedDesc.split('\n').length * 13 + 12) : 0;
@@ -364,12 +366,12 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
         ...el,
         height: (el as { height: number }).height + extraH,
         groupIds: mergedGroupIds,
-        backgroundColor: isChanged ? '#fef3c7' : NODE_BG,
-        strokeColor:     isChanged ? '#d97706' : NODE_STROKE,
-        strokeWidth:     isChanged ? 2.5 : 2,
+        backgroundColor: isChanged ? '#fef3c7' : isRequestContract ? '#e0f2fe' : isResponseContract ? '#f3e8ff' : NODE_BG,
+        strokeColor:     isChanged ? '#d97706' : isRequestContract ? '#0284c7' : isResponseContract ? '#9333ea' : NODE_STROKE,
+        strokeWidth:     isChanged ? 2.5 : (isRequestContract || isResponseContract) ? 2.5 : 2,
         fillStyle: 'solid',
         roughness: ROUGHNESS,
-        customData: { ...el.customData, nodeType: 'component', changed: isChanged },
+        customData: { ...el.customData, nodeType: 'component', changed: isChanged, contractType: isRequestContract ? 'request' : isResponseContract ? 'response' : undefined },
       } as ExcalidrawElement;
     }
     if (el.type === 'text') {

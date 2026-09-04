@@ -63,8 +63,8 @@ function extractNodeNamesFromDiagram(diagram: DiagramData | null): string[] {
 type AnalysisStatus = 'idle' | 'running' | 'patching' | 'done' | 'error';
 
 const DIAGRAM_TABS: { kind: DiagramKind; label: string }[] = [
-  { kind: 'structure', label: 'Structure' },
-  { kind: 'sequence',  label: 'Sequence' },
+  { kind: 'structure', label: 'System Map' },
+  { kind: 'sequence',  label: 'Feature Flows' },
   { kind: 'gitDiff',   label: 'Git Diff' },
 ];
 
@@ -749,22 +749,6 @@ export default function App() {
         </button>
 
         <button
-          onClick={handleRepositoryImplementation}
-          disabled={!folder || busy}
-          title="Map the implementation of the whole repository"
-          style={{
-            display: 'flex', alignItems: 'center', gap: 6, padding: '5px 14px',
-            background: '#3b2a14', border: '1px solid #d97706', borderRadius: 6,
-            color: '#fcd34d', fontSize: 12, fontFamily: 'system-ui, -apple-system, sans-serif',
-            cursor: (!folder || busy) ? 'not-allowed' : 'pointer', opacity: (!folder || busy) ? 0.45 : 1, flexShrink: 0,
-            // @ts-ignore
-            WebkitAppRegion: 'no-drag',
-          }}
-        >
-          <FlowIcon /> {codeFlowLoading ? 'Mapping…' : 'Repo Implementation'}
-        </button>
-
-        <button
           onClick={handleClearProjectCache}
           disabled={!folder || busy}
           title="Clear this project's saved analysis, drilldowns, stories, and implementation maps"
@@ -798,7 +782,7 @@ export default function App() {
         </button>
 
         {/* Analyse */}
-        <button onClick={handleAnalyse} disabled={!folder || busy} style={{
+        <button onClick={handleAnalyse} disabled={!folder || busy} title="Analyse this project and create its functional map" style={{
           display: 'flex', alignItems: 'center', gap: 6,
           padding: '5px 14px', background: '#5b21b6',
           border: '1px solid #7c3aed', borderRadius: 6,

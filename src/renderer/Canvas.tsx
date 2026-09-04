@@ -926,9 +926,20 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
 
       // The drill flow is the feature boundary. Build both companion views from
       // it so Story and Implementation describe the same complete feature.
+      const autoFlowDepth = flowStackRef.current.length;
       void (async () => {
         await renderCodeFlowRef?.current?.(name, 'story', res.mermaid);
         await renderCodeFlowRef?.current?.(name, 'implementation', res.mermaid);
+        // Focus the two companion panels—not the whole base map plus drill—so
+        // both are legible together immediately after a drill.
+        const companionPanels = (api.getSceneElements() as unknown as ExcalidrawElement[]).filter(e =>
+          e.id.startsWith(`flow-d${autoFlowDepth}-`) ||
+          e.id.startsWith(`flow-d${autoFlowDepth + 1}-`) ||
+          e.id === `flow-label-d${autoFlowDepth}` ||
+          e.id === `flow-label-d${autoFlowDepth + 1}`
+        );
+        if (companionPanels.length > 0)
+          api.scrollToContent(companionPanels as unknown as EXEl[], { fitToContent: true, animate: true });
       })();
 
     } catch {
