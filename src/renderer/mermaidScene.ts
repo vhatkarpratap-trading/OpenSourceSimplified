@@ -332,7 +332,9 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
           height: extraH - 8,
           text: wrappedDesc,
           originalText: wrappedDesc,
-          fontSize: 11,
+          // Descriptions are the teaching layer of an implementation map, not
+          // tiny provenance notes. Keep them readable at normal canvas zoom.
+          fontSize: 13,
           fontFamily: FONT,
           textAlign: 'center',
           verticalAlign: 'top',
@@ -343,7 +345,7 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
           strokeStyle: 'solid',
           angle: 0,
           roughness: 0,
-          opacity: 85,
+          opacity: 100,
           roundness: null,
           groupIds: mergedGroupIds,
           frameId: null,

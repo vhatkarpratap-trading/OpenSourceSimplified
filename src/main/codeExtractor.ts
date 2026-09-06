@@ -17,6 +17,13 @@ export interface ExtractedStructure {
   totalFiles: number;
   languages: string[];
   nodePaths: Record<string, string>; // node name → absolute file path
+  relationships: CodeRelationship[]; // static dependency graph, backed by source imports
+}
+
+export interface CodeRelationship {
+  from: string;
+  to: string;
+  kind: 'local-import' | 'external-import';
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -31,6 +38,13 @@ const IGNORE_DIRS = new Set([
 const SOURCE_EXTS = new Set([
   '.ts', '.tsx', '.js', '.jsx', '.mts', '.cts',
   '.dart', '.swift', '.kt', '.java', '.py', '.go', '.rs', '.xml',
+  // Common native, JVM/.NET, scripting, functional, web, and configuration
+  // formats. Unknown formats still receive the generic import parser below.
+  '.c', '.h', '.cc', '.cpp', '.cxx', '.hpp', '.cs', '.fs', '.fsx', '.vb',
+  '.php', '.rb', '.rake', '.scala', '.sc', '.clj', '.cljs', '.groovy', '.gradle',
+  '.hs', '.lua', '.r', '.pl', '.pm', '.ex', '.exs', '.erl', '.hrl', '.zig', '.sol',
+  '.vue', '.svelte', '.astro', '.html', '.htm', '.css', '.scss', '.less',
+  '.sql', '.sh', '.bash', '.zsh', '.ps1', '.yaml', '.yml', '.json', '.toml',
 ]);
 
 const MAX_FILES   = 80;
@@ -92,7 +106,38 @@ export function extractStructure(projectPath: string): ExtractedStructure {
 
   walkDir(projectPath, root, 0);
 
-  return { root, totalFiles, languages: Array.from(languages), nodePaths };
+  // Build a relationship graph after parsing. This is deliberately evidence-led:
+  // an edge exists only when a source file imports another module/package.
+  const fileNodes: CodeNode[] = [];
+  const collectFiles = (node: CodeNode) => {
+    if (node.type === 'file') fileNodes.push(node);
+    node.children.forEach(collectFiles);
+  };
+  collectFiles(root);
+  const byStem = new Map<string, CodeNode[]>();
+  for (const file of fileNodes) {
+    const stem = path.basename(file.path, path.extname(file.path)).toLowerCase();
+    byStem.set(stem, [...(byStem.get(stem) ?? []), file]);
+  }
+  const seen = new Set<string>();
+  const relationships: CodeRelationship[] = [];
+  for (const file of fileNodes) {
+    const from = path.relative(projectPath, file.path);
+    for (const imported of file.imports) {
+      const matches = byStem.get(imported.toLowerCase()) ?? [];
+      const targets = matches.length ? matches.slice(0, 2).map(m => path.relative(projectPath, m.path)) : [imported];
+      for (const to of targets) {
+        const kind: CodeRelationship['kind'] = matches.length ? 'local-import' : 'external-import';
+        const key = `${from}|${kind}|${to}`;
+        if (!seen.has(key) && relationships.length < 240) {
+          seen.add(key);
+          relationships.push({ from, to, kind });
+        }
+      }
+    }
+  }
+
+  return { root, totalFiles, languages: Array.from(languages), nodePaths, relationships };
 }
 
 // ── File parser ───────────────────────────────────────────────────────────────
@@ -323,5 +368,10 @@ export function toClaudePromptJSON(structure: ExtractedStructure): string {
     return out;
   }
 
-  return JSON.stringify(compact(structure.root), null, 1);
+  return JSON.stringify({
+    project: compact(structure.root),
+    // This graph helps follow relationships across folders even when filenames
+    // alone are ambiguous. It is static evidence, not a claim of runtime calls.
+    relationships: structure.relationships.slice(0, 180),
+  }, null, 1);
 }

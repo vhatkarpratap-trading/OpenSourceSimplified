@@ -32,10 +32,12 @@
   "dependencies": {
     "@excalidraw/excalidraw": "^0.17.0",
     "@excalidraw/mermaid-to-excalidraw": "^2.2.2",
+    "@monaco-editor/react": "^4.7.0",
     "@typescript-eslint/typescript-estree": "^8.63.0",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/xterm": "^5.3.0",
     "glob": "^13.0.6",
+    "monaco-editor": "^0.56.0",
     "node-pty": "^1.0.0",
     "react": "^18.0.0",
     "react-dom": "^18.0.0"

@@ -14,6 +14,7 @@ interface CanvasProps {
   onRenderError?: (message: string | null) => void;
   onDrilldownChange?: (active: boolean) => void;
   onCodeFlowChange?: (active: boolean) => void;
+  onImplementationExplanations?: (descriptions: Record<string, string> | null) => void;
   onSelectionChange?: (names: string[]) => void;
   clearDrilldownRef?: React.MutableRefObject<(() => void) | null>;
   clearCodeFlowRef?: React.MutableRefObject<(() => void) | null>;
@@ -129,7 +130,7 @@ function applyZoomAndGit(
   });
 }
 
-export default function Canvas({ diagramData, activeKind = 'structure', onAPIReady, onRenderError, onDrilldownChange, onCodeFlowChange, onSelectionChange, clearDrilldownRef, clearCodeFlowRef, clearAllCodeFlowsRef, renderDrilldownRef, renderCodeFlowRef, canvasContextRef, rawElementsRef, renderCommitDiffRef, clearCommitDiffRef, addNoteRef, selectionAnswerRef, errorAnnotations }: CanvasProps) {
+export default function Canvas({ diagramData, activeKind = 'structure', onAPIReady, onRenderError, onDrilldownChange, onCodeFlowChange, onImplementationExplanations, onSelectionChange, clearDrilldownRef, clearCodeFlowRef, clearAllCodeFlowsRef, renderDrilldownRef, renderCodeFlowRef, canvasContextRef, rawElementsRef, renderCommitDiffRef, clearCommitDiffRef, addNoteRef, selectionAnswerRef, errorAnnotations }: CanvasProps) {
   const [apiReady, setApiReady] = useState(false);
   const apiRef          = useRef<ExcalidrawImperativeAPI | null>(null);
   const lastDataRef     = useRef<DiagramData | null>(null);
@@ -924,23 +925,10 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
           api.scrollToContent(newPanelEls as unknown as EXEl[], { fitToContent: false, animate: true });
       }, 150);
 
-      // The drill flow is the feature boundary. Build both companion views from
-      // it so Story and Implementation describe the same complete feature.
-      const autoFlowDepth = flowStackRef.current.length;
-      void (async () => {
-        await renderCodeFlowRef?.current?.(name, 'story', res.mermaid);
-        await renderCodeFlowRef?.current?.(name, 'implementation', res.mermaid);
-        // Focus the two companion panels—not the whole base map plus drill—so
-        // both are legible together immediately after a drill.
-        const companionPanels = (api.getSceneElements() as unknown as ExcalidrawElement[]).filter(e =>
-          e.id.startsWith(`flow-d${autoFlowDepth}-`) ||
-          e.id.startsWith(`flow-d${autoFlowDepth + 1}-`) ||
-          e.id === `flow-label-d${autoFlowDepth}` ||
-          e.id === `flow-label-d${autoFlowDepth + 1}`
-        );
-        if (companionPanels.length > 0)
-          api.scrollToContent(companionPanels as unknown as EXEl[], { fitToContent: true, animate: true });
-      })();
+      // A drill is the first, user-facing learning level. Do not automatically
+      // add Code Story and Implementation: three side-by-side maps are hard to
+      // read and make an implementation look like a duplicate user journey.
+      // The user can reveal either deeper level explicitly from the toolbar.
 
     } catch {
       // Remove loading indicator on failure, restore clean state
@@ -950,7 +938,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     } finally {
       drillBusyRef.current = false;
     }
-  }, [onDrilldownChange, renderCodeFlowRef]);
+  }, [onDrilldownChange]);
 
   useEffect(() => {
     if (renderDrilldownRef) renderDrilldownRef.current = renderDrilldown;
@@ -1012,6 +1000,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
         : await window.electronAPI.getComponentCodeFlow(name, drillMermaid);
       console.log('[codeflow] ok:', res?.ok, 'error:', res?.error);
       if (!res?.ok || !res.mermaid) throw new Error(res?.error || 'no mermaid');
+      onImplementationExplanations?.(mode === 'implementation' ? (res.descriptions ?? {}) : null);
 
       const { buildMermaidScene: bms } = await import('./mermaidScene');
       const flowScene = await bms(res.mermaid, res.descriptions);
@@ -1020,9 +1009,14 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       const freshRects = freshEls.filter(e =>
         e.type === 'rectangle' && !e.id.startsWith('flow-loading')
       ) as (ExcalidrawElement & { x: number; y: number; width: number; height: number })[];
-      const panelOffsetX = freshRects.reduce((m, e) => Math.max(m, e.x + e.width), 0) + 100;
+      // Code Story is a companion panel. Implementation is a focused learning
+      // view: replacing the user-flow scene makes contracts readable instead
+      // of shrinking them beside a second diagram.
+      const panelOffsetX = mode === 'implementation'
+        ? 80
+        : freshRects.reduce((m, e) => Math.max(m, e.x + e.width), 0) + 100;
       const panelOffsetY = freshRects.reduce((m, e) => Math.min(m, e.y), Infinity);
-      const panelY = isFinite(panelOffsetY) ? panelOffsetY : 0;
+      const panelY = mode === 'implementation' ? 60 : (isFinite(panelOffsetY) ? panelOffsetY : 0);
 
       const depth = flowStackRef.current.length;
       seed = 7000000 + depth * 100000;
@@ -1192,7 +1186,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
         startBinding: null, endBinding: null, roundness: { type: 2 }, elbowed: false,
       }] : [];
 
-      const title = mode === 'implementation' ? 'Implementation' : 'Code Story';
+      const title = mode === 'implementation' ? 'How this is built' : 'Code Story';
       const labelText = happyPath.length > 0
         ? `⟳ ${title}: ${name}  ·  🔴 = main path (read in order)`
         : `⟳ ${title}: ${name}`;
@@ -1211,7 +1205,9 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
 
       const withoutLoading = (api.getSceneElements() as unknown as ExcalidrawElement[])
         .filter(e => !e.id.startsWith('flow-loading'));
-      const finalEls = [...withoutLoading, ...connEls, ...labelEls, ...flowElsMutable, ...happyOverlayEls];
+      const finalEls = mode === 'implementation'
+        ? [...labelEls, ...flowElsMutable, ...happyOverlayEls]
+        : [...withoutLoading, ...connEls, ...labelEls, ...flowElsMutable, ...happyOverlayEls];
 
       flowStackRef.current.push(withoutLoading as ExcalidrawElement[]);
 
@@ -1233,7 +1229,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
           e.id.startsWith(`flow-d${depth}`) || e.id === `flow-conn-d${depth}` || e.id === `flow-label-d${depth}`
         );
         if (newEls.length > 0)
-          api.scrollToContent(newEls as unknown as EXEl[], { fitToContent: false, animate: true });
+          api.scrollToContent(newEls as unknown as EXEl[], { fitToContent: mode === 'implementation', animate: true });
       }, 150);
 
     } catch (err) {

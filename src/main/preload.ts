@@ -22,6 +22,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('ai:getProvider'),
   setAiProvider: (provider: string): Promise<{ provider: string; providers: { id: string; label: string }[] }> =>
     ipcRenderer.invoke('ai:setProvider', provider),
+  getAnalysisDepth: (): Promise<1 | 2 | 3> => ipcRenderer.invoke('analysis:getDepth'),
+  setAnalysisDepth: (depth: 1 | 2 | 3): Promise<1 | 2 | 3> =>
+    ipcRenderer.invoke('analysis:setDepth', depth),
+  getRelationships: (): Promise<{ ok: boolean; mermaid?: string; error?: string }> =>
+    ipcRenderer.invoke('project:relationships'),
+  getProjectFiles: (): Promise<{ ok: boolean; tree: unknown[]; error?: string }> =>
+    ipcRenderer.invoke('project:files'),
+  getProjectFileSource: (path: string): Promise<{ ok: boolean; path?: string; content?: string; error?: string }> =>
+    ipcRenderer.invoke('project:fileSource', path),
 
   // Analysis
   runAnalysis: (): Promise<{ ok?: boolean; error?: string }> =>
@@ -30,6 +39,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Click-to-inspect: fetch kid-friendly detail for one component
   getComponentDetail: (name: string): Promise<{ ok?: boolean; error?: string; detail?: unknown }> =>
     ipcRenderer.invoke('component:detail', name),
+  getComponentSource: (name: string): Promise<{ ok: boolean; path?: string; content?: string; highlight?: string; error?: string }> =>
+    ipcRenderer.invoke('component:source', name),
+  getComponentHierarchy: (name: string): Promise<{ ok: boolean; path?: string; mermaid?: string; error?: string }> =>
+    ipcRenderer.invoke('component:hierarchy', name),
 
   // Double-click drilldown: fetch a detailed sub-diagram for one component
   getComponentDrilldown: (name: string): Promise<{ ok?: boolean; error?: string; mermaid?: string }> =>

@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as crypto from 'crypto';
 import { execSync } from 'child_process';
-import { createPty, writeToPty, resizePty, killPty, restartPty, runCapture, setPtyDataCallback, getPtyCwd, getAiProvider, setAiProvider, AI_PROVIDERS, AiProvider } from './ptyManager';
+import { createPty, writeToPty, resizePty, killPty, restartPty, runCapture as runProviderCapture, setPtyDataCallback, getPtyCwd, getAiProvider, setAiProvider, AI_PROVIDERS, AiProvider } from './ptyManager';
 import { startFileWatcher, stopFileWatcher } from './fileWatcher';
 import { extractStructure, toClaudePromptJSON, ExtractedStructure } from './codeExtractor';
 import { startMcpServer, stopMcpServer, recordPtyOutput, updateClaudeJsonMcpConfig } from './mcpServer';
@@ -16,6 +16,19 @@ let currentDiagram: object | null = null;
 let currentNodePaths: Record<string, string> = {};
 let patchInProgress = false;
 let preferredDiagramType = 'flowchart'; // updated by renderer type picker
+let analysisDepth: 1 | 2 | 3 = 2; // overview, balanced, deep — set by the user
+
+function analysisDepthGuidance(): string {
+  if (analysisDepth === 1) return 'DEPTH: Overview. Show only the 4–6 essential steps, the main success path, and at most one important choice. Prefer a short explanation over completeness.';
+  if (analysisDepth === 3) return 'DEPTH: Deep. Show the complete meaningful path, important alternatives/errors, and every proven component or boundary handoff. Explain unfamiliar terms and why each step exists.';
+  return 'DEPTH: Balanced. Show 6–10 important steps, the main path, and only the choices or communications needed to understand how it works.';
+}
+
+// All main-process AI actions inherit the user's selected detail level,
+// including focused questions and change/commit explanations.
+function runCapture(prompt: string, cwd: string): Promise<string> {
+  return runProviderCapture(`${prompt}\n\n${analysisDepthGuidance()}`, cwd);
+}
 
 function aiProviderSettingsFile() { return path.join(app.getPath('userData'), 'ai-provider.json'); }
 
@@ -179,6 +192,8 @@ function findProjectRoot(startDir: string): string {
     'package.json', 'build.gradle', 'build.gradle.kts', 'settings.gradle',
     'settings.gradle.kts', 'Cargo.toml', 'go.mod', 'pubspec.yaml',
     'pyproject.toml', 'setup.py', 'Podfile', 'Package.swift', 'pom.xml',
+    'composer.json', 'Gemfile', 'requirements.txt', 'Pipfile', 'mix.exs',
+    'CMakeLists.txt', 'Makefile', 'build.sbt',
   ];
   let dir = startDir;
   for (let i = 0; i < 8; i++) {
@@ -192,9 +207,37 @@ function findProjectRoot(startDir: string): string {
   return startDir;
 }
 
+function buildRelationshipGraphMermaid(structure: ExtractedStructure): string {
+  // Keep the graph legible on a canvas. Local project links answer "what uses
+  // what?" first; package dependencies fill only the remaining space.
+  const maxEdges = analysisDepth === 1 ? 15 : analysisDepth === 2 ? 30 : 60;
+  const edges = [...structure.relationships]
+    .sort((a, b) => Number(a.kind !== 'local-import') - Number(b.kind !== 'local-import'))
+    .slice(0, maxEdges);
+  const ids = new Map<string, string>();
+  let next = 1;
+  const idFor = (name: string) => {
+    let id = ids.get(name);
+    if (!id) { id = `N${next++}`; ids.set(name, id); }
+    return id;
+  };
+  // Mermaid labels must remain conservative; paths are displayed as readable
+  // words rather than raw punctuation-heavy module specifiers.
+  const label = (value: string) => value.replace(/[^A-Za-z0-9 _-]/g, ' ').replace(/[_-]/g, ' ').replace(/\s+/g, ' ').trim().slice(-44);
+  const lines = ['flowchart LR'];
+  for (const edge of edges) {
+    const from = idFor(edge.from);
+    const to = idFor(edge.to);
+    lines.push(`  ${from}[${label(edge.from)}] -->|${edge.kind === 'local-import' ? 'imports' : 'uses'}| ${to}[${label(edge.to)}]`);
+  }
+  return lines.join('\n');
+}
+
 // ── Claude prompt ─────────────────────────────────────────────────────────────
 
-const ANALYSIS_SCHEMA_VERSION = 'feature-architecture-v3';
+// Analysis starts with the product experience. Technical detail is deliberately
+// deferred to Code Story and Implementation, which are progressive disclosures.
+const ANALYSIS_SCHEMA_VERSION = 'user-flow-v1';
 
 /** File and symbol names are insufficient to infer product behaviour. */
 function buildAnalysisSourceContext(structure: ExtractedStructure): string {
@@ -220,42 +263,44 @@ function buildAnalysisSourceContext(structure: ExtractedStructure): string {
 
 function buildClaudePrompt(structureJson: string, sourceContext: string): string {
   const schema = `{
-  "pattern": "architecture pattern evidenced by the repository",
+  "pattern": "short product or user-journey name evidenced by the repository",
   "diagrams": {
-    "structure": "flowchart TD — feature-centric system architecture",
-    "sequence": "flowchart TD — major end-to-end feature flows",
+    "structure": "flowchart TD — primary user-facing journey",
+    "sequence": "flowchart TD — other important user-facing journeys",
     "gitDiff": ""
   },
-  "descriptions": { "NodeLabel": "concise responsibility" }
+  "descriptions": { "NodeLabel": "what the person sees, does, or gets at this step" }
 }`;
 
   return [
-    'Analyze this repository for an engineer new to the codebase. The repository evidence below is the source of truth.',
+    'Create a quick product walkthrough for someone who has never seen this repository. The repository evidence below is the source of truth.',
     'Output ONLY the JSON below — no fences or prose.',
+    analysisDepthGuidance(),
     '',
     'EVIDENCE RULES:',
-    '- Infer features, architecture, persistence, and integrations only from supplied evidence.',
-    '- Never invent authentication, databases, APIs, analytics, queues, or services. Omit unsupported categories.',
-    '- Aggregate code into meaningful modules. Do not draw every file, class, method, DTO, or utility.',
+    '- Infer only user-visible features and outcomes supported by the supplied evidence.',
+    '- The relationship graph records source-proven imports. Use it to connect related features correctly, but do not show it or technical module names in the user-facing flow.',
+    '- If a feature is unclear from the evidence, omit it. Never invent screens, accounts, payments, storage, integrations, or error states.',
+    '- This is the FIRST learning level. Do not explain code, architecture, files, classes, functions, APIs, databases, state, requests, or technical layers.',
     '',
-    'SYSTEM MAP RULES for diagrams.structure:',
-    '- Create one readable high-level map, normally 12 to 24 nodes.',
-    '- Use subgraphs for applicable layers: UI Screens, Feature Presentation, Business Services, Shared Components, Data Infrastructure, External Systems. Keep the User node outside subgraphs.',
-    '- Show user to UI to feature logic to services/data/external systems.',
-    '- Show shared components once and connect all features that use them.',
-    '- Use short engineer-friendly labels. Use storage shapes only when persistence is evidenced.',
+    'PRIMARY USER FLOW RULES for diagrams.structure:',
+    '- Draw the most important complete journey a person takes through the product, usually 6 to 12 connected steps.',
+    '- Start with what the person opens, chooses, enters, or asks for. End with what they see, receive, save, or accomplish.',
+    '- Include only meaningful choices, waiting states, empty states, or errors that a person can notice.',
+    "- Labels must be everyday language from the person's point of view. Good: \"Choose a project\", \"See the project map\", \"Read a feature walkthrough\". Bad: \"invoke analysis handler\", \"parse repository\", \"call API\".",
+    '- Use "Person" or "User" only as the starting point when it makes the journey clearer.',
     '',
-    'FEATURE FLOW RULES for diagrams.sequence:',
-    '- Show 2 to 4 important real flows in one readable flowchart TD, with subgraphs per flow when useful.',
-    '- Each flow should show entry UI or trigger to presentation/state to application logic to service/data/integration.',
-    '- Reuse shared infrastructure nodes rather than duplicate them.',
+    'OTHER USER FLOWS RULES for diagrams.sequence:',
+    '- Show 1 to 3 other important journeys, or alternate/error outcomes of the primary journey, in one readable flowchart TD.',
+    '- Use the same person-first language. Do not expose implementation details as intermediate steps.',
+    '- Every node must describe something the person sees, does, decides, or experiences.',
     '',
     'MERMAID RULES:',
     '- Start both diagrams with flowchart TD.',
     '- Use node IDs containing letters, digits, and underscores only.',
     '- Use subgraph GroupId[Short Group Label] and end for grouping. Group IDs must differ from every node ID.',
     '- Keep node labels short. Avoid quotes, parentheses, slashes, colons, semicolons, and pipes in labels.',
-    '- Use edge labels only when they clarify an action, data transfer, or decision.',
+    '- Use edge labels only for a person action or a visible outcome, such as "chooses a folder", "analysis finishes", or "nothing found".',
     '',
     'Schema:', schema, '',
     'Each diagram is raw Mermaid with newlines, not fenced.',
@@ -724,6 +769,54 @@ ipcMain.on('pty:resize', (_e, cols: number, rows: number) => resizePty(cols, row
 
 ipcMain.handle('ai:getProvider', () => ({ provider: getAiProvider(), providers: AI_PROVIDERS }));
 ipcMain.handle('ai:setProvider', (_e, provider: string) => ({ provider: saveAiProvider(provider), providers: AI_PROVIDERS }));
+ipcMain.handle('analysis:getDepth', () => analysisDepth);
+ipcMain.handle('analysis:setDepth', (_e, depth: number) => {
+  analysisDepth = depth === 1 || depth === 3 ? depth : 2;
+  return analysisDepth;
+});
+ipcMain.handle('project:relationships', () => {
+  if (!currentFolder) return { ok: false, error: 'No project is open' };
+  const structure = extractStructure(currentFolder);
+  return { ok: true, relationships: structure.relationships, mermaid: buildRelationshipGraphMermaid(structure) };
+});
+interface ExplorerNode { name: string; path: string; type: 'file' | 'folder'; children?: ExplorerNode[] }
+
+function buildExplorerTree(folder: string): ExplorerNode[] {
+  let seen = 0;
+  const walk = (dir: string, depth: number): ExplorerNode[] => {
+    if (depth > 12 || seen > 3000) return [];
+    let entries: fs.Dirent[] = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+    return entries
+      .filter(entry => entry.name !== '.git' && entry.name !== 'dist')
+      .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name))
+      .map(entry => {
+        seen++;
+        const absolute = path.join(dir, entry.name);
+        const relative = path.relative(folder, absolute);
+        // Keep enormous dependency folders visible without recursively reading them.
+        const children = entry.isDirectory() && entry.name !== 'node_modules' ? walk(absolute, depth + 1) : [];
+        return { name: entry.name, path: relative, type: entry.isDirectory() ? 'folder' : 'file', ...(entry.isDirectory() ? { children } : {}) };
+      });
+  };
+  return walk(folder, 0);
+}
+
+ipcMain.handle('project:files', () => {
+  if (!currentFolder) return { ok: false, error: 'No project is open', tree: [] };
+  return { ok: true, tree: buildExplorerTree(currentFolder) };
+});
+ipcMain.handle('project:fileSource', (_e, relativePath: string) => {
+  if (!currentFolder || !relativePath) return { ok: false, error: 'No project or file selected' };
+  const target = path.resolve(currentFolder, relativePath);
+  // Prevent the renderer from reading outside the project folder.
+  if (!target.startsWith(currentFolder + path.sep)) return { ok: false, error: 'Invalid project path' };
+  try {
+    const content = fs.readFileSync(target, 'utf8');
+    if (content.includes('\0')) return { ok: false, error: 'This is not a text file' };
+    return { ok: true, path: relativePath, content };
+  } catch (err: unknown) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
+});
 
 ipcMain.handle('folder:open', async () => {
   if (!mainWindow) return null;
@@ -781,7 +874,7 @@ async function runAnalysisInternal(): Promise<{ ok?: boolean; error?: string; fr
     }
 
     const structureJson = toClaudePromptJSON(structure);
-    const structureHash = hashStructure(ANALYSIS_SCHEMA_VERSION + ':' + structureJson);
+    const structureHash = hashStructure(ANALYSIS_SCHEMA_VERSION + ':depth-' + analysisDepth + ':' + structureJson);
 
     // ── Cache hit: structure unchanged since last analysis ──
     const cached = loadCache(currentFolder);
@@ -879,6 +972,33 @@ async function runComponentDetail(name: string): Promise<{ ok?: boolean; error?:
 
 ipcMain.handle('component:detail', async (_e, name: string) => runComponentDetail(name));
 
+// Source for the right-side editor. Resolution stays local: select the most
+// relevant indexed source file and return its text without invoking an AI.
+ipcMain.handle('component:source', (_e, rawName: string) => {
+  if (!currentFolder || !rawName?.trim()) return { ok: false, error: 'No project or component selected' };
+  try {
+    const structure = extractStructure(currentFolder);
+    const match = findSourceFiles(rawName.trim(), structure.nodePaths, currentFolder, 1)[0];
+    if (!match) return { ok: false, error: `No local source found for ${rawName}` };
+    return {
+      ok: true,
+      path: path.relative(currentFolder, match.filePath),
+      content: match.content,
+      highlight: rawName.trim(),
+    };
+  } catch (err: unknown) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('component:hierarchy', (_e, rawName: string) => {
+  if (!currentFolder || !rawName?.trim()) return { ok: false, error: 'No project or component selected' };
+  const structure = extractStructure(currentFolder);
+  const match = findSourceFiles(rawName.trim(), structure.nodePaths, currentFolder, 1)[0];
+  if (!match) return { ok: false, error: `No local source found for ${rawName}` };
+  return { ok: true, path: path.relative(currentFolder, match.filePath), mermaid: buildLocalCallHierarchy(match.content) };
+});
+
 // ── Component drilldown ───────────────────────────────────────────────────────
 
 /**
@@ -918,13 +1038,25 @@ function findSourceFiles(
       const re = new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
       s += Math.min((content.match(re) || []).length * 3, 45);
     } catch { /* ignore invalid regex */ }
+    // User-flow labels deliberately use everyday language.  Ignore filler words
+    // when translating one back to code, otherwise a documentation file which
+    // happens to say "component" can beat the actual Canvas.tsx source.
+    const genericWords = new Set([
+      'about', 'after', 'before', 'between', 'component', 'components', 'create',
+      'data', 'from', 'into', 'place', 'screen', 'show', 'step', 'system',
+      'then', 'that', 'the', 'this', 'user', 'users', 'using', 'with',
+    ]);
     // Diagram labels often use readable names (for example, "My Schedule")
     // while metadata files use a shorter technical name (for example, Schedule.page).
-    for (const word of lc.split(/[^a-z0-9]+/).filter(word => word.length > 2)) {
+    for (const word of lc.split(/[^a-z0-9]+/).filter(word => word.length > 2 && !genericWords.has(word))) {
       const re = new RegExp(word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
       if (fn.includes(word)) s += 20;
       s += Math.min((content.match(re) || []).length, 10);
     }
+    // The source tree is the product implementation. Documentation and generated
+    // assets can describe a feature, but are poor targets for a code hierarchy.
+    if (/(^|\/)(src|app|lib|server|client)(\/|$)/i.test(fileName)) s += 8;
+    if (/(^|\/)(docs?|dev-docs|storybook|examples?)(\/|$)/i.test(fileName)) s -= 12;
     return s;
   };
 
@@ -935,7 +1067,7 @@ function findSourceFiles(
     if (seen.has(fp)) return;
     seen.add(fp);
     const content = read(fp);
-    const s = scoreFile(fileName, content);
+    const s = scoreFile(fp, content);
     if (s > 0) results.push({ filePath: fp, content, score: s });
   };
 
@@ -960,13 +1092,118 @@ function findSourceFiles(
   }
 
   results.sort((a, b) => b.score - a.score);
-  return results.slice(0, maxResults).filter(r => r.score > 0).map(r => ({ filePath: r.filePath, content: r.content }));
+
+  // A user-flow phrase can legitimately match a small utility such as
+  // connections.ts.  That utility may expose helpers but have no execution
+  // sequence to draw.  Prefer a similarly relevant source file that actually
+  // contains locally provable function-to-function calls, because it gives the
+  // editor an honest call path rather than an empty overlay.  This remains
+  // entirely static and local.
+  const candidates = results.slice(0, 14);
+  const callCount = (content: string) => (buildLocalCallHierarchy(content).match(/\|calls\|/g) || []).length;
+  candidates.sort((a, b) => (b.score + Math.min(callCount(b.content), 6) * 6) - (a.score + Math.min(callCount(a.content), 6) * 6));
+  const ranked = [...candidates, ...results.slice(14)];
+  return ranked.slice(0, maxResults).filter(r => r.score > 0).map(r => ({ filePath: r.filePath, content: r.content }));
 }
 
-function buildDrilldownPrompt(name: string, sourceCode: string, imports: string[], calledBy: string[]): string {
+/** Build a local, source-proven class/function hierarchy. No AI inference. */
+function buildLocalCallHierarchy(source: string): string {
+  type Def = { key: string; label: string; className?: string };
+  const definitions = new Map<string, Def>();
+  const owns = new Set<string>();
+  const calls = new Set<string>();
+  const imports = new Set<string>();
+  let ast: unknown;
+  try { ast = require('@typescript-eslint/typescript-estree').parse(source, { jsx: true, tolerant: true }); } catch { return 'flowchart TD\n  A[No parseable local call hierarchy found]'; }
+
+  const walk = (node: unknown, visit: (n: Record<string, unknown>, classes: string[], owner?: string) => void, classes: string[] = [], owner?: string) => {
+    if (!node || typeof node !== 'object') return;
+    const n = node as Record<string, unknown>;
+    const type = n.type as string | undefined;
+    let nextClasses = classes;
+    let nextOwner = owner;
+    if (type === 'ClassDeclaration') {
+      const name = ((n.id as { name?: string } | null)?.name) ?? 'AnonymousClass';
+      definitions.set(name, { key: name, label: name });
+      nextClasses = [...classes, name];
+    }
+    const functionName = (() => {
+      if (type === 'FunctionDeclaration') return (n.id as { name?: string } | null)?.name;
+      if (type === 'VariableDeclarator' && ['ArrowFunctionExpression', 'FunctionExpression'].includes((n.init as { type?: string } | null)?.type ?? '')) return (n.id as { name?: string } | null)?.name;
+      if (type === 'MethodDefinition') return (n.key as { name?: string } | null)?.name;
+      return undefined;
+    })();
+    if (functionName) {
+      const className = nextClasses[nextClasses.length - 1];
+      nextOwner = className ? `${className}.${functionName}` : functionName;
+      definitions.set(nextOwner, { key: nextOwner, label: nextOwner, className });
+      if (className) owns.add(`${className}|${nextOwner}`);
+    }
+    visit(n, nextClasses, nextOwner);
+    for (const value of Object.values(n)) {
+      if (Array.isArray(value)) value.forEach(child => walk(child, visit, nextClasses, nextOwner));
+      else if (value && typeof value === 'object' && (value as Record<string, unknown>).type) walk(value, visit, nextClasses, nextOwner);
+    }
+  };
+
+  walk(ast, node => {
+    if (node.type === 'ImportDeclaration') {
+      const sourceName = (node.source as { value?: string } | undefined)?.value;
+      if (typeof sourceName === 'string') imports.add(sourceName);
+    }
+  });
+  walk(ast, (node, _classes, owner) => {
+    if (node.type !== 'CallExpression' || !owner) return;
+    const callee = node.callee as { type?: string; name?: string; property?: { name?: string } } | undefined;
+    const called = callee?.type === 'Identifier' ? callee.name : callee?.property?.name;
+    if (!called) return;
+    const target = [...definitions.values()].find(def => def.key === called || def.key.endsWith(`.${called}`));
+    if (target && target.key !== owner) calls.add(`${owner}|${target.key}`);
+  });
+
+  const id = new Map<string, string>(); let next = 1;
+  const nodeId = (key: string) => { if (!id.has(key)) id.set(key, `N${next++}`); return id.get(key)!; };
+  const label = (key: string) => key.replace(/[^A-Za-z0-9_. ]/g, ' ').slice(0, 48);
+  const lines = ['flowchart LR'];
+  const edges = [...owns].map(value => ({ value, kind: 'contains' })).concat([...calls].map(value => ({ value, kind: 'calls' }))).slice(0, 36);
+  for (const edge of edges) {
+    const [from, to] = edge.value.split('|');
+    lines.push(`  ${nodeId(from)}[${label(from)}] -->|${edge.kind}| ${nodeId(to)}[${label(to)}]`);
+  }
+  if (edges.length === 0) {
+    const fallbackDefs = [...definitions.values()].slice(0, 12);
+    if (fallbackDefs.length) {
+      for (const def of fallbackDefs) lines.push(`  ${nodeId(def.key)}[${label(def.label)}]`);
+    } else if (imports.size) {
+      const module = 'Selected module';
+      for (const imported of [...imports].slice(0, 12)) {
+        lines.push(`  ${nodeId(module)}[${module}] -->|imports| ${nodeId(imported)}[${label(imported)}]`);
+      }
+    } else {
+      lines.push('  A[No classes functions or imports found in this local file]');
+    }
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Give AI requests the same source-proven topology used by the editor.  Keeping
+ * it separate from the source text makes relationships explicit without asking
+ * the model to rediscover them from a large file.
+ */
+function buildHierarchyContext(sourceFiles: { filePath: string; content: string }[]): string {
+  if (!currentFolder) return '';
+  return sourceFiles.slice(0, 6).map(({ filePath, content }) => {
+    const hierarchy = buildLocalCallHierarchy(content);
+    return `// ── ${path.relative(currentFolder!, filePath)}: local AST hierarchy ──\n${hierarchy}`;
+  }).join('\n\n').slice(0, 12000);
+}
+
+function buildDrilldownPrompt(name: string, sourceCode: string, imports: string[], calledBy: string[], hierarchyContext = ''): string {
   return [
     `You are explaining the "${name}" feature to a smart non-engineer. Look at the source code and draw exactly what happens when a user uses this feature — step by step.`,
     'Output ONLY the JSON below — no fences, no prose.',
+    analysisDepthGuidance(),
     '',
     'WHAT TO SHOW:',
     `1. The steps a user goes through inside "${name}" — what they see, what they do, what happens next.`,
@@ -989,6 +1226,14 @@ function buildDrilldownPrompt(name: string, sourceCode: string, imports: string[
     '   Bad: "calls", "returns Promise", "dispatches"',
     '',
     calledBy.length > 0 ? `This feature is reached from: ${calledBy.join(', ')}` : '',
+    hierarchyContext ? [
+      '',
+      'LOCAL AST EVIDENCE (authoritative):',
+      '- This was extracted locally from the supplied files, not inferred by AI.',
+      '- Use it to determine the real class/function ownership and call order.',
+      '- Do not invent calls, methods, or cross-file relationships not shown here or directly proven by source.',
+      hierarchyContext,
+    ].join('\n') : '',
     '',
     'MERMAID SYNTAX (follow exactly):',
     '- Start with `flowchart TD`.',
@@ -1015,7 +1260,7 @@ async function runComponentDrilldown(rawName: string): Promise<{ ok?: boolean; e
   if (!currentFolder || !name) return { error: 'no component' };
   try {
     const cached = loadCache(currentFolder);
-    const cacheKey = 'canonical-v2:' + name;
+    const cacheKey = 'canonical-v4:depth-' + analysisDepth + ':' + name;
     if (cached?.drilldowns?.[cacheKey]) {
       return { ok: true, mermaid: cached.drilldowns[cacheKey], fromCache: true };
     }
@@ -1058,7 +1303,8 @@ async function runComponentDrilldown(rawName: string): Promise<{ ok?: boolean; e
 
     console.log(`[drilldown] "${name}" files:[${usedFiles.join(',')}] calledBy:[${calledBy.slice(0, 5).join(',')}]`);
 
-    const prompt = buildDrilldownPrompt(name, contextForClaude, imports, calledBy.slice(0, 8));
+    const hierarchyContext = buildHierarchyContext(sourceFiles);
+    const prompt = buildDrilldownPrompt(name, contextForClaude, imports, calledBy.slice(0, 8), hierarchyContext);
     const raw = await runCapture(prompt, currentFolder);
     const parsed = extractJson(raw) as { mermaid?: string } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
@@ -1128,10 +1374,11 @@ function buildCodeFlowPrompt(name: string, sourceCode: string): string {
   ].join('\n');
 }
 
-function buildCodeStoryPrompt(name: string, sourceCode: string): string {
+function buildCodeStoryPrompt(name: string, sourceCode: string, hierarchyContext = ''): string {
   return [
     'Explain how the selected component, "' + name + '", behaves when its code runs. Create a plain-English Code Story, not a feature map or a user journey.',
     'Output ONLY the JSON below — no fences, no prose.',
+    analysisDepthGuidance(),
     '',
     'HARD RULES:',
     '- Base every step on the supplied source code. Do not invent screens, user journeys, product features, missing-source handling, or hypothetical behaviour.',
@@ -1143,6 +1390,14 @@ function buildCodeStoryPrompt(name: string, sourceCode: string): string {
     '- This is NOT a user journey. Do not use actions such as "tap", "open screen", "browse", or "sign in" unless that exact action is the code operation being explained.',
     '- If the code does not prove a step, leave it out.',
     '- When DRILL FLOW CONTEXT is supplied, it is the canonical feature trace. Preserve every canonical S-number and its order/branches. Do not add unrelated steps or substitute another helper workflow.',
+    hierarchyContext ? [
+      '',
+      'LOCAL AST EVIDENCE (authoritative):',
+      '- The following hierarchy and call edges are statically extracted from the local source.',
+      '- Follow these edges for function sequencing. Do not turn a class-contains-method edge into a runtime call.',
+      '- Do not invent a call, method, or ownership relationship that is absent from this evidence and source.',
+      hierarchyContext,
+    ].join('\n') : '',
     '',
     'WHAT TO SHOW:',
     '- Tell the complete feature story across all supplied files: entry/input → orchestration → every meaningful decision → local/service/storage work → success result and meaningful failure result.',
@@ -1176,34 +1431,46 @@ function buildCodeStoryPrompt(name: string, sourceCode: string): string {
   ].join('\n');
 }
 
-function buildImplementationPrompt(name: string, sourceCode: string): string {
+function buildImplementationPrompt(name: string, sourceCode: string, hierarchyContext = ''): string {
   return [
-    'Create a compact implementation-level technical flow diagram for the selected feature, "' + name + '". The functional flow is only a starting point: show the important internal path from trigger to final caller/UI result without turning the canvas into an exhaustive call graph.',
-    'Output ONLY the JSON below — no fences, no prose.', '',
-    'RULES:',
+    'Create a clear "How this is built" guide for the selected feature, "' + name + '". It must let a developer understand what the feature can do before showing how components communicate.',
+    'Output ONLY the JSON below — no fences, no prose.',
+    analysisDepthGuidance(), '',
+    'PRIORITY:',
+    '- Clarity beats completeness. A developer should understand this diagram in under one minute.',
+    '- Start with what this feature enables: the trigger and the useful result it produces. Then show the small number of internal handoffs that make it happen.',
+    '- Use everyday labels. Say "Check the saved project", "Ask the project service", "Show the project details"—not class names, architecture patterns, or a line of source code.',
+    '- Use 5–10 main nodes. Include an extra node only when it reveals a real decision, useful failure outcome, or communication contract.',
+    '',
+    'TRUTHFULNESS:',
     '- Use only facts proven by the supplied source.',
-    '- Treat DRILL FLOW CONTEXT as the functional flow to implement. Preserve its feature scope and all proved branches, but DO NOT redraw it. Expand every functional step into the real components, calls, data transformations, and decisions found in the supplied source.',
-    '- Trace the complete implementation across all supplied files: trigger/entry → handler/controller → state manager/use case/service → repository/cache/storage/API boundary → transformations → result to UI/caller. Only include layers that the code proves.',
-    '- This is a progressive-disclosure overview: use 5–8 main-path nodes plus at most 2 meaningful decision/error nodes. An important data boundary may add a visible request and response node. Combine small helpers into the responsibility that owns them. Do not emit one node per function, DTO, mapper, request-building step, or state update.',
-    '- Every meaningful node must communicate: responsible component or layer, input, operation, output, data source/destination, and important condition. Keep the node label short; put the concise supporting facts in its description.',
-    '- Node labels must name an implementation responsibility in plain language. Good: "View model validates the visit request", "Repository reads cached visit by identifier", "API client maps response into UI state". Bad: "Open the page", "Show the brief", "User views results".',
-    '- For every call that matters, show who makes the call, what it receives, whether it is a local function, storage operation, or external/API call, and what it returns, resolves to, or changes. Use the real function name in its description when the source proves it, then immediately explain it in everyday English.',
-    '- REQUEST AND RESPONSE ARE REQUIRED for every API, service, IPC, storage, or repository boundary. The node description must explicitly include `Request:` (caller, operation, and only source-proven payload fields/parameters) and `Response:` (returned value, response shape, stored result, or error). If the code does not expose either, write `Request: Unknown` or `Response: Implementation detail not provided`; never silently omit it.',
-    '- Make every proved boundary contract VISIBLE IN THE MERMAID CHART, not only in descriptions. For each API, OData, service, repository, IPC, or storage call, draw compact sibling nodes in this exact pattern: `REQ — [operation]: [proven method/entity/query/key/payload]` → `Boundary — [service/store/call]` → `RES — [success shape/result]` and branch `RES — [proven error/empty result]` when applicable. These are contract nodes, not generic implementation steps.',
-    '- A contract must answer both questions on the canvas: “What does the caller send?” and “What does it receive?” For HTTP/API calls, show method, endpoint/path, query/body, and headers/auth only when proved. For OData, show operation, entity set/read link/key/query/payload. For repository/storage calls, show read/write operation, key/query, record/entity shape, and success/error result. Use `Unknown` or `Implementation detail not provided` for missing source evidence.',
-    '- For every object that matters, state its proven shape or important fields before and after the step. Explain whether the step reads it, validates it, creates a new object, updates it, stores it, sends it, or returns it. Never invent fields, values, request bodies, or response data.',
-    '- Each description must fit in two or three short sentences, using this exact compact order: "Layer: [...]; Input: [...]; Operation: [...]. Request: [...]; Response: [...]. Data: [source → destination]; Conditions/effect: [...]; Evidence: (path/file)." For a node with no boundary call, write `Request: Not applicable; Response: Not applicable`. Do not repeat data already clear from the node or arrow.',
-    '- Do not make this a user journey. A node may describe rendering only as the final technical result of state/data processing.',
-    '- Make only the pivotal decisions explicit with diamond nodes: validation, cache/data availability, authentication/authorization, or response success. Fold minor conditions into the responsible operation. Label every outgoing decision edge.',
-    '- Show only meaningful, source-proven error, empty-data, or alternative paths. Merge failures that end in the same UI/caller error state rather than drawing separate branches for every low-level exception.',
-    '- Make asynchronous work visible as one compact lifecycle: loading/pending → async boundary → success/failure. Include cancellation, duplicate-request, retry, stale-response, or background processing only when it changes the feature outcome.',
-    '- ODATA RULE: When source proves an OData read, create, update, delete, upload, or download, do NOT collapse it into a generic data node. Use the explicit `REQ — OData ...` → `OData — Local/remote OData service or store` → `RES — OData ...` contract pattern. Label the request with the proven entity set/read link/query/key/payload and the response with the proven entity/fields/result. Never expose secrets.',
-    '- For non-OData persistence and APIs, show one boundary node each. Put request construction, response parsing, mapping, storage operation, key/query, and later reads in the node description, explicitly under `Request:` and `Response:`, unless a separate decision or outcome depends on them. Never expose secrets.',
-    '- Do NOT use Mermaid subgraphs or swimlanes because the canvas renderer does not reliably support them. Instead, prefix each node label with one concise proved layer tag when it improves clarity, for example "UI — Start loading and pass visit ID", "Data — Read cached visit", or "External — Send insight request". Do not create a tag for every component.',
-    '- Use flowchart TD. Use rectangles for operations, diamonds for decisions, database shapes for proven persistence, and cloud/service shapes for proven external systems. Solid arrows are the main path; dashed arrows only denote optional/supporting relationships. Label arrows with the actual data/event/condition.',
-    '- If source code does not establish a detail needed by the functional flow, write "Unknown", "TODO", or "Implementation detail not provided" in the description. If code contradicts the functional flow, represent the code and note the difference in the description.', '',
+    '- Treat DRILL FLOW CONTEXT as the feature scope. Preserve proved outcomes and branches, but do not redraw the user journey.',
+    '- Combine private helper functions into the component that owns them. Do not invent details, fields, endpoints, or error paths.',
+    hierarchyContext ? [
+      '',
+      'LOCAL AST EVIDENCE (authoritative):',
+      '- Use this local class/function hierarchy to identify component ownership and direct calls.',
+      '- A `contains` edge means ownership only; a `calls` edge is a source-proven direct call.',
+      '- Do not claim an unshown call or cross-component contract.',
+      hierarchyContext,
+    ].join('\n') : '',
+    '',
+    'COMMUNICATION CONTRACTS:',
+    '- Show every meaningful handoff between components, layers, processes, services, repositories, storage, or external systems. A tiny private helper does not need its own contract.',
+    '- Make each handoff easy to read: `Caller -->|what it asks for and key input| Receiver` followed by `Receiver -->|what comes back or fails| Caller`.',
+    '- For REST/HTTP use three concise nodes: `Request — METHOD path and key input` → `Service — REST call` → `Response — status and result`. Show headers, body fields, query values, and errors only when source proves them.',
+    '- For IPC, storage, repositories, and events use the same idea: show who asks, what they send, who handles it, and what returns. Do not create a separate node for request and response when an arrow label makes the contract clear.',
+    '- EVERY node description must teach the reader, not merely cite the code. Use this exact reader-friendly order: `What it means: [define the input, output, or term in everyday words]. Why it happens: [why this step is needed for the feature to work]. Communication: [who it talks to, what it sends, and what comes back].`',
+    '- Explain unfamiliar terms where they appear. For example: `What it means: Streaming links are optional saved web addresses for music services. Why it happens: Empty addresses cannot open a service, so the app keeps only usable links. Communication: The screen receives the usable list and creates one button for each link.`',
+    '- Keep descriptions free of source paths, function names, class names, and framework jargon. The chart should read like a guided explanation, not a code review.',
+    '',
+    'DIAGRAM:',
+    '- Use flowchart TD. Rectangles are steps; diamonds are only for important decisions; database/cloud shapes are only for proven storage/external systems.',
+    '- Use short, plain-English node labels and short arrow labels. Keep source-level names in descriptions only.',
+    '- Show meaningful success and failure/empty outcomes, but merge low-level errors that lead to the same result.',
+    '- Never expose secrets.', '',
     'Schema:',
-    '{"mermaid":"flowchart TD string — use \n for newlines","descriptions":{"Node Label":"Layer: ...; Input: ...; Operation: .... Request: ...; Response: .... Data: ... → ...; Conditions/effect: ...; Evidence: (path/file)"},"happyPath":["nodeId1","nodeId2"]}', '',
+    '{"mermaid":"flowchart TD string — use \n for newlines","descriptions":{"Node Label":"What it means: ... Why it happens: ... Communication: ..."},"happyPath":["nodeId1","nodeId2"]}', '',
     'SOURCE CODE of ' + name + ':', sourceCode.slice(0, 16000), '', 'JSON only.',
   ].join('\n');
 }
@@ -1212,6 +1479,7 @@ function buildRepositoryCodeStoryPrompt(projectStructure: string): string {
   return [
     'Create one plain-English Code Story for this entire repository. This is a guided overview for a developer who needs to understand what the application does and how its major parts work together.',
     'Output ONLY the JSON below — no fences or prose.',
+    analysisDepthGuidance(),
     '',
     'WHAT TO SHOW:',
     '- Show the 5–10 most important responsibilities or feature areas, in the order a request or user action moves through the application.',
@@ -1245,6 +1513,7 @@ function buildArchitectureStoryPrompt(projectContext: string): string {
   return [
     "Create an evidence-based Architecture Story for this repository. This is separate from a code-flow story: it explains the project's technical shape so a developer can orient themselves before tracing a feature.",
     'Output ONLY the JSON below — no fences or prose.',
+    analysisDepthGuidance(),
     '',
     'WHAT TO EXPLAIN:',
     '- Runtime and framework: name the framework, language, package manager, and app/runtime type only when the supplied files prove them.',
@@ -1281,17 +1550,19 @@ function buildArchitectureStoryPrompt(projectContext: string): string {
 function buildRepositoryImplementationPrompt(projectContext: string): string {
   return [
     'Create a feature-by-feature Implementation Map for this repository. Explain how EVERY meaningful feature found in the supplied source is implemented, in plain language for a developer.',
-    'Output ONLY the JSON below — no fences or prose.', '',
+    'Output ONLY the JSON below — no fences or prose.',
+    analysisDepthGuidance(), '',
     'WHAT TO SHOW:',
     '- First show the shared startup/entry point. Then create one subgraph for EACH meaningful, independent feature or workflow found in the source. A feature is a cohesive user or domain capability, not an individual file or helper.',
     '- Treat build scripts, dependency manifests, plugin setup, and generated configuration as infrastructure—not features. Do not devote a feature subgraph to them unless the repository contains no application or domain feature code.',
-    '- For every feature, show its actual implementation path: trigger or entry → important logic/decision → state, data, or API work → result. Use 2–4 connected nodes per feature.',
+    '- For every feature, show its actual implementation path and every meaningful component contract: trigger or entry → important logic/decision → state, data, or API work → result. Use as many contract nodes as needed; do not hide a component-to-component handoff to stay compact.',
     '- Cover all meaningful features the supplied source proves, up to 8 feature subgraphs and 24 nodes total. If there are more, combine closely related minor features and state that in the description.',
     '- Node labels must be plain English operations, not raw class, function, variable, or file names.',
     '- Every description explains concrete implementation details in plain language: request/input, important function calls, object/data movement, response or side effect, conditions, and source evidence in parentheses.',
-    '- Describe each important call as: caller → function/service/storage operation → what it receives → what it returns or changes. State whether it is a local function, storage operation, or external/API call when the source proves this.',
+    '- For EVERY communication between components, describe a contract as: caller → receiver → operation/event and source-proven input → source-proven result/error. State its transport: direct call, event/callback, IPC, HTTP/REST, repository, storage, or other proven mechanism.',
+    '- For REST/HTTP contracts, draw `REQ — METHOD path query/body` → `REST boundary` → `RES — status body/error` and return it to the caller. Include headers/auth only when source proves them. For direct calls, draw a forward arrow with operation/input and a return arrow with result/error.',
     '- Describe each important object with only source-proven fields or shape, and say whether the step reads, validates, creates, updates, stores, sends, or returns it. Never invent fields or response values.',
-    '- Use this exact description order: "Request/Input: [...]. Call: [...]. Object: [before] → [after]. Response/Effect: [...]. Evidence: (path/file)."',
+    '- Use this exact description order: "Request/Input: [...]. Transport: [...]. Contract: [caller → receiver → operation]. Object: [before] → [after]. Response/Effect: [...]. Evidence: (path/file)."',
     '- Show framework, runtime, persistence, API, or external integrations only when the supplied context proves them.',
     '- Do not invent missing layers. Say no persistence or integration is evident when appropriate.',
     '- Every edge is labelled with the data, event, or responsibility passed between steps.', '',
@@ -1300,7 +1571,7 @@ function buildRepositoryImplementationPrompt(projectContext: string): string {
     '- Use one `subgraph FeatureName` block for each feature and Id[Plain English operation] nodes with labelled edges.',
     '- Connect the shared entry point to every feature entry. No code snippets.', '',
     'Schema:',
-    '{"mermaid":"flowchart TD string","descriptions":{"Node Label":"Request/Input: ... Call: ... Object: ... → ... Response/Effect: ... Evidence: (path/file)"},"happyPath":["nodeId1","nodeId2"]}', '',
+    '{"mermaid":"flowchart TD string","descriptions":{"Node Label":"Request/Input: ... Transport: ... Contract: ... Object: ... → ... Response/Effect: ... Evidence: (path/file)"},"happyPath":["nodeId1","nodeId2"]}', '',
     'PROJECT CONTEXT:', projectContext.slice(0, 50000), '', 'JSON only.',
   ].join('\n');
 }
@@ -1379,17 +1650,17 @@ async function runArchitectureStory(): Promise<{ ok?: boolean; error?: string; m
 
 async function runRepositoryImplementation(): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string> }> {
   if (!currentFolder) return { error: 'no project folder' };
-  const cacheKey = '__repository_implementation__';
+    const cacheKey = '__repository_implementation__:depth-' + analysisDepth;
   try {
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
       const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string> };
-      if (cached.version === 4 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {} };
+      if (cached.version === 5 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {} };
     }
     const structure = extractStructure(currentFolder);
     const parsed = extractJson(await runCapture(buildRepositoryImplementationPrompt(repositoryImplementationContext(currentFolder, structure)), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string> } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
-    const result = { version: 4, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {} };
+    const result = { version: 5, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {} };
     saveCodeFlow(currentFolder, cacheKey, JSON.stringify(result));
     return { ok: true, mermaid: result.mermaid, descriptions: result.descriptions };
   } catch (err: unknown) { return { error: err instanceof Error ? err.message : String(err) }; }
@@ -1400,14 +1671,16 @@ async function runComponentCodeFlow(rawName: string, drillMermaid = ''): Promise
   if (!currentFolder || !name) return { error: 'no component' };
   try {
     const cached = loadCache(currentFolder);
-    const cachedValue = cached?.codeflows?.[name];
+    const cacheKey = `depth-${analysisDepth}:${name}`;
+    const cachedValue = cached?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
       try {
         const p = JSON.parse(cachedValue) as { version?: number; mermaid: string; descriptions?: Record<string, string>; happyPath: string[] };
-        // Version 7 makes the story describe the selected component's runtime
+        // Version 12 grounds the story in the locally extracted AST hierarchy
+        // as well as source text, preventing inferred function relationships.
         // behaviour (inputs, decisions, effects, and results), rather than a
         // broad feature or user-flow map.
-        if (!drillMermaid && p?.version === 11 && p.mermaid) return { ok: true, mermaid: p.mermaid, descriptions: p.descriptions ?? {}, happyPath: p.happyPath ?? [], fromCache: true };
+        if (!drillMermaid && p?.version === 12 && p.mermaid) return { ok: true, mermaid: p.mermaid, descriptions: p.descriptions ?? {}, happyPath: p.happyPath ?? [], fromCache: true };
       } catch {
         // Older raw-Mermaid entries were generated as user journeys, not code stories.
         // Ignore them so they are recreated with the current Code Story rules.
@@ -1421,7 +1694,7 @@ async function runComponentCodeFlow(rawName: string, drillMermaid = ''): Promise
       if (!parsed?.mermaid) return { error: 'no mermaid in response' };
       const happyPath = parsed.happyPath ?? [];
       const descriptions = parsed.descriptions ?? {};
-      saveCodeFlow(currentFolder, name, JSON.stringify({ version: 3, mermaid: parsed.mermaid, descriptions, happyPath }));
+      saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 3, mermaid: parsed.mermaid, descriptions, happyPath }));
       return { ok: true, mermaid: parsed.mermaid, descriptions, happyPath };
     }
 
@@ -1441,13 +1714,18 @@ async function runComponentCodeFlow(rawName: string, drillMermaid = ''): Promise
       return { error: `No source code was found for "${name}". Select a code component to create a Code Story.` };
     }
 
-    const raw = await runCapture(buildCodeStoryPrompt(name, sourceCode + (drillMermaid ? '\n\nDRILL FLOW CONTEXT — cover this complete feature path:\n' + drillMermaid : '')), currentFolder);
+    const hierarchyContext = buildHierarchyContext(sourceFiles);
+    const raw = await runCapture(buildCodeStoryPrompt(
+      name,
+      sourceCode + (drillMermaid ? '\n\nDRILL FLOW CONTEXT — cover this complete feature path:\n' + drillMermaid : ''),
+      hierarchyContext,
+    ), currentFolder);
     const parsed = extractJson(raw) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
 
     const happyPath = parsed.happyPath ?? [];
     const descriptions = parsed.descriptions ?? {};
-    saveCodeFlow(currentFolder, name, JSON.stringify({ version: 11, mermaid: parsed.mermaid, descriptions, happyPath }));
+    saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 12, mermaid: parsed.mermaid, descriptions, happyPath }));
     return { ok: true, mermaid: parsed.mermaid, descriptions, happyPath };
   } catch (err: unknown) {
     return { error: err instanceof Error ? err.message : String(err) };
@@ -1460,11 +1738,11 @@ async function runComponentImplementation(rawName: string, drillMermaid = ''): P
   const name = rawName.trim();
   if (!currentFolder || !name) return { error: 'no component' };
   try {
-    const cacheKey = '__implementation__' + name;
+    const cacheKey = '__implementation__:depth-' + analysisDepth + ':' + name;
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
       const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] };
-      if (!drillMermaid && cached.version === 10 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, happyPath: cached.happyPath ?? [] };
+      if (!drillMermaid && cached.version === 15 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, happyPath: cached.happyPath ?? [] };
     }
     const structure = extractStructure(currentFolder);
     const sourceFiles = findSourceFiles(name, structure.nodePaths, currentFolder, 6);
@@ -1477,9 +1755,13 @@ async function runComponentImplementation(rawName: string, drillMermaid = ''): P
       if (budget <= 0) break;
     }
     if (!sourceCode.trim()) return { error: `No source code was found for "${name}". Select a code component to explain its implementation.` };
-    const parsed = extractJson(await runCapture(buildImplementationPrompt(name, sourceCode + (drillMermaid ? '\n\nDRILL FLOW CONTEXT — implement this complete feature path:\n' + drillMermaid : '')), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
+    const scope = drillMermaid
+      ? '\n\nFEATURE SCOPE ONLY — this is a user-facing flow. Use it only to identify the feature and its outcomes. Do NOT repeat, paraphrase, or draw its user steps. Explain the source-proven component contracts that make those outcomes happen instead:\n' + drillMermaid
+      : '';
+    const hierarchyContext = buildHierarchyContext(sourceFiles);
+    const parsed = extractJson(await runCapture(buildImplementationPrompt(name, sourceCode + scope, hierarchyContext), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
-    const result = { version: 10, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {}, happyPath: parsed.happyPath ?? [] };
+    const result = { version: 15, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {}, happyPath: parsed.happyPath ?? [] };
     saveCodeFlow(currentFolder, cacheKey, JSON.stringify(result));
     return { ok: true, mermaid: result.mermaid, descriptions: result.descriptions, happyPath: result.happyPath };
   } catch (err: unknown) { return { error: err instanceof Error ? err.message : String(err) }; }
@@ -1720,13 +2002,17 @@ function normalizeDiagramPattern(diagram: Record<string, unknown>, structure: Ex
 
   const langs = structure.languages;
   let inferred = 'Layered Architecture';
-  if (langs.includes('.kt') || langs.includes('.java')) inferred = 'Android App';
-  else if (langs.includes('.swift')) inferred = 'iOS App';
-  else if (langs.includes('.dart')) inferred = 'Flutter App';
-  else if (langs.includes('.py')) inferred = 'Python Project';
-  else if (langs.includes('.go')) inferred = 'Go Service';
-  else if (langs.includes('.rs')) inferred = 'Rust Project';
-  else if (langs.includes('.ts') || langs.includes('.tsx')) inferred = 'TypeScript App';
+  if (langs.includes('kt') || langs.includes('java')) inferred = 'Android App';
+  else if (langs.includes('swift')) inferred = 'iOS App';
+  else if (langs.includes('dart')) inferred = 'Flutter App';
+  else if (langs.includes('py')) inferred = 'Python Project';
+  else if (langs.includes('go')) inferred = 'Go Service';
+  else if (langs.includes('rs')) inferred = 'Rust Project';
+  else if (langs.includes('ts') || langs.includes('tsx')) inferred = 'TypeScript App';
+  else if (langs.includes('cs') || langs.includes('fs')) inferred = '.NET Project';
+  else if (langs.includes('php')) inferred = 'PHP Project';
+  else if (langs.includes('rb')) inferred = 'Ruby Project';
+  else if (langs.includes('cpp') || langs.includes('c') || langs.includes('h')) inferred = 'Native Application';
 
   diagram.pattern = inferred;
 }

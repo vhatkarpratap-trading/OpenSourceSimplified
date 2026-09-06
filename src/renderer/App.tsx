@@ -3,6 +3,8 @@ import type { ExcalidrawImperativeAPI } from '@excalidraw/excalidraw/types/types
 import Terminal from './Terminal';
 import Canvas from './Canvas';
 import MermaidRenderer from './MermaidRenderer';
+import CodeEditor from './CodeEditor';
+import FileExplorer, { ExplorerNode } from './FileExplorer';
 import { DiagramData, DiagramKind } from './diagramBuilder';
 import type { CommitInfo, CommitDiffResult, PRInfo, PRReviewResult, ChangeContextNode } from './global';
 
@@ -60,11 +62,26 @@ function extractNodeNamesFromDiagram(diagram: DiagramData | null): string[] {
   return Array.from(names).filter(n => n && !/^(TD|LR|TB|RL|flowchart|classDef|changed)$/i.test(n));
 }
 
+// Excalidraw can split a long Mermaid label across text elements.  Its click
+// callback then gives us only the first part of the label, while descriptions
+// retain the exact label emitted by the analysis.  Restore that complete name
+// before using it to locate local source code.
+function restoreSelectionLabel(name: string, diagram: DiagramData | null): string {
+  const compact = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const selected = compact(name);
+  if (!selected || !diagram?.descriptions) return name;
+  const match = Object.keys(diagram.descriptions).find(label => {
+    const candidate = compact(label);
+    return candidate === selected || candidate.startsWith(`${selected} `) || selected.startsWith(`${candidate} `);
+  });
+  return match ?? name;
+}
+
 type AnalysisStatus = 'idle' | 'running' | 'patching' | 'done' | 'error';
 
 const DIAGRAM_TABS: { kind: DiagramKind; label: string }[] = [
-  { kind: 'structure', label: 'System Map' },
-  { kind: 'sequence',  label: 'Feature Flows' },
+  { kind: 'structure', label: 'User Flow' },
+  { kind: 'sequence',  label: 'More User Flows' },
   { kind: 'gitDiff',   label: 'Git Diff' },
 ];
 
@@ -95,6 +112,11 @@ export default function App() {
   } | null>(null);
   const [activeKind, setActiveKind]         = useState<DiagramKind>('structure');
   const [renderError, setRenderError]       = useState<string | null>(null);
+  const [codeSource, setCodeSource] = useState<{ path: string; content: string; highlight: string } | null>(null);
+  const [callHierarchy, setCallHierarchy] = useState<{ path: string; mermaid: string } | null>(null);
+  const [projectTree, setProjectTree] = useState<ExplorerNode[]>([]);
+  const [ideWidth, setIdeWidth] = useState(520);
+  const [resizingIde, setResizingIde] = useState(false);
   const [drilldownActive, setDrilldownActive] = useState(false);
   const [drillDepth, setDrillDepth]           = useState(0);
   const [codeFlowActive, setCodeFlowActive]   = useState(false);
@@ -108,6 +130,7 @@ export default function App() {
   const [codeFlowLoading, setCodeFlowLoading] = useState(false);
   const [terminalMinimized, setTerminalMinimized] = useState(false);
   const [aiProvider, setAiProvider] = useState('claude');
+  const [analysisDepth, setAnalysisDepth] = useState<1 | 2 | 3>(2);
   const [aiProviders, setAiProviders] = useState<{ id: string; label: string }[]>([
     { id: 'claude', label: 'Claude' }, { id: 'codex', label: 'OpenAI Codex' }, { id: 'gemini', label: 'Google Gemini' },
   ]);
@@ -181,7 +204,22 @@ export default function App() {
       setAiProvider(provider);
       setAiProviders(providers);
     }).catch(() => undefined);
+    window.electronAPI.getAnalysisDepth().then(setAnalysisDepth).catch(() => undefined);
   }, []);
+
+  useEffect(() => {
+    if (!folder) { setProjectTree([]); return; }
+    window.electronAPI.getProjectFiles().then(result => setProjectTree(result.ok ? result.tree as ExplorerNode[] : [])).catch(() => setProjectTree([]));
+  }, [folder]);
+
+  useEffect(() => {
+    if (!resizingIde) return;
+    const move = (event: MouseEvent) => setIdeWidth(Math.max(320, Math.min(window.innerWidth - event.clientX - 14, window.innerWidth - 500)));
+    const up = () => setResizingIde(false);
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+    return () => { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); };
+  }, [resizingIde]);
   const excalidrawAPIRef   = useRef<ExcalidrawImperativeAPI | null>(null);
   const clearDrilldownRef  = useRef<(() => void) | null>(null);
   const clearCodeFlowRef   = useRef<(() => void) | null>(null);
@@ -320,6 +358,19 @@ export default function App() {
     await window.electronAPI.runAnalysis();
   }, [folder, status]);
 
+  const handleRelationships = useCallback(async () => {
+    if (!folder) return;
+    const result = await window.electronAPI.getRelationships();
+    if (!result.ok || !result.mermaid) { setRenderError(result.error ?? 'Could not build the local relationship graph'); return; }
+    clearDrilldownRef.current?.();
+    clearAllCodeFlowsRef.current?.();
+    setDiagramAndRecord({ pattern: `Local relationships — ${analysisDepth === 1 ? 'overview' : analysisDepth === 2 ? 'balanced' : 'deep'}`, diagrams: { structure: result.mermaid }, descriptions: {} });
+    setActiveKind('structure');
+    setSelectedComponent(null);
+    setSelectedComponents([]);
+    setRenderError(null);
+  }, [folder, analysisDepth, setDiagramAndRecord]);
+
   const handleCanvasCommand = useCallback(async (command: string) => {
     if (!folder) return;
     const canvasContext = canvasContextRef.current?.() ?? '';
@@ -357,9 +408,30 @@ export default function App() {
   }, [folder, selectedComponents, selectionQuestion, setDiagramAndRecord]);
 
   const handleSelectionChange = useCallback((names: string[]) => {
-    setSelectedComponents(names);
-    setSelectedComponent(names[0] ?? null);
+    const restoredNames = names.map(name => restoreSelectionLabel(name, diagram));
+    setSelectedComponents(restoredNames);
+    setSelectedComponent(restoredNames[0] ?? null);
     if (names.length === 0) setSelectionQuestionOpen(false);
+    const selected = restoredNames[0];
+    if (!selected) { setCodeSource(null); setCallHierarchy(null); return; }
+    void window.electronAPI.getComponentSource(selected).then(result => {
+      if (result.ok && result.path && result.content) {
+        setCodeSource({ path: result.path, content: result.content, highlight: result.highlight ?? selected });
+      } else {
+        setCodeSource(null);
+      }
+    }).catch(() => setCodeSource(null));
+    void window.electronAPI.getComponentHierarchy(selected).then(result => {
+      if (result.ok && result.path && result.mermaid) setCallHierarchy({ path: result.path, mermaid: result.mermaid });
+      else setCallHierarchy(null);
+    }).catch(() => setCallHierarchy(null));
+  }, [diagram]);
+
+  const handleExplorerFile = useCallback((filePath: string) => {
+    void window.electronAPI.getProjectFileSource(filePath).then(result => {
+      if (result.ok && result.path && result.content) setCodeSource({ path: result.path, content: result.content, highlight: '' });
+      else setRenderError(result.error ?? 'Could not open file');
+    });
   }, []);
 
   const folderName = folder ? folder.split('/').filter(Boolean).pop() : null;
@@ -495,7 +567,10 @@ export default function App() {
     }
   }, [folder, codeFlowLoading, setDiagramAndRecord]);
 
-  const canFlow = !!selectedComponent && !codeFlowLoading;
+  // The learning path should work for a newcomer before they know which node
+  // to select. A selection narrows Story/Implementation to one feature; no
+  // selection explains the whole project.
+  const canFlow = !!folder && !codeFlowLoading;
 
   const handleHistoryTabClick = useCallback(async () => {
     // If diagrams are showing, re-open the picker; if already open, do nothing
@@ -660,6 +735,27 @@ export default function App() {
           </select>
         </label>
 
+        <label title="Controls the detail level for every new user flow, Code Story, implementation map, and answer" style={{
+          display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0,
+          color: '#8888aa', fontSize: 10, fontFamily: 'system-ui, -apple-system, sans-serif',
+          // @ts-ignore
+          WebkitAppRegion: 'no-drag',
+        }}>
+          Depth
+          <input
+            type="range" min="1" max="3" step="1" value={analysisDepth}
+            onChange={(event) => {
+              const next = Number(event.target.value) as 1 | 2 | 3;
+              setAnalysisDepth(next);
+              window.electronAPI.setAnalysisDepth(next).then(setAnalysisDepth).catch(() => undefined);
+            }}
+            style={{ width: 58, accentColor: '#a78bfa', cursor: 'pointer' }}
+          />
+          <span style={{ color: '#d8d8ed', width: 54 }}>
+            {analysisDepth === 1 ? 'Overview' : analysisDepth === 2 ? 'Balanced' : 'Deep'}
+          </span>
+        </label>
+
         {/* Folder path */}
         <span style={{
           flex: 1, fontSize: 11, fontFamily: 'ui-monospace, monospace',
@@ -711,9 +807,9 @@ export default function App() {
 
         {/* Code Story button */}
         <button
-          onClick={handleCodeFlow}
+          onClick={() => { if (selectedComponent) void handleCodeFlow(); else void handleRepositoryCodeStory(); }}
           disabled={!canFlow}
-          title={selectedComponent ? `Explain how ${selectedComponent} works` : 'Select a component first'}
+          title={selectedComponent ? `Explain how ${selectedComponent} works in plain English` : 'Explain how the whole project works in plain English'}
           style={{
             display: 'flex', alignItems: 'center', gap: 6,
             padding: '5px 14px',
@@ -729,13 +825,13 @@ export default function App() {
           }}
         >
           <FlowIcon />
-          {codeFlowLoading ? 'Explaining…' : 'Code Story'}
+          {codeFlowLoading ? 'Explaining…' : selectedComponent ? 'Code Story' : 'Project Code Story'}
         </button>
 
         <button
-          onClick={handleImplementation}
+          onClick={() => { if (selectedComponent) void handleImplementation(); else void handleRepositoryImplementation(); }}
           disabled={!canFlow}
-          title={selectedComponent ? `Explain the implementation details of ${selectedComponent}` : 'Select a component first'}
+          title={selectedComponent ? `Show a clear guide to how ${selectedComponent} is built` : 'Show a clear guide to how the whole project is built'}
           style={{
             display: 'flex', alignItems: 'center', gap: 6, padding: '5px 14px',
             background: canFlow ? '#3b2a14' : '#13131f', border: `1px solid ${canFlow ? '#d97706' : '#2a2a50'}`, borderRadius: 6,
@@ -745,7 +841,7 @@ export default function App() {
             WebkitAppRegion: 'no-drag',
           }}
         >
-          <FlowIcon /> {codeFlowLoading ? 'Explaining…' : 'Implementation'}
+          <FlowIcon /> {codeFlowLoading ? 'Explaining…' : selectedComponent ? 'How it is built' : 'How the project is built'}
         </button>
 
         <button
@@ -781,8 +877,19 @@ export default function App() {
           Ask selected
         </button>
 
+        <button onClick={handleRelationships} disabled={!folder || busy} title="View the locally built file and import relationship graph" style={{
+          display: 'flex', alignItems: 'center', gap: 6, padding: '5px 12px',
+          background: '#172554', border: '1px solid #2563eb', borderRadius: 6, color: '#bfdbfe',
+          fontSize: 12, fontFamily: 'system-ui, -apple-system, sans-serif',
+          cursor: (!folder || busy) ? 'not-allowed' : 'pointer', opacity: (!folder || busy) ? 0.45 : 1, flexShrink: 0,
+          // @ts-ignore
+          WebkitAppRegion: 'no-drag',
+        }}>
+          ⟷ Relationships
+        </button>
+
         {/* Analyse */}
-        <button onClick={handleAnalyse} disabled={!folder || busy} title="Analyse this project and create its functional map" style={{
+        <button onClick={handleAnalyse} disabled={!folder || busy} title="Show what people can do with this project, in plain language" style={{
           display: 'flex', alignItems: 'center', gap: 6,
           padding: '5px 14px', background: '#5b21b6',
           border: '1px solid #7c3aed', borderRadius: 6,
@@ -794,7 +901,7 @@ export default function App() {
           WebkitAppRegion: 'no-drag',
         }}>
           <SparkleIcon />
-          {status === 'running' ? 'Analysing…' : status === 'patching' ? 'Updating…' : 'Analyse'}
+          {status === 'running' ? 'Finding user flows…' : status === 'patching' ? 'Updating…' : 'Analyse user flow'}
         </button>
       </div>
 
@@ -846,8 +953,8 @@ export default function App() {
 
         {/* Terminal */}
         <div style={{
-          width: terminalMinimized ? 32 : '38%',
-          minWidth: terminalMinimized ? 32 : 300,
+          width: terminalMinimized ? 32 : '28%',
+          minWidth: terminalMinimized ? 32 : 250,
           display: 'flex', flexDirection: 'column',
           background: '#0d0d1a', borderRadius: 10,
           border: '1px solid #2a2a4a', overflow: 'hidden',
@@ -1251,14 +1358,14 @@ export default function App() {
                 <button
                   onClick={handleImplementation}
                   disabled={codeFlowLoading}
-                  title="Show plain-language implementation details"
+                  title="Show a clear guide to how this is built"
                   style={{
                     display: 'flex', alignItems: 'center', gap: 4, padding: '4px 10px',
                     background: codeFlowLoading ? '#2a1d0b' : '#3b2a14', border: '1px solid #d97706', borderRadius: 6,
                     color: '#fcd34d', fontSize: 11, cursor: codeFlowLoading ? 'not-allowed' : 'pointer',
                   }}
                 >
-                  <FlowIcon /> {codeFlowLoading ? 'Explaining…' : 'Implementation'}
+                  <FlowIcon /> {codeFlowLoading ? 'Explaining…' : 'How it is built'}
                 </button>
                 <button
                   onClick={() => handleCanvasCommand(`Implement or improve the ${selectedComponent} component`)}
@@ -1602,6 +1709,42 @@ export default function App() {
                 </div>
               </div>
             )}
+          </div>
+        </div>
+
+        {/* Drag this divider to resize the IDE pane. */}
+        <div
+          onMouseDown={() => setResizingIde(true)}
+          title="Drag to resize IDE"
+          style={{ width: 6, margin: '0 -8px', cursor: 'col-resize', flexShrink: 0, zIndex: 5, background: resizingIde ? '#7c3aed' : 'transparent' }}
+        />
+
+        {/* Local source editor — follows the selected diagram component. */}
+        <div style={{
+          width: ideWidth, minWidth: 320, display: 'flex', flexDirection: 'column',
+          background: '#10101b', borderRadius: 10, border: '1px solid #2a2a4a', overflow: 'hidden', flexShrink: 0,
+        }}>
+          <div style={{ padding: '7px 11px', borderBottom: '1px solid #24243b', display: 'flex', alignItems: 'center', gap: 7, flexShrink: 0 }}>
+            <span style={{ color: '#a78bfa', fontSize: 12 }}>⌘</span>
+            <span style={{ color: '#b8b8d5', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.08em', fontFamily: 'system-ui, sans-serif' }}>Local source</span>
+            <span style={{ marginLeft: 'auto', color: '#777795', fontSize: 10, fontFamily: 'ui-monospace, monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{codeSource?.path ?? 'Select a diagram step'}</span>
+          </div>
+          <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
+            <aside style={{ width: 145, flexShrink: 0, overflowY: 'auto', borderRight: '1px solid #24243b', background: '#131321' }}>
+              <div style={{ padding: '8px 10px', color: '#777795', fontSize: 9, letterSpacing: '0.09em', textTransform: 'uppercase', fontFamily: 'system-ui, sans-serif' }}>Explorer</div>
+              <FileExplorer tree={projectTree} activePath={codeSource?.path} onOpen={handleExplorerFile} />
+              {projectTree.length === 0 && <div style={{ padding: '10px', color: '#666680', fontSize: 10 }}>Open a project to browse files.</div>}
+            </aside>
+            <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+              {callHierarchy && (
+                <div style={{ padding: '5px 10px', flexShrink: 0, borderBottom: '1px solid #24243b', background: '#171725', color: '#aaa8c8', fontSize: 10, fontFamily: 'system-ui, sans-serif' }}>
+                  Local call path is marked in the editor: <span style={{ color: '#c4b5fd' }}>↳ calls</span> shows what runs next; blue marks imports.
+                </div>
+              )}
+              <div style={{ flex: 1, minHeight: 0 }}>
+              <CodeEditor path={codeSource?.path} content={codeSource?.content} highlight={codeSource?.highlight} callHierarchy={callHierarchy?.mermaid} />
+              </div>
+            </div>
           </div>
         </div>
       </div>
