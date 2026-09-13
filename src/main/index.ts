@@ -1582,7 +1582,7 @@ function buildCodeStoryPrompt(name: string, sourceCode: string, hierarchyContext
 
 /** A second pass that reviews the first diagram as a developer new to this codebase. */
 function buildCodeStoryNewbieReviewPrompt(
-  name: string, sourceCode: string, hierarchyContext: string, candidate: { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] },
+  name: string, sourceCode: string, hierarchyContext: string, candidate: { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] }, usesPriorTurn = false,
 ): string {
   return [
     `You are a senior developer reviewing a "How it works" explanation of "${name}" for a teammate opening this codebase for the first time.`,
@@ -1604,8 +1604,10 @@ function buildCodeStoryNewbieReviewPrompt(
     '',
     'CANDIDATE TO IMPROVE:', JSON.stringify(candidate),
     '',
-    'SOURCE CODE:', sourceCode.slice(0, 9000),
-    hierarchyContext ? `\nSOURCE-PROVEN HIERARCHY AND GRAPH EVIDENCE:\n${hierarchyContext.slice(0, 8000)}` : '',
+    usesPriorTurn
+      ? 'SOURCE AND GRAPH EVIDENCE: Use the complete source code and hierarchy/Graphify evidence from the immediately preceding Code Story turn in this same project session. Do not invent details absent from that evidence.'
+      : `SOURCE CODE:\n${sourceCode.slice(0, 9000)}`,
+    !usesPriorTurn && hierarchyContext ? `\nSOURCE-PROVEN HIERARCHY AND GRAPH EVIDENCE:\n${hierarchyContext.slice(0, 8000)}` : '',
     '',
     'Replacement JSON only.',
   ].join('\n');
@@ -1940,7 +1942,7 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
     // that a newcomer needs to follow the implementation with confidence.
     if (shouldRunCodeStoryReview(sourceCode, parsed)) try {
       const reviewed = extractJson(await runCapture(
-        buildCodeStoryNewbieReviewPrompt(name, sourceCode, hierarchyContext, parsed),
+        buildCodeStoryNewbieReviewPrompt(name, sourceCode, hierarchyContext, parsed, getAiProvider() === 'claude'),
         currentFolder,
       )) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
       if (reviewed?.mermaid) {

@@ -3,6 +3,7 @@ import { BrowserWindow } from 'electron';
 import * as os from 'os';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
+import * as path from 'path';
 
 // Resolve claude binary — Electron strips PATH so we can't rely on bare 'claude'
 function findClaude(): string {
@@ -49,13 +50,34 @@ let ptyDataCallback: ((data: string) => void) | null = null;
 const initializedProjectSessions = new Set<string>();
 const captureQueues = new Map<string, Promise<void>>();
 const projectSessionIds = new Map<string, string>();
+const newlyCreatedProjectSessions = new Set<string>();
+const sessionStorePath = path.join(os.tmpdir(), 'rex-canvas-ai-sessions.json');
+let storedProjectSessions: Record<string, string> | null = null;
+
+function loadStoredSessions(): Record<string, string> {
+  if (storedProjectSessions) return storedProjectSessions;
+  try {
+    const value = JSON.parse(fs.readFileSync(sessionStorePath, 'utf8')) as Record<string, string>;
+    storedProjectSessions = value && typeof value === 'object' ? value : {};
+  } catch { storedProjectSessions = {}; }
+  return storedProjectSessions;
+}
+
+function saveStoredSessions() {
+  try { fs.writeFileSync(sessionStorePath, JSON.stringify(loadStoredSessions()), 'utf8'); } catch {}
+}
 
 function projectSessionId(cwd: string): string {
   let id = projectSessionIds.get(cwd);
   if (!id) {
-    // A fresh ID avoids colliding with a session left behind by an earlier app run.
-    id = crypto.randomUUID();
+    // Preserve one Claude conversation per project across app relaunches. This
+    // lets follow-up calls refer to already supplied project/source context.
+    const stored = loadStoredSessions()[cwd];
+    id = stored || crypto.randomUUID();
+    if (!stored) newlyCreatedProjectSessions.add(cwd);
     projectSessionIds.set(cwd, id);
+    loadStoredSessions()[cwd] = id;
+    saveStoredSessions();
   }
   return id;
 }
@@ -162,7 +184,7 @@ function runCaptureInProjectSession(prompt: string, cwd: string, provider: AiPro
     let cmd: string;
     if (provider === 'claude') {
       const sessionId = projectSessionId(sessionKey);
-      const sessionFlag = initializedProjectSessions.has(sessionKey)
+      const sessionFlag = (initializedProjectSessions.has(sessionKey) || (!!loadStoredSessions()[sessionKey] && !newlyCreatedProjectSessions.has(sessionKey)))
         ? '--resume ' + sessionId
         : '--session-id ' + sessionId;
       cmd = CLAUDE_BIN + ' --print ' + sessionFlag + ' < "' + tmpFile + '"';
