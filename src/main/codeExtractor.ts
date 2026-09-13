@@ -32,7 +32,7 @@ const IGNORE_DIRS = new Set([
   'node_modules', 'dist', 'build', '.git', '.dart_tool', '.idea',
   'coverage', '__pycache__', '.gradle', 'Pods', '.expo',
   '.next', '.nuxt', 'out', 'target', 'bin', 'obj', '.vs',
-  '.build', 'DerivedData', 'xcuserdata',
+  '.build', 'DerivedData', 'xcuserdata', 'graphify-out',
 ]);
 
 const SOURCE_EXTS = new Set([

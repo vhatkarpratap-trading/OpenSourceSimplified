@@ -310,9 +310,11 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
       }
       const isChanged = CHANGED_FILLS.has((el.backgroundColor || '').toLowerCase());
 
-      // Expand height if we have a description for this node
+      // Mermaid owns the layout. Keep explanatory descriptions out of the
+      // canvas scene: adding them after the Mermaid layout pass expands nodes
+      // without moving connected nodes or arrows, causing overlaps.
       const label = containerLabel.get(el.id);
-      const desc = label ? (descNorm[label.toLowerCase()] ?? null) : null;
+      const desc = null;
       const isRequestContract = /^REQ\s*(?:—|-|:)/i.test(label || '');
       const isResponseContract = /^RES\s*(?:—|-|:)/i.test(label || '');
       const box = el as ExcalidrawElement & { x: number; y: number; width: number; height: number };

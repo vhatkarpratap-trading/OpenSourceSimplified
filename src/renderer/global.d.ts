@@ -60,10 +60,6 @@ export interface PRReviewResult {
 declare global {
   interface Window {
     electronAPI: {
-      ptyWrite: (data: string) => void;
-      ptyResize: (cols: number, rows: number) => void;
-      onPtyData: (cb: (data: string) => void) => void;
-      onPtyExit: (cb: () => void) => void;
       openFolder: () => Promise<{ folder: string; hasCachedDiagram: boolean } | null>;
       clearProjectCache: () => Promise<{ ok: boolean; error?: string }>;
       getAiProvider: () => Promise<{ provider: string; providers: { id: string; label: string }[] }>;
@@ -71,14 +67,13 @@ declare global {
       getAnalysisDepth: () => Promise<1 | 2 | 3>;
       setAnalysisDepth: (depth: 1 | 2 | 3) => Promise<1 | 2 | 3>;
       getRelationships: () => Promise<{ ok: boolean; mermaid?: string; error?: string }>;
-      getProjectFiles: () => Promise<{ ok: boolean; tree: unknown[]; error?: string }> ;
-      getProjectFileSource: (path: string) => Promise<{ ok: boolean; path?: string; content?: string; error?: string }> ;
       runAnalysis: () => Promise<{ ok?: boolean; error?: string }>;
+      buildGraphAndAnalyse: () => Promise<{ ok: boolean; error?: string; nodeCount?: number; edgeCount?: number; analysis?: { ok?: boolean; error?: string } }> ;
       getComponentDetail: (name: string) => Promise<{ ok?: boolean; error?: string; detail?: ComponentDetail }>;
-      getComponentSource: (name: string) => Promise<{ ok: boolean; path?: string; content?: string; highlight?: string; error?: string }> ;
-      getComponentHierarchy: (name: string) => Promise<{ ok: boolean; path?: string; mermaid?: string; error?: string }> ;
       getComponentDrilldown: (name: string) => Promise<{ ok?: boolean; error?: string; mermaid?: string }>;
       getComponentCodeFlow: (name: string, drillMermaid?: string) => Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] }> ;
+      getComponentSource: (name: string) => Promise<{ ok: boolean; error?: string; files?: Array<{ path: string; content: string; highlight?: string }> }> ;
+      getActualCodeFlow: (name: string) => Promise<{ ok: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] }> ;
       getComponentImplementation: (name: string, drillMermaid?: string) => Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] }>;
       getArchitectureStory: () => Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string> }>;
       getRepositoryImplementation: () => Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string> }> ;
@@ -106,7 +101,6 @@ declare global {
       // Change context
       onChangeContext: (cb: (nodes: ChangeContextNode[]) => void) => void;
       // Build/test error annotations
-      onErrorAnnotations: (cb: (annotations: { node: string; error: string }[]) => void) => void;
       // MCP
       onMcpGetCanvasState: (cb: (data: { replyChannel: string }) => void) => void;
       answerMcpGetCanvasState: (replyChannel: string, state: string) => void;

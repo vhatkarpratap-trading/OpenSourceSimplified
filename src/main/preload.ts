@@ -1,16 +1,6 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
-  // Terminal PTY
-  ptyWrite: (data: string) => ipcRenderer.send('pty:write', data),
-  ptyResize: (cols: number, rows: number) => ipcRenderer.send('pty:resize', cols, rows),
-  onPtyData: (callback: (data: string) => void) => {
-    ipcRenderer.on('pty:data', (_event: unknown, data: string) => callback(data));
-  },
-  onPtyExit: (callback: () => void) => {
-    ipcRenderer.on('pty:exit', () => callback());
-  },
-
   // Folder
   openFolder: (): Promise<{ folder: string; hasCachedDiagram: boolean } | null> =>
     ipcRenderer.invoke('folder:open'),
@@ -27,22 +17,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('analysis:setDepth', depth),
   getRelationships: (): Promise<{ ok: boolean; mermaid?: string; error?: string }> =>
     ipcRenderer.invoke('project:relationships'),
-  getProjectFiles: (): Promise<{ ok: boolean; tree: unknown[]; error?: string }> =>
-    ipcRenderer.invoke('project:files'),
-  getProjectFileSource: (path: string): Promise<{ ok: boolean; path?: string; content?: string; error?: string }> =>
-    ipcRenderer.invoke('project:fileSource', path),
 
   // Analysis
   runAnalysis: (): Promise<{ ok?: boolean; error?: string }> =>
     ipcRenderer.invoke('analysis:run'),
+  buildGraphAndAnalyse: (): Promise<{ ok: boolean; error?: string; nodeCount?: number; edgeCount?: number; analysis?: { ok?: boolean; error?: string } }> =>
+    ipcRenderer.invoke('graphify:buildAndAnalyse'),
 
   // Click-to-inspect: fetch kid-friendly detail for one component
   getComponentDetail: (name: string): Promise<{ ok?: boolean; error?: string; detail?: unknown }> =>
     ipcRenderer.invoke('component:detail', name),
-  getComponentSource: (name: string): Promise<{ ok: boolean; path?: string; content?: string; highlight?: string; error?: string }> =>
-    ipcRenderer.invoke('component:source', name),
-  getComponentHierarchy: (name: string): Promise<{ ok: boolean; path?: string; mermaid?: string; error?: string }> =>
-    ipcRenderer.invoke('component:hierarchy', name),
 
   // Double-click drilldown: fetch a detailed sub-diagram for one component
   getComponentDrilldown: (name: string): Promise<{ ok?: boolean; error?: string; mermaid?: string }> =>
@@ -51,6 +35,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Code flow: structured class/function/data trace rendered onto the canvas
   getComponentCodeFlow: (name: string, drillMermaid?: string): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] }> =>
     ipcRenderer.invoke('component:codeflow', name, drillMermaid),
+  getComponentSource: (name: string): Promise<{ ok: boolean; error?: string; files?: Array<{ path: string; content: string; highlight?: string }> }> =>
+    ipcRenderer.invoke('component:source', name),
+  getActualCodeFlow: (name: string): Promise<{ ok: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] }> =>
+    ipcRenderer.invoke('component:actualCodeFlow', name),
   getComponentImplementation: (name: string, drillMermaid?: string): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] }> =>
     ipcRenderer.invoke('component:implementation', name, drillMermaid),
 
@@ -171,8 +159,4 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('canvas:changeContext', (_event: unknown, nodes: unknown[]) => cb(nodes));
   },
 
-  // Build/test error annotations
-  onErrorAnnotations: (cb: (annotations: unknown[]) => void) => {
-    ipcRenderer.on('canvas:errorAnnotations', (_event: unknown, annotations: unknown[]) => cb(annotations));
-  },
 });

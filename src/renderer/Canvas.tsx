@@ -20,7 +20,7 @@ interface CanvasProps {
   clearCodeFlowRef?: React.MutableRefObject<(() => void) | null>;
   clearAllCodeFlowsRef?: React.MutableRefObject<(() => void) | null>;
   renderDrilldownRef?: React.MutableRefObject<((name: string) => void) | null>;
-  renderCodeFlowRef?: React.MutableRefObject<((name: string, mode?: 'story' | 'implementation', drillMermaid?: string) => Promise<void>) | null>;
+  renderCodeFlowRef?: React.MutableRefObject<((name: string, mode?: 'story' | 'implementation' | 'actual', drillMermaid?: string) => Promise<void>) | null>;
   canvasContextRef?: React.MutableRefObject<(() => string) | null>;
   rawElementsRef?: React.MutableRefObject<(() => unknown[]) | null>;
   renderCommitDiffRef?: React.MutableRefObject<((diff: CommitDiffResult) => Promise<void>) | null>;
@@ -944,7 +944,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     if (renderDrilldownRef) renderDrilldownRef.current = renderDrilldown;
   }, [renderDrilldown, renderDrilldownRef]);
 
-  const renderCodeFlow = useCallback(async (rawName: string, mode: 'story' | 'implementation' = 'story', drillMermaid = '') => {
+  const renderCodeFlow = useCallback(async (rawName: string, mode: 'story' | 'implementation' | 'actual' = 'story', drillMermaid = '') => {
     const name = rawName.trim();
     const api = apiRef.current;
     if (!api) return;
@@ -983,7 +983,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     }, {
       type: 'text', id: `flow-loading-text-${seed}`,
       x: loadX + 10, y: loadY + 11, width: 220, height: 18,
-      text: `${mode === 'implementation' ? 'Explaining implementation' : 'Tracing behavior'} of ${name}…`, originalText: `${mode === 'implementation' ? 'Explaining implementation' : 'Tracing behavior'} of ${name}…`,
+      text: `${mode === 'actual' ? 'Tracing source code' : mode === 'implementation' ? 'Explaining implementation' : 'Tracing behavior'} of ${name}…`, originalText: `${mode === 'actual' ? 'Tracing source code' : mode === 'implementation' ? 'Explaining implementation' : 'Tracing behavior'} of ${name}…`,
       fontSize: 12, fontFamily: 1, textAlign: 'left', verticalAlign: 'top',
       strokeColor: '#15803d', backgroundColor: 'transparent',
       fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid',
@@ -995,9 +995,11 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     api.updateScene({ elements: [...currentEls, ...loadingEls] as unknown as EXEl[] });
 
     try {
-      const res = mode === 'implementation'
-        ? await window.electronAPI.getComponentImplementation(name, drillMermaid)
-        : await window.electronAPI.getComponentCodeFlow(name, drillMermaid);
+      const res = mode === 'actual'
+        ? await window.electronAPI.getActualCodeFlow(name)
+        : mode === 'implementation'
+          ? await window.electronAPI.getComponentImplementation(name, drillMermaid)
+          : await window.electronAPI.getComponentCodeFlow(name, drillMermaid);
       console.log('[codeflow] ok:', res?.ok, 'error:', res?.error);
       if (!res?.ok || !res.mermaid) throw new Error(res?.error || 'no mermaid');
       onImplementationExplanations?.(mode === 'implementation' ? (res.descriptions ?? {}) : null);
@@ -1186,7 +1188,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
         startBinding: null, endBinding: null, roundness: { type: 2 }, elbowed: false,
       }] : [];
 
-      const title = mode === 'implementation' ? 'How this is built' : 'Code Story';
+      const title = mode === 'actual' ? 'Actual Code Flow' : mode === 'implementation' ? 'Implementation story' : 'Code Story';
       const labelText = happyPath.length > 0
         ? `⟳ ${title}: ${name}  ·  🔴 = main path (read in order)`
         : `⟳ ${title}: ${name}`;

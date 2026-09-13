@@ -1,30 +1,9 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import type { ExcalidrawImperativeAPI } from '@excalidraw/excalidraw/types/types';
-import Terminal from './Terminal';
 import Canvas from './Canvas';
 import MermaidRenderer from './MermaidRenderer';
-import CodeEditor from './CodeEditor';
-import FileExplorer, { ExplorerNode } from './FileExplorer';
 import { DiagramData, DiagramKind } from './diagramBuilder';
 import type { CommitInfo, CommitDiffResult, PRInfo, PRReviewResult, ChangeContextNode } from './global';
-
-// Diagram types that render natively via mermaid SVG (not Excalidraw shapes)
-const NATIVE_MERMAID_PREFIXES = [
-  'sequencediagram', 'classdiagram', 'statediagram', 'erdiagram',
-  'gantt', 'pie', 'gitgraph', 'mindmap', 'timeline', 'xychart',
-  'kanban', 'block', 'sankey', 'quadrantchart', 'requirementdiagram',
-  'c4context', 'c4container', 'c4component',
-];
-
-function getDiagramTypePrefix(mermaid: string): string {
-  return mermaid.trim().split('\n')[0].trim().toLowerCase().replace(/\s.*$/, '');
-}
-
-function isNativeMermaid(mermaid: string | undefined): boolean {
-  if (!mermaid) return false;
-  const prefix = getDiagramTypePrefix(mermaid);
-  return NATIVE_MERMAID_PREFIXES.some(p => prefix.startsWith(p));
-}
 
 const DIAGRAM_TYPES: { id: string; label: string; emoji: string; description: string; template: string }[] = [
   { id: 'flowchart', label: 'Flow Chart', emoji: '⬡', description: 'Steps, decisions, processes',
@@ -62,10 +41,6 @@ function extractNodeNamesFromDiagram(diagram: DiagramData | null): string[] {
   return Array.from(names).filter(n => n && !/^(TD|LR|TB|RL|flowchart|classDef|changed)$/i.test(n));
 }
 
-// Excalidraw can split a long Mermaid label across text elements.  Its click
-// callback then gives us only the first part of the label, while descriptions
-// retain the exact label emitted by the analysis.  Restore that complete name
-// before using it to locate local source code.
 function restoreSelectionLabel(name: string, diagram: DiagramData | null): string {
   const compact = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
   const selected = compact(name);
@@ -112,11 +87,6 @@ export default function App() {
   } | null>(null);
   const [activeKind, setActiveKind]         = useState<DiagramKind>('structure');
   const [renderError, setRenderError]       = useState<string | null>(null);
-  const [codeSource, setCodeSource] = useState<{ path: string; content: string; highlight: string } | null>(null);
-  const [callHierarchy, setCallHierarchy] = useState<{ path: string; mermaid: string } | null>(null);
-  const [projectTree, setProjectTree] = useState<ExplorerNode[]>([]);
-  const [ideWidth, setIdeWidth] = useState(520);
-  const [resizingIde, setResizingIde] = useState(false);
   const [drilldownActive, setDrilldownActive] = useState(false);
   const [drillDepth, setDrillDepth]           = useState(0);
   const [codeFlowActive, setCodeFlowActive]   = useState(false);
@@ -128,7 +98,10 @@ export default function App() {
   const [selectionAnswering, setSelectionAnswering] = useState(false);
   const [drilling, setDrilling]               = useState(false);
   const [codeFlowLoading, setCodeFlowLoading] = useState(false);
-  const [terminalMinimized, setTerminalMinimized] = useState(false);
+  const [sourcePanelOpen, setSourcePanelOpen] = useState(false);
+  const [sourceView, setSourceView] = useState<{ files?: Array<{ path: string; content: string; highlight?: string }>; error?: string } | null>(null);
+  const [sourceFileIndex, setSourceFileIndex] = useState(0);
+  const [graphBuilding, setGraphBuilding] = useState(false);
   const [aiProvider, setAiProvider] = useState('claude');
   const [analysisDepth, setAnalysisDepth] = useState<1 | 2 | 3>(2);
   const [aiProviders, setAiProviders] = useState<{ id: string; label: string }[]>([
@@ -182,9 +155,6 @@ export default function App() {
   const [changeContext, setChangeContext]         = useState<ChangeContextNode[] | null>(null);
   const [changeContextOpen, setChangeContextOpen] = useState(false);
 
-  // Terminal error annotations
-  const [errorAnnotations, setErrorAnnotations] = useState<{ node: string; error: string }[]>([]);
-
   const typePickerRef = useRef<HTMLDivElement>(null);
 
   // Close type picker when clicking outside
@@ -207,25 +177,12 @@ export default function App() {
     window.electronAPI.getAnalysisDepth().then(setAnalysisDepth).catch(() => undefined);
   }, []);
 
-  useEffect(() => {
-    if (!folder) { setProjectTree([]); return; }
-    window.electronAPI.getProjectFiles().then(result => setProjectTree(result.ok ? result.tree as ExplorerNode[] : [])).catch(() => setProjectTree([]));
-  }, [folder]);
-
-  useEffect(() => {
-    if (!resizingIde) return;
-    const move = (event: MouseEvent) => setIdeWidth(Math.max(320, Math.min(window.innerWidth - event.clientX - 14, window.innerWidth - 500)));
-    const up = () => setResizingIde(false);
-    document.addEventListener('mousemove', move);
-    document.addEventListener('mouseup', up);
-    return () => { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); };
-  }, [resizingIde]);
   const excalidrawAPIRef   = useRef<ExcalidrawImperativeAPI | null>(null);
   const clearDrilldownRef  = useRef<(() => void) | null>(null);
   const clearCodeFlowRef   = useRef<(() => void) | null>(null);
   const clearAllCodeFlowsRef = useRef<(() => void) | null>(null);
   const renderDrilldownRef = useRef<((name: string) => void) | null>(null);
-  const renderCodeFlowRef  = useRef<((name: string, mode?: 'story' | 'implementation', drillMermaid?: string) => Promise<void>) | null>(null);
+  const renderCodeFlowRef  = useRef<((name: string, mode?: 'story' | 'implementation' | 'actual', drillMermaid?: string) => Promise<void>) | null>(null);
   const canvasContextRef   = useRef<(() => string) | null>(null);
   const rawElementsRef     = useRef<(() => unknown[]) | null>(null);
   const renderCommitDiffRef = useRef<((diff: CommitDiffResult) => Promise<void>) | null>(null);
@@ -327,9 +284,6 @@ export default function App() {
       setChangeContextOpen(true);
     });
 
-    window.electronAPI.onErrorAnnotations((annotations) => {
-      setErrorAnnotations(annotations as { node: string; error: string }[]);
-    });
   }
 
   const handleOpenFolder = useCallback(async () => {
@@ -357,6 +311,17 @@ export default function App() {
     if (!folder || status === 'running' || status === 'patching') return;
     await window.electronAPI.runAnalysis();
   }, [folder, status]);
+
+  const handleBuildGraphAndAnalyse = useCallback(async () => {
+    if (!folder || graphBuilding || status === 'running' || status === 'patching') return;
+    setGraphBuilding(true);
+    setRenderError(null);
+    const result = await window.electronAPI.buildGraphAndAnalyse();
+    setGraphBuilding(false);
+    if (!result.ok || result.analysis?.error) {
+      setRenderError(result.error || result.analysis?.error || 'Could not build the Graphify code graph');
+    }
+  }, [folder, graphBuilding, status]);
 
   const handleRelationships = useCallback(async () => {
     if (!folder) return;
@@ -413,26 +378,8 @@ export default function App() {
     setSelectedComponent(restoredNames[0] ?? null);
     if (names.length === 0) setSelectionQuestionOpen(false);
     const selected = restoredNames[0];
-    if (!selected) { setCodeSource(null); setCallHierarchy(null); return; }
-    void window.electronAPI.getComponentSource(selected).then(result => {
-      if (result.ok && result.path && result.content) {
-        setCodeSource({ path: result.path, content: result.content, highlight: result.highlight ?? selected });
-      } else {
-        setCodeSource(null);
-      }
-    }).catch(() => setCodeSource(null));
-    void window.electronAPI.getComponentHierarchy(selected).then(result => {
-      if (result.ok && result.path && result.mermaid) setCallHierarchy({ path: result.path, mermaid: result.mermaid });
-      else setCallHierarchy(null);
-    }).catch(() => setCallHierarchy(null));
+    if (!selected) return;
   }, [diagram]);
-
-  const handleExplorerFile = useCallback((filePath: string) => {
-    void window.electronAPI.getProjectFileSource(filePath).then(result => {
-      if (result.ok && result.path && result.content) setCodeSource({ path: result.path, content: result.content, highlight: '' });
-      else setRenderError(result.error ?? 'Could not open file');
-    });
-  }, []);
 
   const folderName = folder ? folder.split('/').filter(Boolean).pop() : null;
   const busy = status === 'running' || status === 'patching';
@@ -470,6 +417,17 @@ export default function App() {
     setCodeFlowDepth(d => d + 1);
     setCodeFlowLoading(false);
   }, [selectedComponent, codeFlowLoading]);
+
+  const handleActualCodeFlow = useCallback(async () => {
+    if (!selectedComponent) return;
+    setSourcePanelOpen(true);
+    setSourceFileIndex(0);
+    setSourceView({});
+    const result = await window.electronAPI.getComponentSource(selectedComponent);
+    setSourceView(result.ok
+      ? { files: result.files }
+      : { error: result.error ?? 'No matching source file was found.' });
+  }, [selectedComponent]);
 
   const handleImplementation = useCallback(async () => {
     if (!selectedComponent || codeFlowLoading) return;
@@ -685,10 +643,10 @@ export default function App() {
 
       {/* ── Toolbar ── */}
       <div style={{
-        display: 'flex', alignItems: 'center', gap: 10,
-        padding: '0 16px', height: 52,
-        background: '#13131f', borderBottom: '1px solid #1e1e3a',
-        flexShrink: 0,
+        display: 'flex', alignItems: 'center', alignContent: 'center', flexWrap: 'wrap', gap: 8,
+        padding: '8px 16px', minHeight: 76, boxSizing: 'border-box',
+        background: '#15151d', borderBottom: '1px solid #30303b',
+        flexShrink: 0, overflowX: 'auto',
         // @ts-ignore
         WebkitAppRegion: 'drag',
       }}>
@@ -697,9 +655,9 @@ export default function App() {
         {/* Open Project */}
         <button onClick={handleOpenFolder} style={{
           display: 'flex', alignItems: 'center', gap: 6,
-          padding: '5px 12px', background: '#1e1e3a',
-          border: '1px solid #2a2a50', borderRadius: 6,
-          color: '#cdd6f4', fontSize: 12,
+          padding: '6px 12px', background: '#23232d',
+          border: '1px solid #484854', borderRadius: 6,
+          color: '#ededf2', fontSize: 12,
           fontFamily: 'system-ui, -apple-system, sans-serif',
           cursor: 'pointer', flexShrink: 0,
           // @ts-ignore
@@ -709,9 +667,26 @@ export default function App() {
           Open Project
         </button>
 
+        <button
+          onClick={handleBuildGraphAndAnalyse}
+          disabled={!folder || graphBuilding || status === 'running' || status === 'patching'}
+          title="Build a local Graphify code graph, then analyse the project with it"
+          style={{
+            display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
+            background: folder && !graphBuilding && status !== 'running' && status !== 'patching' ? '#2b2b36' : '#1b1b24',
+            border: '1px solid #51515e', borderRadius: 6, color: '#ededf2', fontSize: 12,
+            fontFamily: 'system-ui, -apple-system, sans-serif', cursor: folder ? 'pointer' : 'not-allowed', flexShrink: 0,
+            opacity: folder ? 1 : 0.45,
+            // @ts-ignore
+            WebkitAppRegion: 'no-drag',
+          }}
+        >
+          ◈ {graphBuilding ? 'Building graph…' : 'Graphify + Analyse'}
+        </button>
+
         <label title="Choose the AI that handles new analysis and canvas questions" style={{
           display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0,
-          color: '#8888aa', fontSize: 10, fontFamily: 'system-ui, -apple-system, sans-serif',
+          color: '#a4a4b0', fontSize: 10, fontFamily: 'system-ui, -apple-system, sans-serif',
           // @ts-ignore
           WebkitAppRegion: 'no-drag',
         }}>
@@ -727,7 +702,7 @@ export default function App() {
               }).catch(() => setAiProvider(aiProvider));
             }}
             style={{
-              background: '#171725', border: '1px solid #36365a', borderRadius: 5, color: '#d8d8ed',
+              background: '#20202a', border: '1px solid #484854', borderRadius: 5, color: '#ededf2',
               fontSize: 11, padding: '4px 24px 4px 7px', cursor: 'pointer', outline: 'none',
             }}
           >
@@ -737,7 +712,7 @@ export default function App() {
 
         <label title="Controls the detail level for every new user flow, Code Story, implementation map, and answer" style={{
           display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0,
-          color: '#8888aa', fontSize: 10, fontFamily: 'system-ui, -apple-system, sans-serif',
+          color: '#a4a4b0', fontSize: 10, fontFamily: 'system-ui, -apple-system, sans-serif',
           // @ts-ignore
           WebkitAppRegion: 'no-drag',
         }}>
@@ -749,9 +724,9 @@ export default function App() {
               setAnalysisDepth(next);
               window.electronAPI.setAnalysisDepth(next).then(setAnalysisDepth).catch(() => undefined);
             }}
-            style={{ width: 58, accentColor: '#a78bfa', cursor: 'pointer' }}
+            style={{ width: 58, accentColor: '#d4d4dc', cursor: 'pointer' }}
           />
-          <span style={{ color: '#d8d8ed', width: 54 }}>
+          <span style={{ color: '#ededf2', width: 54 }}>
             {analysisDepth === 1 ? 'Overview' : analysisDepth === 2 ? 'Balanced' : 'Deep'}
           </span>
         </label>
@@ -759,7 +734,7 @@ export default function App() {
         {/* Folder path */}
         <span style={{
           flex: 1, fontSize: 11, fontFamily: 'ui-monospace, monospace',
-          color: '#6666aa', overflow: 'hidden',
+          color: '#9999a8', overflow: 'hidden', minWidth: 100,
           textOverflow: 'ellipsis', whiteSpace: 'nowrap', userSelect: 'none',
         }}>
           {folder ?? 'No project open'}
@@ -783,6 +758,9 @@ export default function App() {
           )}
         </div>
 
+        {/* Keep project settings separate from the workflow actions below. */}
+        <div style={{ flexBasis: '100%', height: 0 }} />
+
         {/* Drill button */}
         <button
           onClick={handleDrill}
@@ -790,9 +768,9 @@ export default function App() {
           title={selectedComponent ? `Drill into ${selectedComponent}` : 'Select a component first'}
           style={{
             display: 'flex', alignItems: 'center', gap: 6,
-            padding: '5px 14px', background: selectedComponent && !drilldownActive ? '#0f4c75' : '#13131f',
-            border: `1px solid ${selectedComponent && !drilldownActive ? '#1a73b5' : '#2a2a50'}`, borderRadius: 6,
-            color: selectedComponent && !drilldownActive ? '#bae6fd' : '#444466', fontSize: 12,
+            padding: '6px 12px', background: selectedComponent && !drilldownActive ? '#2b2b36' : '#1b1b24',
+            border: `1px solid ${selectedComponent && !drilldownActive ? '#51515e' : '#3b3b47'}`, borderRadius: 6,
+            color: selectedComponent && !drilldownActive ? '#ededf2' : '#777782', fontSize: 12,
             fontFamily: 'system-ui, -apple-system, sans-serif',
             cursor: selectedComponent && !drilldownActive ? 'pointer' : 'not-allowed',
             opacity: selectedComponent && !drilldownActive ? 1 : 0.45, flexShrink: 0,
@@ -812,10 +790,10 @@ export default function App() {
           title={selectedComponent ? `Explain how ${selectedComponent} works in plain English` : 'Explain how the whole project works in plain English'}
           style={{
             display: 'flex', alignItems: 'center', gap: 6,
-            padding: '5px 14px',
-            background: canFlow ? '#1a3a1a' : '#13131f',
-            border: `1px solid ${canFlow ? '#16a34a' : '#2a2a50'}`, borderRadius: 6,
-            color: canFlow ? '#86efac' : '#444466', fontSize: 12,
+            padding: '6px 12px',
+            background: canFlow ? '#2b2b36' : '#1b1b24',
+            border: `1px solid ${canFlow ? '#51515e' : '#3b3b47'}`, borderRadius: 6,
+            color: canFlow ? '#ededf2' : '#777782', fontSize: 12,
             fontFamily: 'system-ui, -apple-system, sans-serif',
             cursor: canFlow ? 'pointer' : 'not-allowed',
             opacity: canFlow ? 1 : 0.45, flexShrink: 0,
@@ -829,13 +807,30 @@ export default function App() {
         </button>
 
         <button
+          onClick={handleActualCodeFlow}
+          disabled={!selectedComponent || codeFlowLoading}
+          title={selectedComponent ? `Show source-proven classes, methods, and direct calls for ${selectedComponent}` : 'Select a component first'}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
+            background: selectedComponent && !codeFlowLoading ? '#1e3a8a' : '#1b1b24',
+            border: `1px solid ${selectedComponent && !codeFlowLoading ? '#3b82f6' : '#3b3b47'}`, borderRadius: 6,
+            color: selectedComponent && !codeFlowLoading ? '#dbeafe' : '#777782', fontSize: 12, fontFamily: 'system-ui, -apple-system, sans-serif',
+            cursor: selectedComponent && !codeFlowLoading ? 'pointer' : 'not-allowed', opacity: selectedComponent && !codeFlowLoading ? 1 : 0.45, flexShrink: 0,
+            // @ts-ignore
+            WebkitAppRegion: 'no-drag',
+          }}
+        >
+          <FlowIcon /> View actual code
+        </button>
+
+        <button
           onClick={() => { if (selectedComponent) void handleImplementation(); else void handleRepositoryImplementation(); }}
           disabled={!canFlow}
           title={selectedComponent ? `Show a clear guide to how ${selectedComponent} is built` : 'Show a clear guide to how the whole project is built'}
           style={{
-            display: 'flex', alignItems: 'center', gap: 6, padding: '5px 14px',
-            background: canFlow ? '#3b2a14' : '#13131f', border: `1px solid ${canFlow ? '#d97706' : '#2a2a50'}`, borderRadius: 6,
-            color: canFlow ? '#fcd34d' : '#444466', fontSize: 12, fontFamily: 'system-ui, -apple-system, sans-serif',
+            display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
+            background: canFlow ? '#2b2b36' : '#1b1b24', border: `1px solid ${canFlow ? '#51515e' : '#3b3b47'}`, borderRadius: 6,
+            color: canFlow ? '#ededf2' : '#777782', fontSize: 12, fontFamily: 'system-ui, -apple-system, sans-serif',
             cursor: canFlow ? 'pointer' : 'not-allowed', opacity: canFlow ? 1 : 0.45, flexShrink: 0,
             // @ts-ignore
             WebkitAppRegion: 'no-drag',
@@ -849,8 +844,8 @@ export default function App() {
           disabled={!folder || busy}
           title="Clear this project's saved analysis, drilldowns, stories, and implementation maps"
           style={{
-            padding: '5px 10px', background: '#2a1720', border: '1px solid #9f1239', borderRadius: 6,
-            color: '#fda4af', fontSize: 11, fontFamily: 'system-ui, -apple-system, sans-serif',
+            padding: '6px 10px', background: '#20202a', border: '1px solid #484854', borderRadius: 6,
+            color: '#c8c8d0', fontSize: 11, fontFamily: 'system-ui, -apple-system, sans-serif',
             cursor: (!folder || busy) ? 'not-allowed' : 'pointer', opacity: (!folder || busy) ? 0.45 : 1, flexShrink: 0,
             // @ts-ignore
             WebkitAppRegion: 'no-drag',
@@ -864,10 +859,10 @@ export default function App() {
           disabled={!selectedComponent}
           title={selectedComponent ? 'Ask a question about the selected component or components' : 'Select a component first'}
           style={{
-            display: 'flex', alignItems: 'center', gap: 6, padding: '5px 14px',
-            background: selectedComponent ? '#312e81' : '#13131f',
-            border: `1px solid ${selectedComponent ? '#6366f1' : '#2a2a50'}`, borderRadius: 6,
-            color: selectedComponent ? '#e0e7ff' : '#444466', fontSize: 12,
+            display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
+            background: selectedComponent ? '#2b2b36' : '#1b1b24',
+            border: `1px solid ${selectedComponent ? '#51515e' : '#3b3b47'}`, borderRadius: 6,
+            color: selectedComponent ? '#ededf2' : '#777782', fontSize: 12,
             fontFamily: 'system-ui, -apple-system, sans-serif',
             cursor: selectedComponent ? 'pointer' : 'not-allowed', opacity: selectedComponent ? 1 : 0.45, flexShrink: 0,
             // @ts-ignore
@@ -878,8 +873,8 @@ export default function App() {
         </button>
 
         <button onClick={handleRelationships} disabled={!folder || busy} title="View the locally built file and import relationship graph" style={{
-          display: 'flex', alignItems: 'center', gap: 6, padding: '5px 12px',
-          background: '#172554', border: '1px solid #2563eb', borderRadius: 6, color: '#bfdbfe',
+          display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
+          background: '#2b2b36', border: '1px solid #51515e', borderRadius: 6, color: '#ededf2',
           fontSize: 12, fontFamily: 'system-ui, -apple-system, sans-serif',
           cursor: (!folder || busy) ? 'not-allowed' : 'pointer', opacity: (!folder || busy) ? 0.45 : 1, flexShrink: 0,
           // @ts-ignore
@@ -891,9 +886,9 @@ export default function App() {
         {/* Analyse */}
         <button onClick={handleAnalyse} disabled={!folder || busy} title="Show what people can do with this project, in plain language" style={{
           display: 'flex', alignItems: 'center', gap: 6,
-          padding: '5px 14px', background: '#5b21b6',
-          border: '1px solid #7c3aed', borderRadius: 6,
-          color: '#ede9fe', fontSize: 12,
+          padding: '6px 12px', background: '#32323f',
+          border: '1px solid #626270', borderRadius: 6,
+          color: '#ffffff', fontSize: 12,
           fontFamily: 'system-ui, -apple-system, sans-serif',
           cursor: (!folder || busy) ? 'not-allowed' : 'pointer',
           opacity: (!folder || busy) ? 0.45 : 1, flexShrink: 0,
@@ -950,43 +945,6 @@ export default function App() {
 
       {/* ── Panes ── */}
       <div style={{ display: 'flex', flex: 1, padding: '10px', gap: 10, overflow: 'hidden' }}>
-
-        {/* Terminal */}
-        <div style={{
-          width: terminalMinimized ? 32 : '28%',
-          minWidth: terminalMinimized ? 32 : 250,
-          display: 'flex', flexDirection: 'column',
-          background: '#0d0d1a', borderRadius: 10,
-          border: '1px solid #2a2a4a', overflow: 'hidden',
-          transition: 'width 0.2s ease, min-width 0.2s ease',
-          flexShrink: 0,
-        }}>
-          <div style={{
-            padding: '6px 12px', fontSize: 10,
-            fontFamily: 'system-ui, -apple-system, sans-serif',
-            color: '#444466', letterSpacing: '0.1em',
-            textTransform: 'uppercase', borderBottom: '1px solid #1a1a30',
-            flexShrink: 0, userSelect: 'none',
-            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-          }}>
-            {!terminalMinimized && (folderName ? `Terminal · ${folderName}` : 'Terminal')}
-            <button
-              onClick={() => setTerminalMinimized(m => !m)}
-              title={terminalMinimized ? 'Expand terminal' : 'Minimize terminal'}
-              style={{
-                background: 'none', border: 'none', cursor: 'pointer',
-                color: '#444466', padding: '0 2px', lineHeight: 1,
-                fontSize: 14, display: 'flex', alignItems: 'center',
-                marginLeft: terminalMinimized ? 0 : 'auto',
-              }}
-            >
-              {terminalMinimized ? '▶' : '◀'}
-            </button>
-          </div>
-          <div style={{ flex: 1, overflow: 'hidden', padding: terminalMinimized ? 0 : 4, display: terminalMinimized ? 'none' : 'block' }}>
-            <Terminal onCanvasCommand={handleCanvasCommand} />
-          </div>
-        </div>
 
         {/* Canvas */}
         <div style={{
@@ -1356,6 +1314,19 @@ export default function App() {
                   <FlowIcon /> {codeFlowLoading ? 'Explaining…' : 'Story'}
                 </button>
                 <button
+                  onClick={handleActualCodeFlow}
+                  disabled={codeFlowLoading}
+                  title="Open the source code that represents this component"
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 4,
+                    padding: '4px 10px', background: codeFlowLoading ? '#172554' : '#1e3a8a',
+                    border: '1px solid #3b82f6', borderRadius: 6,
+                    color: '#bfdbfe', fontSize: 11, cursor: codeFlowLoading ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  <FlowIcon /> View code
+                </button>
+                <button
                   onClick={handleImplementation}
                   disabled={codeFlowLoading}
                   title="Show a clear guide to how this is built"
@@ -1421,12 +1392,6 @@ export default function App() {
                 </button>
               </div>
             )}
-            {isNativeMermaid(diagram?.diagrams?.structure) ? (
-              <MermaidRenderer
-                mermaid={diagram!.diagrams!.structure!}
-                title={diagram?.pattern}
-              />
-            ) : (
             <Canvas
               diagramData={diagram}
               activeKind={activeKind}
@@ -1446,10 +1411,54 @@ export default function App() {
               clearCommitDiffRef={clearCommitDiffRef}
               addNoteRef={addNoteRef}
               selectionAnswerRef={selectionAnswerRef}
-              errorAnnotations={errorAnnotations}
             />
-            )}
             </div>
+
+            {sourcePanelOpen && (
+              <aside style={{
+                width: '38%', minWidth: 360, maxWidth: 720, flexShrink: 0,
+                display: 'flex', flexDirection: 'column', overflow: 'hidden',
+                background: '#101217', borderLeft: '1px solid #303642',
+                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+              }}>
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: 8, padding: '9px 12px',
+                  background: '#171a21', borderBottom: '1px solid #303642', flexShrink: 0,
+                }}>
+                  <span style={{ color: '#93c5fd', fontSize: 11, fontFamily: 'system-ui, sans-serif', fontWeight: 700 }}>SOURCE</span>
+                  <span style={{ color: '#9ca3af', fontSize: 10, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                    {selectedComponent ? `Code for ${selectedComponent}` : 'Select a component'}
+                  </span>
+                  <button onClick={() => setSourcePanelOpen(false)} title="Close source browser" style={{ background: 'none', border: 0, color: '#9ca3af', cursor: 'pointer', fontSize: 16 }}>×</button>
+                </div>
+                {!!sourceView?.files?.length && (
+                  <div style={{ display: 'flex', gap: 3, overflowX: 'auto', padding: '6px 8px', borderBottom: '1px solid #303642', flexShrink: 0 }}>
+                    {sourceView.files.map((file, index) => (
+                      <button key={file.path} onClick={() => setSourceFileIndex(index)} title={file.path} style={{
+                        padding: '4px 7px', borderRadius: 4, border: '1px solid #334155', whiteSpace: 'nowrap',
+                        background: index === sourceFileIndex ? '#1e3a5f' : '#171a21', color: index === sourceFileIndex ? '#dbeafe' : '#94a3b8',
+                        fontSize: 10, fontFamily: 'ui-monospace, monospace', cursor: 'pointer',
+                      }}>{file.path.split('/').pop()}</button>
+                    ))}
+                  </div>
+                )}
+                <div style={{ overflow: 'auto', flex: 1, padding: '10px 0', color: '#d1d5db', fontSize: 12, lineHeight: 1.55 }}>
+                  {sourceView?.error ? (
+                    <div style={{ padding: '12px', color: '#fca5a5', fontFamily: 'system-ui, sans-serif' }}>{sourceView.error}</div>
+                  ) : !sourceView?.files?.[sourceFileIndex]?.content ? (
+                    <div style={{ padding: '12px', color: '#9ca3af', fontFamily: 'system-ui, sans-serif' }}>Loading source…</div>
+                  ) : sourceView.files[sourceFileIndex].content.split('\n').map((line, index) => {
+                    const matches = !!sourceView.files?.[sourceFileIndex]?.highlight && line.toLowerCase().includes(sourceView.files[sourceFileIndex].highlight!.toLowerCase());
+                    return (
+                      <div key={index} style={{ display: 'flex', background: matches ? '#1e3a5f' : 'transparent', minWidth: 'max-content' }}>
+                        <span style={{ width: 48, paddingRight: 12, textAlign: 'right', color: '#64748b', userSelect: 'none' }}>{index + 1}</span>
+                        <code style={{ whiteSpace: 'pre', color: matches ? '#fef3c7' : '#d1d5db' }}>{line || ' '}</code>
+                      </div>
+                    );
+                  })}
+                </div>
+              </aside>
+            )}
 
             {/* ── Canvas history panel ── */}
             {canvasHistoryOpen && canvasHistory.length > 0 && (
@@ -1589,36 +1598,6 @@ export default function App() {
               </div>
             )}
 
-            {/* ── Build/test error annotations panel ── */}
-            {errorAnnotations.length > 0 && (
-              <div style={{
-                width: 240, flexShrink: 0, borderLeft: '1px solid #fee2e2',
-                display: 'flex', flexDirection: 'column',
-                background: '#fffafa', overflowY: 'auto',
-              }}>
-                <div style={{
-                  padding: '8px 12px', borderBottom: '1px solid #fecaca',
-                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                  background: '#fff', flexShrink: 0,
-                }}>
-                  <span style={{ fontSize: 10, color: '#dc2626', textTransform: 'uppercase', letterSpacing: '0.08em', fontFamily: 'system-ui, sans-serif', fontWeight: 600 }}>
-                    Errors · {errorAnnotations.length}
-                  </span>
-                  <span onClick={() => setErrorAnnotations([])} style={{ fontSize: 11, color: '#aaa', cursor: 'pointer' }}>✕</span>
-                </div>
-                {errorAnnotations.map((ann, i) => (
-                  <div key={i} style={{ padding: '8px 12px', borderBottom: '1px solid #fef2f2' }}>
-                    <div style={{ fontSize: 11, fontWeight: 700, color: '#b91c1c', fontFamily: 'system-ui, sans-serif', marginBottom: 3 }}>
-                      {ann.node}
-                    </div>
-                    <div style={{ fontSize: 10, color: '#7f1d1d', fontFamily: 'ui-monospace, monospace', lineHeight: 1.5, wordBreak: 'break-all' }}>
-                      {ann.error}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-
             {/* ── Change story sidebar ── */}
             {prActive && prResult && (
               <div style={{
@@ -1712,41 +1691,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Drag this divider to resize the IDE pane. */}
-        <div
-          onMouseDown={() => setResizingIde(true)}
-          title="Drag to resize IDE"
-          style={{ width: 6, margin: '0 -8px', cursor: 'col-resize', flexShrink: 0, zIndex: 5, background: resizingIde ? '#7c3aed' : 'transparent' }}
-        />
-
-        {/* Local source editor — follows the selected diagram component. */}
-        <div style={{
-          width: ideWidth, minWidth: 320, display: 'flex', flexDirection: 'column',
-          background: '#10101b', borderRadius: 10, border: '1px solid #2a2a4a', overflow: 'hidden', flexShrink: 0,
-        }}>
-          <div style={{ padding: '7px 11px', borderBottom: '1px solid #24243b', display: 'flex', alignItems: 'center', gap: 7, flexShrink: 0 }}>
-            <span style={{ color: '#a78bfa', fontSize: 12 }}>⌘</span>
-            <span style={{ color: '#b8b8d5', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.08em', fontFamily: 'system-ui, sans-serif' }}>Local source</span>
-            <span style={{ marginLeft: 'auto', color: '#777795', fontSize: 10, fontFamily: 'ui-monospace, monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{codeSource?.path ?? 'Select a diagram step'}</span>
-          </div>
-          <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
-            <aside style={{ width: 145, flexShrink: 0, overflowY: 'auto', borderRight: '1px solid #24243b', background: '#131321' }}>
-              <div style={{ padding: '8px 10px', color: '#777795', fontSize: 9, letterSpacing: '0.09em', textTransform: 'uppercase', fontFamily: 'system-ui, sans-serif' }}>Explorer</div>
-              <FileExplorer tree={projectTree} activePath={codeSource?.path} onOpen={handleExplorerFile} />
-              {projectTree.length === 0 && <div style={{ padding: '10px', color: '#666680', fontSize: 10 }}>Open a project to browse files.</div>}
-            </aside>
-            <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
-              {callHierarchy && (
-                <div style={{ padding: '5px 10px', flexShrink: 0, borderBottom: '1px solid #24243b', background: '#171725', color: '#aaa8c8', fontSize: 10, fontFamily: 'system-ui, sans-serif' }}>
-                  Local call path is marked in the editor: <span style={{ color: '#c4b5fd' }}>↳ calls</span> shows what runs next; blue marks imports.
-                </div>
-              )}
-              <div style={{ flex: 1, minHeight: 0 }}>
-              <CodeEditor path={codeSource?.path} content={codeSource?.content} highlight={codeSource?.highlight} callHierarchy={callHierarchy?.mermaid} />
-              </div>
-            </div>
-          </div>
-        </div>
       </div>
     </div>
   );
