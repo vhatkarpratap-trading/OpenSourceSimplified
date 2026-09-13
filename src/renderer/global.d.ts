@@ -71,7 +71,7 @@ declare global {
       buildGraphAndAnalyse: () => Promise<{ ok: boolean; error?: string; nodeCount?: number; edgeCount?: number; analysis?: { ok?: boolean; error?: string } }> ;
       getComponentDetail: (name: string) => Promise<{ ok?: boolean; error?: string; detail?: ComponentDetail }>;
       getComponentDrilldown: (name: string) => Promise<{ ok?: boolean; error?: string; mermaid?: string }>;
-      getComponentCodeFlow: (name: string, drillMermaid?: string) => Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] }> ;
+      getComponentCodeFlow: (name: string, drillMermaid?: string) => Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; dataFlow?: Record<string, { input: string; output: string; change: string }>; happyPath?: string[] }> ;
       getComponentSource: (name: string) => Promise<{ ok: boolean; error?: string; files?: Array<{ path: string; content: string; highlight?: string }> }> ;
       getActualCodeFlow: (name: string) => Promise<{ ok: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] }> ;
       getComponentImplementation: (name: string, drillMermaid?: string) => Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] }>;

@@ -15,6 +15,7 @@ interface CanvasProps {
   onDrilldownChange?: (active: boolean) => void;
   onCodeFlowChange?: (active: boolean) => void;
   onImplementationExplanations?: (descriptions: Record<string, string> | null) => void;
+  onCodeStoryDataFlow?: (data: Record<string, { input: string; output: string; change: string }> | null) => void;
   onSelectionChange?: (names: string[]) => void;
   clearDrilldownRef?: React.MutableRefObject<(() => void) | null>;
   clearCodeFlowRef?: React.MutableRefObject<(() => void) | null>;
@@ -130,7 +131,7 @@ function applyZoomAndGit(
   });
 }
 
-export default function Canvas({ diagramData, activeKind = 'structure', onAPIReady, onRenderError, onDrilldownChange, onCodeFlowChange, onImplementationExplanations, onSelectionChange, clearDrilldownRef, clearCodeFlowRef, clearAllCodeFlowsRef, renderDrilldownRef, renderCodeFlowRef, canvasContextRef, rawElementsRef, renderCommitDiffRef, clearCommitDiffRef, addNoteRef, selectionAnswerRef, errorAnnotations }: CanvasProps) {
+export default function Canvas({ diagramData, activeKind = 'structure', onAPIReady, onRenderError, onDrilldownChange, onCodeFlowChange, onImplementationExplanations, onCodeStoryDataFlow, onSelectionChange, clearDrilldownRef, clearCodeFlowRef, clearAllCodeFlowsRef, renderDrilldownRef, renderCodeFlowRef, canvasContextRef, rawElementsRef, renderCommitDiffRef, clearCommitDiffRef, addNoteRef, selectionAnswerRef, errorAnnotations }: CanvasProps) {
   const [apiReady, setApiReady] = useState(false);
   const apiRef          = useRef<ExcalidrawImperativeAPI | null>(null);
   const lastDataRef     = useRef<DiagramData | null>(null);
@@ -1003,6 +1004,9 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       console.log('[codeflow] ok:', res?.ok, 'error:', res?.error);
       if (!res?.ok || !res.mermaid) throw new Error(res?.error || 'no mermaid');
       onImplementationExplanations?.(mode === 'implementation' ? (res.descriptions ?? {}) : null);
+      onCodeStoryDataFlow?.(mode === 'story'
+        ? ((('dataFlow' in res ? res.dataFlow : undefined) ?? {}) as Record<string, { input: string; output: string; change: string }>)
+        : null);
 
       const { buildMermaidScene: bms } = await import('./mermaidScene');
       const flowScene = await bms(res.mermaid, res.descriptions);

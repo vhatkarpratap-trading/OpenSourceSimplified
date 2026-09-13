@@ -55,6 +55,7 @@ function providerLabel() {
 // Drilldown results are cached inside the same file under `drilldowns[name]`.
 
 interface CodeFlowStep { fn: string; what: string; data: string }
+interface DataFlowSnapshot { input: string; output: string; change: string }
 
 interface CommitDiagram {
   featureFlow: { mermaid: string; descriptions?: Record<string, string> };
@@ -1554,12 +1555,19 @@ function buildCodeStoryPrompt(name: string, sourceCode: string, hierarchyContext
     '- Name conditional behaviour truthfully. If the source branches, show both meaningful outcomes with labels such as "valid data" and "missing data"; do not quietly present only the happy path.',
     '- Do not use function names, class names, variable names, file paths, or source code in the chart.',
     '- Edge labels are the data or decision in plain English: "answers", "missing field", "valid survey".',
+    '- Every main-path edge MUST name the data that moves to the next step, not a vague action. Examples: "raw PCM samples", "validated request", "normalized track record", "sync payload".',
     '',
     'DESCRIPTIONS:',
     '- Give every node two short sentences: first, what it means in everyday language; second, why this step is needed before the next one.',
     '- Every description must state the information interaction in this form: "Meaning: [plain-language state before] → [plain-language state after]. Why: [why this read, change, or send is needed]."',
     '- For a boundary node, add `Contract:` after Meaning: identify caller → receiver, transport (direct call, event, IPC, HTTP/REST, repository, or storage), input → result/error. For HTTP include `Endpoint: METHOD /path`, and for storage include `Record: proven key/fields or unknown`. Keep it factual and readable.',
     '- Do not mention code names, file paths, design patterns, or developer terminology in the reader-facing explanation.',
+    '',
+    'DATA SNAPSHOTS:',
+    '- For every main-path node, return dataFlow with a source-proven representative input and output shape plus the transformation. This is a visual before to after trace for a developer.',
+    '- Use the real type, serializer, mapper, request model, or fields from source when proven. Show compact JSON-like values, arrays, or typed records in the application format.',
+    '- If a field or shape is not proven, write "unknown (not exposed by source)"; never invent IDs, endpoints, field names, values, or payload formats.',
+    '- Keep each input/output under 300 characters. Redact secrets and credentials.',
     '',
     'MERMAID:',
     '- Start with flowchart TD.',
@@ -1571,7 +1579,7 @@ function buildCodeStoryPrompt(name: string, sourceCode: string, hierarchyContext
     'happyPath is the ordered list of node IDs for the main successful path.',
     '',
     'Schema:',
-    '{"mermaid":"flowchart TD string — use \\n for newlines","descriptions":{"Node Label":"Plain-English explanation of this step."},"happyPath":["nodeId1","nodeId2"]}',
+    '{"mermaid":"flowchart TD string — use \\n for newlines","descriptions":{"Node Label":"Plain-English explanation of this step."},"dataFlow":{"Node Label":{"input":"{...}","output":"{...}","change":"what changed"}},"happyPath":["nodeId1","nodeId2"]}',
     '',
     'SOURCE CODE of ' + name + ':',
     sourceCode.slice(0, 16000),
@@ -1582,7 +1590,7 @@ function buildCodeStoryPrompt(name: string, sourceCode: string, hierarchyContext
 
 /** A second pass that reviews the first diagram as a developer new to this codebase. */
 function buildCodeStoryNewbieReviewPrompt(
-  name: string, sourceCode: string, hierarchyContext: string, candidate: { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] }, usesPriorTurn = false,
+  name: string, sourceCode: string, hierarchyContext: string, candidate: { mermaid?: string; descriptions?: Record<string, string>; dataFlow?: Record<string, DataFlowSnapshot>; happyPath?: string[] }, usesPriorTurn = false,
 ): string {
   return [
     `You are a senior developer reviewing a "How it works" explanation of "${name}" for a teammate opening this codebase for the first time.`,
@@ -1597,10 +1605,11 @@ function buildCodeStoryNewbieReviewPrompt(
     '- Add meaningful success, empty, validation, and failure branches when source proves them. Do not add imagined errors.',
     '- Node labels remain short and readable. Put the detailed contract explanation in `descriptions`, one per node.',
     '- Each description must teach a newcomer: Meaning (before → after), Contract (when a boundary exists), and Why (why this step is necessary).',
+    '- Ensure every main-path node has a dataFlow entry with compact, source-proven input/output snapshots and a precise transformation. Use "unknown (not exposed by source)" instead of invented fields or values.',
     '- Keep 6–14 connected Mermaid nodes. Start with `flowchart TD`; use plain IDs and no subgraphs, styles, or code snippets.',
     '',
     'Schema:',
-    '{"mermaid":"flowchart TD string","descriptions":{"Node label":"Meaning: ... Contract: ... Why: ..."},"happyPath":["nodeId"]}',
+    '{"mermaid":"flowchart TD string","descriptions":{"Node label":"Meaning: ... Contract: ... Why: ..."},"dataFlow":{"Node label":{"input":"{...}","output":"{...}","change":"..."}},"happyPath":["nodeId"]}',
     '',
     'CANDIDATE TO IMPROVE:', JSON.stringify(candidate),
     '',
@@ -1880,7 +1889,7 @@ async function runRepositoryImplementation(): Promise<{ ok?: boolean; error?: st
   } catch (err: unknown) { return { error: err instanceof Error ? err.message : String(err) }; }
 }
 
-async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[]; fromCache?: boolean }> {
+async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; dataFlow?: Record<string, DataFlowSnapshot>; happyPath?: string[]; fromCache?: boolean }> {
   const name = rawName.trim();
   if (!currentFolder || !name) return { error: 'no component' };
   try {
@@ -1889,13 +1898,13 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
     const cachedValue = cached?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
       try {
-        const p = JSON.parse(cachedValue) as { version?: number; mermaid: string; descriptions?: Record<string, string>; happyPath: string[] };
+        const p = JSON.parse(cachedValue) as { version?: number; mermaid: string; descriptions?: Record<string, string>; dataFlow?: Record<string, DataFlowSnapshot>; happyPath: string[] };
         // Version 16 makes Code Story an independent internal explanation while grounding
         // the story in the locally extracted AST hierarchy and Graphify slice.
         // as well as source text, preventing inferred function relationships.
         // behaviour (inputs, decisions, effects, and results), rather than a
         // broad feature or user-flow map.
-        if (p?.version === 18 && p.mermaid) return { ok: true, mermaid: p.mermaid, descriptions: p.descriptions ?? {}, happyPath: p.happyPath ?? [], fromCache: true };
+        if (p?.version === 19 && p.mermaid) return { ok: true, mermaid: p.mermaid, descriptions: p.descriptions ?? {}, dataFlow: p.dataFlow ?? {}, happyPath: p.happyPath ?? [], fromCache: true };
       } catch {
         // Older raw-Mermaid entries were generated as user journeys, not code stories.
         // Ignore them so they are recreated with the current Code Story rules.
@@ -1935,7 +1944,7 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
       sourceCode,
       hierarchyContext,
     ), currentFolder);
-    let parsed = extractJson(raw) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
+    let parsed = extractJson(raw) as { mermaid?: string; descriptions?: Record<string, string>; dataFlow?: Record<string, DataFlowSnapshot>; happyPath?: string[] } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
 
     // The first pass establishes the flow; this second pass fills in contracts
@@ -1944,12 +1953,13 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
       const reviewed = extractJson(await runCapture(
         buildCodeStoryNewbieReviewPrompt(name, sourceCode, hierarchyContext, parsed, getAiProvider() === 'claude'),
         currentFolder,
-      )) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
+      )) as { mermaid?: string; descriptions?: Record<string, string>; dataFlow?: Record<string, DataFlowSnapshot>; happyPath?: string[] } | null;
       if (reviewed?.mermaid) {
         parsed = {
           ...parsed,
           ...reviewed,
           descriptions: reviewed.descriptions ?? parsed.descriptions,
+          dataFlow: reviewed.dataFlow ?? parsed.dataFlow,
           happyPath: reviewed.happyPath ?? parsed.happyPath,
         };
       }
@@ -1959,8 +1969,9 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
 
     const happyPath = parsed.happyPath ?? [];
     const descriptions = parsed.descriptions ?? {};
-    saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 18, mermaid: parsed.mermaid, descriptions, happyPath }));
-    return { ok: true, mermaid: parsed.mermaid, descriptions, happyPath };
+    const dataFlow = parsed.dataFlow ?? {};
+    saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 19, mermaid: parsed.mermaid, descriptions, dataFlow, happyPath }));
+    return { ok: true, mermaid: parsed.mermaid, descriptions, dataFlow, happyPath };
   } catch (err: unknown) {
     return { error: err instanceof Error ? err.message : String(err) };
   }
