@@ -7,7 +7,7 @@ import { execSync } from 'child_process';
 import { createPty, writeToPty, resizePty, killPty, restartPty, runCapture as runProviderCapture, setPtyDataCallback, getPtyCwd, getAiProvider, setAiProvider, AI_PROVIDERS, AiProvider } from './ptyManager';
 import { startFileWatcher, stopFileWatcher } from './fileWatcher';
 import { extractStructure, toClaudePromptJSON, ExtractedStructure } from './codeExtractor';
-import { buildGraphifyIndex, graphifyPromptContext } from './graphifyContext';
+import { buildGraphifyIndex, graphifyPromptContext, graphifySourceFiles } from './graphifyContext';
 import { startMcpServer, stopMcpServer, recordPtyOutput, updateClaudeJsonMcpConfig } from './mcpServer';
 import { listPRs, listLocalBranches, reviewPR, PRInfo } from './prReviewer';
 
@@ -1604,11 +1604,19 @@ function buildCodeStoryNewbieReviewPrompt(
     '',
     'CANDIDATE TO IMPROVE:', JSON.stringify(candidate),
     '',
-    'SOURCE CODE:', sourceCode.slice(0, 16000),
-    hierarchyContext ? `\nSOURCE-PROVEN HIERARCHY AND GRAPH EVIDENCE:\n${hierarchyContext.slice(0, 14000)}` : '',
+    'SOURCE CODE:', sourceCode.slice(0, 9000),
+    hierarchyContext ? `\nSOURCE-PROVEN HIERARCHY AND GRAPH EVIDENCE:\n${hierarchyContext.slice(0, 8000)}` : '',
     '',
     'Replacement JSON only.',
   ].join('\n');
+}
+
+function shouldRunCodeStoryReview(sourceCode: string, candidate: { mermaid?: string; descriptions?: Record<string, string> }): boolean {
+  // Deep mode requests the full newcomer audit. At lower depths, pay for it
+  // only when the local evidence crosses a contract boundary worth explaining.
+  if (analysisDepth === 3) return true;
+  const evidence = `${sourceCode}\n${candidate.mermaid ?? ''}\n${Object.values(candidate.descriptions ?? {}).join(' ')}`;
+  return /\b(https?|retrofit|okhttp|api|repository|dao|database|datastore|storage|sharedpreferences|ipc|socket|fetch|axios|service|insert|update|delete|select|emit|event)\b/i.test(evidence);
 }
 
 function buildImplementationPrompt(name: string, sourceCode: string, hierarchyContext = ''): string {
@@ -1885,7 +1893,7 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
         // as well as source text, preventing inferred function relationships.
         // behaviour (inputs, decisions, effects, and results), rather than a
         // broad feature or user-flow map.
-        if (p?.version === 17 && p.mermaid) return { ok: true, mermaid: p.mermaid, descriptions: p.descriptions ?? {}, happyPath: p.happyPath ?? [], fromCache: true };
+        if (p?.version === 18 && p.mermaid) return { ok: true, mermaid: p.mermaid, descriptions: p.descriptions ?? {}, happyPath: p.happyPath ?? [], fromCache: true };
       } catch {
         // Older raw-Mermaid entries were generated as user journeys, not code stories.
         // Ignore them so they are recreated with the current Code Story rules.
@@ -1903,10 +1911,10 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
       return { ok: true, mermaid: parsed.mermaid, descriptions, happyPath };
     }
 
-    const sourceFiles = findSourceFiles(name, structure.nodePaths, currentFolder, 6);
+    const sourceFiles = findSourceFiles(name, structure.nodePaths, currentFolder, 3);
 
     let sourceCode = '';
-    let budget = 16000;
+    let budget = 9000;
     for (const { filePath, content } of sourceFiles) {
       const rel = path.relative(currentFolder, filePath);
       const chunk = content.slice(0, budget);
@@ -1930,7 +1938,7 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
 
     // The first pass establishes the flow; this second pass fills in contracts
     // that a newcomer needs to follow the implementation with confidence.
-    try {
+    if (shouldRunCodeStoryReview(sourceCode, parsed)) try {
       const reviewed = extractJson(await runCapture(
         buildCodeStoryNewbieReviewPrompt(name, sourceCode, hierarchyContext, parsed),
         currentFolder,
@@ -1949,7 +1957,7 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
 
     const happyPath = parsed.happyPath ?? [];
     const descriptions = parsed.descriptions ?? {};
-    saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 17, mermaid: parsed.mermaid, descriptions, happyPath }));
+    saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 18, mermaid: parsed.mermaid, descriptions, happyPath }));
     return { ok: true, mermaid: parsed.mermaid, descriptions, happyPath };
   } catch (err: unknown) {
     return { error: err instanceof Error ? err.message : String(err) };
@@ -1966,28 +1974,39 @@ async function runComponentSource(rawName: string): Promise<{ ok: boolean; error
     const structure = extractStructure(currentFolder);
     const graphify = graphifyPromptContext(currentFolder, name);
     const sourceHash = hashStructure(toClaudePromptJSON(structure) + ':graphify:' + graphify.fingerprint);
-    const cacheKey = `__source_browser__:v3:${name}:${sourceHash}`;
+    const cacheKey = `__source_browser__:v4:${name}:${sourceHash}`;
     const isImplementationPath = (relPath: string) => {
       const normalized = relPath.replace(/\\/g, '/');
       return /\.(?:kt|kts|java|swift|m|mm|ts|tsx|js|jsx|dart|py|go|rs|cs|cpp|c|h)$/i.test(normalized)
         && !/(^|\/)(?:test|androidTest|build-logic|node_modules|dist|build|generated)(\/|$)/i.test(normalized);
     };
+    const queryTerms = name.toLowerCase().split(/[^a-z0-9]+/).filter(term => term.length >= 3);
     const availableFiles = Array.from(new Set(Object.values(structure.nodePaths)
       .map(filePath => path.relative(currentFolder!, filePath))
       .filter(isImplementationPath)))
       .sort((a, b) => {
-        const score = (value: string) => /(^|\/)(?:app|feature)(\/|$)/.test(value) ? 0 : /(^|\/)core(\/|$)/.test(value) ? 1 : 2;
-        return score(a) - score(b) || a.localeCompare(b);
+        const score = (value: string) => {
+          const lower = value.toLowerCase();
+          return (/(^|\/)(?:app|feature)(\/|$)/.test(value) ? 10 : /(^|\/)core(\/|$)/.test(value) ? 4 : 0)
+            + queryTerms.filter(term => lower.includes(term)).length * 20;
+        };
+        return score(b) - score(a) || a.localeCompare(b);
       })
-      .slice(0, 700);
+      .slice(0, 180);
     const availableSet = new Set(availableFiles);
     let paths: string[] = [];
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
       try {
         const cached = JSON.parse(cachedValue) as { version?: number; files?: string[] };
-        if (cached.version === 3 && Array.isArray(cached.files)) paths = cached.files.filter(isImplementationPath);
+        if (cached.version === 4 && Array.isArray(cached.files)) paths = cached.files.filter(isImplementationPath);
       } catch { /* resolve again */ }
+    }
+
+    if (paths.length === 0) {
+      // Graphify is a local, source-proven index. Prefer it before spending an
+      // AI request on a filename inference.
+      paths = graphifySourceFiles(currentFolder, name, 4).filter(candidate => availableSet.has(candidate));
     }
 
     if (paths.length === 0) {
@@ -2012,8 +2031,9 @@ async function runComponentSource(rawName: string): Promise<{ ok: boolean; error
         .map(source => path.relative(currentFolder!, source.filePath))
         .filter(isImplementationPath)
         .slice(0, 4);
-      saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 3, files: paths }));
     }
+    // Persist both local Graphify resolutions and AI fallbacks.
+    if (paths.length > 0) saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 4, files: paths }));
 
     const root = path.resolve(currentFolder);
     const files = paths.slice(0, 4).flatMap(relPath => {

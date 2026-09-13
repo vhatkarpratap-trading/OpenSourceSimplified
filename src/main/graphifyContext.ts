@@ -62,6 +62,27 @@ export async function buildGraphifyIndex(folder: string, onStatus: (message: str
   return { ok: true, nodeCount: context.nodeCount, edgeCount: context.edgeCount };
 }
 
+/** Return locally-proven source files near a focused graph symbol without an AI call. */
+export function graphifySourceFiles(folder: string, focus: string, max = 4): string[] {
+  const graph = parse(folder);
+  if (!graph) return [];
+  const terms = text(focus).toLowerCase().split(/[^a-z0-9]+/).filter(term => term.length >= 3);
+  const ranked = graph.nodes
+    .filter(node => !!node.sourceFile)
+    .map(node => {
+      const haystack = `${node.label} ${node.sourceFile}`.toLowerCase();
+      const score = (haystack.includes(text(focus).toLowerCase()) ? 20 : 0)
+        + terms.filter(term => haystack.includes(term)).length;
+      return { node, score };
+    })
+    .filter(item => item.score > 0)
+    .sort((a, b) => b.score - a.score);
+  return Array.from(new Set(ranked.map(({ node }) => {
+    const source = node.sourceFile!;
+    return path.normalize(path.isAbsolute(source) ? path.relative(folder, source) : source).replace(/\\/g, '/');
+  }))).slice(0, max);
+}
+
 function parse(folder: string): { nodes: GraphNode[]; edges: GraphEdge[]; fingerprint: string } | null {
   const file = graphFile(folder);
   try {
@@ -110,21 +131,21 @@ export function graphifyPromptContext(folder: string, focus?: string): GraphifyP
     const score = (haystack.includes(query) ? 20 : 0) + queryTerms.filter(term => haystack.includes(term)).length;
     return { node, score };
   }).filter(match => match.score > 0).sort((a, b) => b.score - a.score).map(match => match.node) : [];
-  const seeds = (matched.length ? matched : rankedNodes).slice(0, query ? 12 : 36);
+  const seeds = (matched.length ? matched : rankedNodes).slice(0, query ? 8 : 20);
   const selected = new Set(seeds.map(node => node.id));
   // Two expansion passes retain direct evidence around a selected component
   // without injecting an entire repository graph into the model context.
-  for (let pass = 0; pass < (query ? 2 : 1) && selected.size < 56; pass++) {
+  for (let pass = 0; pass < (query ? 2 : 1) && selected.size < (query ? 28 : 32); pass++) {
     for (const edge of graph.edges) {
       if (selected.has(edge.source) || selected.has(edge.target)) {
         selected.add(edge.source); selected.add(edge.target);
-        if (selected.size >= 56) break;
+        if (selected.size >= (query ? 28 : 32)) break;
       }
     }
   }
-  const nodes = graph.nodes.filter(node => selected.has(node.id)).slice(0, 56);
+  const nodes = graph.nodes.filter(node => selected.has(node.id)).slice(0, query ? 28 : 32);
   const ids = new Set(nodes.map(node => node.id));
-  const edges = graph.edges.filter(edge => ids.has(edge.source) && ids.has(edge.target)).slice(0, 110);
+  const edges = graph.edges.filter(edge => ids.has(edge.source) && ids.has(edge.target)).slice(0, query ? 48 : 64);
   const payload = {
     nodes: nodes.map(node => ({ id: node.id, label: node.label, source_file: node.sourceFile, file_type: node.fileType })),
     edges: edges.map(edge => ({ source: edge.source, target: edge.target, relation: edge.relation, confidence: edge.confidence, confidence_score: edge.score, source_file: edge.sourceFile })),
