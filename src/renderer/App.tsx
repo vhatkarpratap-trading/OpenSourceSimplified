@@ -474,7 +474,8 @@ export default function App() {
   }, [selectedComponent, codeFlowLoading]);
 
   const handleRepositoryCodeStory = useCallback(async () => {
-    if (!folder || codeFlowLoading) return;
+    if (!folder || codeFlowLoading || flowInFlightRef.current) return;
+    flowInFlightRef.current = true;
     setStoryLoading(true);
     setStatus('running');
     setStatusDetail('Creating whole-repository code story…');
@@ -496,13 +497,15 @@ export default function App() {
       setRenderError(err instanceof Error ? err.message : String(err));
     } finally {
       setStoryLoading(false);
+      flowInFlightRef.current = false;
       setStatus('done');
       setStatusDetail(null);
     }
   }, [folder, codeFlowLoading, setDiagramAndRecord]);
 
   const handleArchitectureStory = useCallback(async () => {
-    if (!folder || codeFlowLoading) return;
+    if (!folder || codeFlowLoading || flowInFlightRef.current) return;
+    flowInFlightRef.current = true;
     setStoryLoading(true);
     setStatus('running');
     setStatusDetail('Finding the project architecture…');
@@ -524,13 +527,15 @@ export default function App() {
       setRenderError(err instanceof Error ? err.message : String(err));
     } finally {
       setStoryLoading(false);
+      flowInFlightRef.current = false;
       setStatus('done');
       setStatusDetail(null);
     }
   }, [folder, codeFlowLoading, setDiagramAndRecord]);
 
   const handleRepositoryImplementation = useCallback(async () => {
-    if (!folder || codeFlowLoading) return;
+    if (!folder || codeFlowLoading || flowInFlightRef.current) return;
+    flowInFlightRef.current = true;
     setImplLoading(true);
     setStatus('running');
     setStatusDetail('Mapping the repository implementation…');
@@ -554,6 +559,7 @@ export default function App() {
       setRenderError(err instanceof Error ? err.message : String(err));
     } finally {
       setImplLoading(false);
+      flowInFlightRef.current = false;
       setStatus('done');
       setStatusDetail(null);
     }
@@ -819,7 +825,7 @@ export default function App() {
 
         {/* Code Story button */}
         <button
-          onClick={() => { if (selectedComponent) void handleCodeFlow(); else void handleRepositoryCodeStory(); }}
+          onClick={() => { if (flowInFlightRef.current) return; if (selectedComponent) void handleCodeFlow(); else void handleRepositoryCodeStory(); }}
           disabled={!canFlow}
           title={selectedComponent ? `Explain how ${selectedComponent} works in plain English` : 'Explain how the whole project works in plain English'}
           style={{
@@ -858,7 +864,7 @@ export default function App() {
         </button>
 
         <button
-          onClick={() => { if (selectedComponent) void handleImplementation(); else void handleRepositoryImplementation(); }}
+          onClick={() => { if (flowInFlightRef.current) return; if (selectedComponent) void handleImplementation(); else void handleRepositoryImplementation(); }}
           disabled={!canFlow}
           title={selectedComponent ? `Show a clear guide to how ${selectedComponent} is built` : 'Show a clear guide to how the whole project is built'}
           style={{
