@@ -185,6 +185,7 @@ export default function App() {
   const renderCodeFlowRef  = useRef<((name: string, mode?: 'story' | 'implementation' | 'actual', drillMermaid?: string) => Promise<void>) | null>(null);
   const canvasContextRef   = useRef<(() => string) | null>(null);
   const rawElementsRef     = useRef<(() => unknown[]) | null>(null);
+  const sessionPanelsRef   = useRef<{ name: string; mode: string }[]>([]);
   const renderCommitDiffRef = useRef<((diff: CommitDiffResult) => Promise<void>) | null>(null);
   const clearCommitDiffRef  = useRef<(() => void) | null>(null);
   const addNoteRef          = useRef<((data: { text: string; bg: string; stroke: string; textColor: string }) => void) | null>(null);
@@ -284,12 +285,28 @@ export default function App() {
       setChangeContextOpen(true);
     });
 
+    // Restore last session's panels from cache — re-render them onto the canvas
+    window.electronAPI.onRestoreSession(async (panels) => {
+      for (const panel of panels) {
+        if (panel.mode === 'drill') {
+          await renderDrilldownRef.current?.(panel.name);
+          setDrillDepth(d => d + 1);
+          setDrilldownActive(true);
+        } else {
+          await renderCodeFlowRef.current?.(panel.name, panel.mode as 'story' | 'implementation' | 'actual');
+          setCodeFlowDepth(d => d + 1);
+          setCodeFlowActive(true);
+        }
+      }
+    });
+
   }
 
   const handleOpenFolder = useCallback(async () => {
     const result = await window.electronAPI.openFolder();
     if (result) {
       setFolder(result.folder);
+      sessionPanelsRef.current = [];
       if (!result.hasCachedDiagram) { setStatus('idle'); setDiagram(null); }
     }
   }, []);
@@ -300,6 +317,8 @@ export default function App() {
     if (!result.ok) { setRenderError(result.error ?? 'Could not clear the project cache'); return; }
     clearDrilldownRef.current?.();
     clearAllCodeFlowsRef.current?.();
+    sessionPanelsRef.current = [];
+    window.electronAPI.saveSessionPanels([]);
     setDiagram(null);
     setSelectedComponent(null);
     setSelectedComponents([]);
@@ -395,11 +414,15 @@ export default function App() {
   const handleBack = useCallback(() => {
     clearDrilldownRef.current?.();
     setDrillDepth(d => Math.max(0, d - 1));
+    sessionPanelsRef.current = sessionPanelsRef.current.filter((p, i) => !(p.mode === 'drill' && i === sessionPanelsRef.current.length - 1));
+    window.electronAPI.saveSessionPanels(sessionPanelsRef.current);
   }, []);
 
   const handleBackFlow = useCallback(() => {
     clearCodeFlowRef.current?.();
     setCodeFlowDepth(d => Math.max(0, d - 1));
+    sessionPanelsRef.current = sessionPanelsRef.current.filter((_, i) => i !== sessionPanelsRef.current.length - 1);
+    window.electronAPI.saveSessionPanels(sessionPanelsRef.current);
   }, []);
 
   const handleDrill = useCallback(async () => {
@@ -407,6 +430,8 @@ export default function App() {
     setDrilling(true);
     await renderDrilldownRef.current?.(selectedComponent);
     setDrillDepth(d => d + 1);
+    sessionPanelsRef.current = [...sessionPanelsRef.current, { name: selectedComponent, mode: 'drill' }];
+    window.electronAPI.saveSessionPanels(sessionPanelsRef.current);
     setDrilling(false);
   }, [selectedComponent, drilling]);
 
@@ -415,6 +440,8 @@ export default function App() {
     setCodeFlowLoading(true);
     await renderCodeFlowRef.current?.(selectedComponent);
     setCodeFlowDepth(d => d + 1);
+    sessionPanelsRef.current = [...sessionPanelsRef.current, { name: selectedComponent, mode: 'story' }];
+    window.electronAPI.saveSessionPanels(sessionPanelsRef.current);
     setCodeFlowLoading(false);
   }, [selectedComponent, codeFlowLoading]);
 
@@ -434,6 +461,8 @@ export default function App() {
     setCodeFlowLoading(true);
     await renderCodeFlowRef.current?.(selectedComponent, 'implementation');
     setCodeFlowDepth(d => d + 1);
+    sessionPanelsRef.current = [...sessionPanelsRef.current, { name: selectedComponent, mode: 'implementation' }];
+    window.electronAPI.saveSessionPanels(sessionPanelsRef.current);
     setCodeFlowLoading(false);
   }, [selectedComponent, codeFlowLoading]);
 

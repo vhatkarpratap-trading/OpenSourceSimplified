@@ -62,6 +62,8 @@ interface CommitDiagram {
   codeFlow:    { mermaid: string; happyPath?: string[] };
 }
 
+interface SessionPanel { name: string; mode: 'story' | 'implementation' | 'actual' | 'drill' }
+
 interface CacheFile {
   structureHash: string;
   provider?: AiProvider;
@@ -69,6 +71,7 @@ interface CacheFile {
   drilldowns: Record<string, string>;
   codeflows: Record<string, string>;
   commitDiagrams?: Record<string, CommitDiagram>;
+  lastSession?: SessionPanel[];
   savedAt: number;
 }
 
@@ -167,6 +170,16 @@ function saveCodeFlow(folder: string, componentName: string, mermaid: string) {
     if (!existing) return;
     existing.codeflows = existing.codeflows ?? {};
     existing.codeflows[componentName] = mermaid;
+    existing.savedAt = Date.now();
+    fs.writeFileSync(cacheFile(folder), JSON.stringify(existing, null, 2), 'utf8');
+  } catch { /* ignore */ }
+}
+
+function saveSessionPanels(folder: string, panels: SessionPanel[]) {
+  try {
+    const existing = loadCache(folder);
+    if (!existing) return;
+    existing.lastSession = panels;
     existing.savedAt = Date.now();
     fs.writeFileSync(cacheFile(folder), JSON.stringify(existing, null, 2), 'utf8');
   } catch { /* ignore */ }
@@ -860,6 +873,9 @@ function createWindow() {
         currentDiagram = cached.diagram;
         mainWindow.webContents.send('canvas:diagram', cached.diagram);
         mainWindow.webContents.send('folder:restored', { folder: last, hasCachedDiagram: true });
+        if (cached.lastSession?.length) {
+          mainWindow.webContents.send('canvas:restoreSession', cached.lastSession);
+        }
       } else {
         mainWindow.webContents.send('folder:restored', { folder: last, hasCachedDiagram: false });
       }
@@ -926,6 +942,9 @@ ipcMain.handle('folder:open', async () => {
   if (hasCurrentCachedDiagram && cached?.diagram) {
     currentDiagram = cached.diagram;
     mainWindow.webContents.send('canvas:diagram', cached.diagram);
+    if (cached.lastSession?.length) {
+      mainWindow.webContents.send('canvas:restoreSession', cached.lastSession);
+    }
   }
 
   startFileWatcher(folder, (changedFiles) => {
@@ -934,6 +953,10 @@ ipcMain.handle('folder:open', async () => {
   });
 
   return { folder, hasCachedDiagram: hasCurrentCachedDiagram };
+});
+
+ipcMain.on('session:savePanels', (_e, panels: SessionPanel[]) => {
+  if (currentFolder) saveSessionPanels(currentFolder, panels);
 });
 
 ipcMain.handle('cache:clearProject', () => {

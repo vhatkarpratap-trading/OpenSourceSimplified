@@ -98,6 +98,9 @@ declare global {
       askAboutComponents: (req: { question: string; components: string[]; canvasContext: string; folder: string }) => Promise<{ ok: boolean; diagram?: DiagramData; error?: string }>;
       // Diagram type preference
       setPreferredDiagramType: (type: string) => void;
+      // Session panel persistence
+      saveSessionPanels: (panels: { name: string; mode: string }[]) => void;
+      onRestoreSession: (cb: (panels: { name: string; mode: string }[]) => void) => void;
       // Change context
       onChangeContext: (cb: (nodes: ChangeContextNode[]) => void) => void;
       // Build/test error annotations

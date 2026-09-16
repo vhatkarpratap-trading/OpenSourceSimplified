@@ -154,6 +154,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Diagram type preference for completed response diagrams
   setPreferredDiagramType: (type: string) => ipcRenderer.send('canvas:setPreferredDiagramType', type),
 
+  // Session panel persistence — save which panels were open so they restore on next load
+  saveSessionPanels: (panels: { name: string; mode: string }[]) => ipcRenderer.send('session:savePanels', panels),
+
+  // Restore last session's panels after diagram loads
+  onRestoreSession: (cb: (panels: { name: string; mode: string }[]) => void) => {
+    ipcRenderer.on('canvas:restoreSession', (_event: unknown, panels: unknown) =>
+      cb(panels as { name: string; mode: string }[]));
+  },
+
   // Change context (ambient panel — fires after Claude edits)
   onChangeContext: (cb: (nodes: unknown[]) => void) => {
     ipcRenderer.on('canvas:changeContext', (_event: unknown, nodes: unknown[]) => cb(nodes));
