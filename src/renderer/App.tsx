@@ -413,10 +413,8 @@ export default function App() {
   const handleCodeFlow = useCallback(async () => {
     if (!selectedComponent || codeFlowLoading) return;
     setCodeFlowLoading(true);
-    clearAllCodeFlowsRef.current?.();
-    setCodeFlowDepth(0);
     await renderCodeFlowRef.current?.(selectedComponent);
-    setCodeFlowDepth(1);
+    setCodeFlowDepth(d => d + 1);
     setCodeFlowLoading(false);
   }, [selectedComponent, codeFlowLoading]);
 
@@ -434,10 +432,8 @@ export default function App() {
   const handleImplementation = useCallback(async () => {
     if (!selectedComponent || codeFlowLoading) return;
     setCodeFlowLoading(true);
-    clearAllCodeFlowsRef.current?.();
-    setCodeFlowDepth(0);
     await renderCodeFlowRef.current?.(selectedComponent, 'implementation');
-    setCodeFlowDepth(1);
+    setCodeFlowDepth(d => d + 1);
     setCodeFlowLoading(false);
   }, [selectedComponent, codeFlowLoading]);
 
