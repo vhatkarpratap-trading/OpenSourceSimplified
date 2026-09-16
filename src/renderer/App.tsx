@@ -959,40 +959,29 @@ export default function App() {
             borderBottom: '1px solid #ebebf5',
             flexShrink: 0, userSelect: 'none',
           }}>
-            {drilldownActive && (
-              <button onClick={handleBack} style={{
-                display: 'flex', alignItems: 'center', gap: 4,
-                padding: '3px 10px', fontSize: 11, borderRadius: 5,
-                fontFamily: 'system-ui, -apple-system, sans-serif',
-                border: '1px solid #1a73b5', background: '#e0f2fe',
-                color: '#0369a1', cursor: 'pointer', flexShrink: 0,
-              }}>
-                ← Drill {drillDepth > 1 ? `(${drillDepth})` : ''}
-              </button>
-            )}
-            {codeFlowActive && (
-              <button onClick={handleBackFlow} style={{
-                display: 'flex', alignItems: 'center', gap: 4,
-                padding: '3px 10px', fontSize: 11, borderRadius: 5,
-                fontFamily: 'system-ui, -apple-system, sans-serif',
-                border: '1px solid #16a34a', background: '#dcfce7',
-                color: '#15803d', cursor: 'pointer', flexShrink: 0,
-              }}>
-                ← Flow {codeFlowDepth > 1 ? `(${codeFlowDepth})` : ''}
-              </button>
-            )}
-
-            <span style={{
-              fontSize: 10, color: drilldownActive ? '#5b21b6' : '#aaaabc',
-              letterSpacing: '0.1em', textTransform: 'uppercase',
-              fontFamily: 'system-ui, -apple-system, sans-serif',
-              fontWeight: drilldownActive ? 600 : 400,
-            }}>
-              {canvasLabel}
-            </span>
-
-            {!drilldownActive && !codeFlowActive && (
-              <div style={{ display: 'flex', gap: 4, marginLeft: 'auto', alignItems: 'center', position: 'relative' }}>
+            <div style={{ display: 'flex', gap: 4, marginLeft: 'auto', alignItems: 'center', position: 'relative' }}>
+                {drilldownActive && (
+                  <button onClick={handleBack} style={{
+                    display: 'flex', alignItems: 'center', gap: 4,
+                    padding: '3px 10px', fontSize: 11, borderRadius: 5,
+                    fontFamily: 'system-ui, -apple-system, sans-serif',
+                    border: '1px solid #1a73b5', background: '#e0f2fe',
+                    color: '#0369a1', cursor: 'pointer', flexShrink: 0,
+                  }}>
+                    ← Drill {drillDepth > 1 ? `(${drillDepth})` : ''}
+                  </button>
+                )}
+                {codeFlowActive && (
+                  <button onClick={handleBackFlow} style={{
+                    display: 'flex', alignItems: 'center', gap: 4,
+                    padding: '3px 10px', fontSize: 11, borderRadius: 5,
+                    fontFamily: 'system-ui, -apple-system, sans-serif',
+                    border: '1px solid #16a34a', background: '#dcfce7',
+                    color: '#15803d', cursor: 'pointer', flexShrink: 0,
+                  }}>
+                    ← Flow {codeFlowDepth > 1 ? `(${codeFlowDepth})` : ''}
+                  </button>
+                )}
 
                 {/* Diagram type picker */}
                 <div style={{ position: 'relative' }} ref={typePickerRef}>
@@ -1149,7 +1138,6 @@ export default function App() {
                   </button>
                 )}
               </div>
-            )}
           </div>
 
           {renderError && (
@@ -1272,7 +1260,7 @@ export default function App() {
             <div style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
 
             {/* ── Canvas node action bar ── */}
-            {selectedComponent && !drilldownActive && !codeFlowActive && (
+            {selectedComponent && (
               <div style={{
                 position: 'absolute', bottom: 16, left: '50%',
                 transform: 'translateX(-50%)',
