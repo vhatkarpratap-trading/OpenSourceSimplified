@@ -764,16 +764,16 @@ export default function App() {
         {/* Drill button */}
         <button
           onClick={handleDrill}
-          disabled={!selectedComponent || drilling || drilldownActive}
+          disabled={!selectedComponent || drilling}
           title={selectedComponent ? `Drill into ${selectedComponent}` : 'Select a component first'}
           style={{
             display: 'flex', alignItems: 'center', gap: 6,
-            padding: '6px 12px', background: selectedComponent && !drilldownActive ? '#2b2b36' : '#1b1b24',
-            border: `1px solid ${selectedComponent && !drilldownActive ? '#51515e' : '#3b3b47'}`, borderRadius: 6,
-            color: selectedComponent && !drilldownActive ? '#ededf2' : '#777782', fontSize: 12,
+            padding: '6px 12px', background: selectedComponent ? '#2b2b36' : '#1b1b24',
+            border: `1px solid ${selectedComponent ? '#51515e' : '#3b3b47'}`, borderRadius: 6,
+            color: selectedComponent ? '#ededf2' : '#777782', fontSize: 12,
             fontFamily: 'system-ui, -apple-system, sans-serif',
-            cursor: selectedComponent && !drilldownActive ? 'pointer' : 'not-allowed',
-            opacity: selectedComponent && !drilldownActive ? 1 : 0.45, flexShrink: 0,
+            cursor: selectedComponent ? 'pointer' : 'not-allowed',
+            opacity: selectedComponent ? 1 : 0.45, flexShrink: 0,
             transition: 'all 0.2s',
             // @ts-ignore
             WebkitAppRegion: 'no-drag',
