@@ -183,6 +183,7 @@ export default function App() {
   const clearAllCodeFlowsRef = useRef<(() => void) | null>(null);
   const renderDrilldownRef = useRef<((name: string) => void) | null>(null);
   const renderCodeFlowRef  = useRef<((name: string, mode?: 'story' | 'implementation' | 'actual', drillMermaid?: string) => Promise<void>) | null>(null);
+  const flowInFlightRef    = useRef(false);
   const canvasContextRef   = useRef<(() => string) | null>(null);
   const rawElementsRef     = useRef<(() => unknown[]) | null>(null);
   const sessionPanelsRef   = useRef<{ name: string; mode: string }[]>([]);
@@ -436,13 +437,15 @@ export default function App() {
   }, [selectedComponent, drilling]);
 
   const handleCodeFlow = useCallback(async () => {
-    if (!selectedComponent || codeFlowLoading) return;
+    if (!selectedComponent || codeFlowLoading || flowInFlightRef.current) return;
+    flowInFlightRef.current = true;
     setCodeFlowLoading(true);
     await renderCodeFlowRef.current?.(selectedComponent);
     setCodeFlowDepth(d => d + 1);
     sessionPanelsRef.current = [...sessionPanelsRef.current, { name: selectedComponent, mode: 'story' }];
     window.electronAPI.saveSessionPanels(sessionPanelsRef.current);
     setCodeFlowLoading(false);
+    flowInFlightRef.current = false;
   }, [selectedComponent, codeFlowLoading]);
 
   const handleActualCodeFlow = useCallback(async () => {
@@ -457,13 +460,15 @@ export default function App() {
   }, [selectedComponent]);
 
   const handleImplementation = useCallback(async () => {
-    if (!selectedComponent || codeFlowLoading) return;
+    if (!selectedComponent || codeFlowLoading || flowInFlightRef.current) return;
+    flowInFlightRef.current = true;
     setCodeFlowLoading(true);
     await renderCodeFlowRef.current?.(selectedComponent, 'implementation');
     setCodeFlowDepth(d => d + 1);
     sessionPanelsRef.current = [...sessionPanelsRef.current, { name: selectedComponent, mode: 'implementation' }];
     window.electronAPI.saveSessionPanels(sessionPanelsRef.current);
     setCodeFlowLoading(false);
+    flowInFlightRef.current = false;
   }, [selectedComponent, codeFlowLoading]);
 
   const handleRepositoryCodeStory = useCallback(async () => {
