@@ -97,7 +97,9 @@ export default function App() {
   const [selectionQuestionOpen, setSelectionQuestionOpen] = useState(false);
   const [selectionAnswering, setSelectionAnswering] = useState(false);
   const [drilling, setDrilling]               = useState(false);
-  const [codeFlowLoading, setCodeFlowLoading] = useState(false);
+  const [storyLoading, setStoryLoading]       = useState(false);
+  const [implLoading, setImplLoading]         = useState(false);
+  const codeFlowLoading = storyLoading || implLoading;
   const [sourcePanelOpen, setSourcePanelOpen] = useState(false);
   const [sourceView, setSourceView] = useState<{ files?: Array<{ path: string; content: string; highlight?: string }>; error?: string } | null>(null);
   const [sourceFileIndex, setSourceFileIndex] = useState(0);
@@ -439,12 +441,12 @@ export default function App() {
   const handleCodeFlow = useCallback(async () => {
     if (!selectedComponent || codeFlowLoading || flowInFlightRef.current) return;
     flowInFlightRef.current = true;
-    setCodeFlowLoading(true);
+    setStoryLoading(true);
     await renderCodeFlowRef.current?.(selectedComponent);
     setCodeFlowDepth(d => d + 1);
     sessionPanelsRef.current = [...sessionPanelsRef.current, { name: selectedComponent, mode: 'story' }];
     window.electronAPI.saveSessionPanels(sessionPanelsRef.current);
-    setCodeFlowLoading(false);
+    setStoryLoading(false);
     flowInFlightRef.current = false;
   }, [selectedComponent, codeFlowLoading]);
 
@@ -462,18 +464,18 @@ export default function App() {
   const handleImplementation = useCallback(async () => {
     if (!selectedComponent || codeFlowLoading || flowInFlightRef.current) return;
     flowInFlightRef.current = true;
-    setCodeFlowLoading(true);
+    setImplLoading(true);
     await renderCodeFlowRef.current?.(selectedComponent, 'implementation');
     setCodeFlowDepth(d => d + 1);
     sessionPanelsRef.current = [...sessionPanelsRef.current, { name: selectedComponent, mode: 'implementation' }];
     window.electronAPI.saveSessionPanels(sessionPanelsRef.current);
-    setCodeFlowLoading(false);
+    setImplLoading(false);
     flowInFlightRef.current = false;
   }, [selectedComponent, codeFlowLoading]);
 
   const handleRepositoryCodeStory = useCallback(async () => {
     if (!folder || codeFlowLoading) return;
-    setCodeFlowLoading(true);
+    setStoryLoading(true);
     setStatus('running');
     setStatusDetail('Creating whole-repository code story…');
     try {
@@ -493,7 +495,7 @@ export default function App() {
     } catch (err) {
       setRenderError(err instanceof Error ? err.message : String(err));
     } finally {
-      setCodeFlowLoading(false);
+      setStoryLoading(false);
       setStatus('done');
       setStatusDetail(null);
     }
@@ -501,7 +503,7 @@ export default function App() {
 
   const handleArchitectureStory = useCallback(async () => {
     if (!folder || codeFlowLoading) return;
-    setCodeFlowLoading(true);
+    setStoryLoading(true);
     setStatus('running');
     setStatusDetail('Finding the project architecture…');
     try {
@@ -521,7 +523,7 @@ export default function App() {
     } catch (err) {
       setRenderError(err instanceof Error ? err.message : String(err));
     } finally {
-      setCodeFlowLoading(false);
+      setStoryLoading(false);
       setStatus('done');
       setStatusDetail(null);
     }
@@ -529,11 +531,9 @@ export default function App() {
 
   const handleRepositoryImplementation = useCallback(async () => {
     if (!folder || codeFlowLoading) return;
-    setCodeFlowLoading(true);
+    setImplLoading(true);
     setStatus('running');
     setStatusDetail('Mapping the repository implementation…');
-    // This is a full-canvas view, not a component overlay. Clear immediately so
-    // the old Story/Implementation pair cannot remain visible while it runs.
     clearDrilldownRef.current?.();
     clearAllCodeFlowsRef.current?.();
     setDrilldownActive(false);
@@ -553,7 +553,7 @@ export default function App() {
     } catch (err) {
       setRenderError(err instanceof Error ? err.message : String(err));
     } finally {
-      setCodeFlowLoading(false);
+      setImplLoading(false);
       setStatus('done');
       setStatusDetail(null);
     }
@@ -837,7 +837,7 @@ export default function App() {
           }}
         >
           <FlowIcon />
-          {codeFlowLoading ? 'Explaining…' : selectedComponent ? 'Code Story' : 'Project Code Story'}
+          {storyLoading ? 'Explaining…' : selectedComponent ? 'Code Story' : 'Project Code Story'}
         </button>
 
         <button
@@ -870,7 +870,7 @@ export default function App() {
             WebkitAppRegion: 'no-drag',
           }}
         >
-          <FlowIcon /> {codeFlowLoading ? 'Explaining…' : selectedComponent ? 'How it is built' : 'How the project is built'}
+          <FlowIcon /> {implLoading ? 'Explaining…' : selectedComponent ? 'How it is built' : 'How the project is built'}
         </button>
 
         <button
@@ -1328,12 +1328,12 @@ export default function App() {
                   title="Explain how this component works"
                   style={{
                     display: 'flex', alignItems: 'center', gap: 4,
-                    padding: '4px 10px', background: codeFlowLoading ? '#0f2a0f' : '#1a3a1a',
+                    padding: '4px 10px', background: storyLoading ? '#0f2a0f' : '#1a3a1a',
                     border: '1px solid #16a34a', borderRadius: 6,
                     color: '#86efac', fontSize: 11, cursor: codeFlowLoading ? 'not-allowed' : 'pointer',
                   }}
                 >
-                  <FlowIcon /> {codeFlowLoading ? 'Explaining…' : 'Story'}
+                  <FlowIcon /> {storyLoading ? 'Explaining…' : 'Story'}
                 </button>
                 <button
                   onClick={handleActualCodeFlow}
@@ -1354,11 +1354,11 @@ export default function App() {
                   title="Show a clear guide to how this is built"
                   style={{
                     display: 'flex', alignItems: 'center', gap: 4, padding: '4px 10px',
-                    background: codeFlowLoading ? '#2a1d0b' : '#3b2a14', border: '1px solid #d97706', borderRadius: 6,
+                    background: implLoading ? '#2a1d0b' : '#3b2a14', border: '1px solid #d97706', borderRadius: 6,
                     color: '#fcd34d', fontSize: 11, cursor: codeFlowLoading ? 'not-allowed' : 'pointer',
                   }}
                 >
-                  <FlowIcon /> {codeFlowLoading ? 'Explaining…' : 'How it is built'}
+                  <FlowIcon /> {implLoading ? 'Explaining…' : 'How it is built'}
                 </button>
                 <button
                   onClick={() => handleCanvasCommand(`Implement or improve the ${selectedComponent} component`)}
