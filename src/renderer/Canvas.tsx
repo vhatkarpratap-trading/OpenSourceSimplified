@@ -15,7 +15,6 @@ interface CanvasProps {
   onDrilldownChange?: (active: boolean) => void;
   onCodeFlowChange?: (active: boolean) => void;
   onImplementationExplanations?: (descriptions: Record<string, string> | null) => void;
-  onCodeStoryDataFlow?: (data: Record<string, { input: string; output: string; change: string }> | null) => void;
   onSelectionChange?: (names: string[]) => void;
   clearDrilldownRef?: React.MutableRefObject<(() => void) | null>;
   clearCodeFlowRef?: React.MutableRefObject<(() => void) | null>;
@@ -39,7 +38,7 @@ interface GitAnnotation { name: string; summary: string; added: number; removed:
  *   no git info              → full opacity, all grey (default state)
  *   git changed (rect)       → restore type color (vivid), full opacity
  *   git changed (text/arrow) → full opacity
- *   git unchanged            → 10% opacity (almost invisible, changed ones pop)
+ *   git unchanged            → full opacity so the entire diagram remains readable
  *   Claude changed           → amber stroke + yellow bg
  *   Claude impacted          → orange stroke + peach bg
  */
@@ -100,9 +99,8 @@ function applyZoomAndGit(
         if (el.type === 'text')      return { ...el, opacity: baseOp, strokeColor: isChanged ? '#92400e' : '#9a3412' } as ExcalidrawElement;
         return { ...el, opacity: baseOp, strokeColor: stroke } as ExcalidrawElement;
       }
-      // Everything else greys out so the change clearly pops
-      const dimmed = Math.max(1, Math.floor(baseOp * 0.12));
-      return el.opacity === dimmed ? el : { ...el, opacity: dimmed };
+      // Keep the full diagram legible while the changed nodes remain colour-coded.
+      return el.opacity === baseOp ? el : { ...el, opacity: baseOp };
     }
 
     if (hasGitChanges) {
@@ -121,9 +119,8 @@ function applyZoomAndGit(
         }
         return el.opacity === baseOp ? el : { ...el, opacity: baseOp };
       }
-      // Unchanged — dim hard so changed components clearly pop
-      const dimmed = Math.max(1, Math.floor(baseOp * 0.10));
-      return el.opacity === dimmed ? el : { ...el, opacity: dimmed };
+      // Keep unchanged components fully visible; colour still identifies changes.
+      return el.opacity === baseOp ? el : { ...el, opacity: baseOp };
     }
 
     // No changes — full grey base, normal opacity
@@ -131,7 +128,7 @@ function applyZoomAndGit(
   });
 }
 
-export default function Canvas({ diagramData, activeKind = 'structure', onAPIReady, onRenderError, onDrilldownChange, onCodeFlowChange, onImplementationExplanations, onCodeStoryDataFlow, onSelectionChange, clearDrilldownRef, clearCodeFlowRef, clearAllCodeFlowsRef, renderDrilldownRef, renderCodeFlowRef, canvasContextRef, rawElementsRef, renderCommitDiffRef, clearCommitDiffRef, addNoteRef, selectionAnswerRef, errorAnnotations }: CanvasProps) {
+export default function Canvas({ diagramData, activeKind = 'structure', onAPIReady, onRenderError, onDrilldownChange, onCodeFlowChange, onImplementationExplanations, onSelectionChange, clearDrilldownRef, clearCodeFlowRef, clearAllCodeFlowsRef, renderDrilldownRef, renderCodeFlowRef, canvasContextRef, rawElementsRef, renderCommitDiffRef, clearCommitDiffRef, addNoteRef, selectionAnswerRef, errorAnnotations }: CanvasProps) {
   const [apiReady, setApiReady] = useState(false);
   const apiRef          = useRef<ExcalidrawImperativeAPI | null>(null);
   const lastDataRef     = useRef<DiagramData | null>(null);
@@ -1004,10 +1001,6 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       console.log('[codeflow] ok:', res?.ok, 'error:', res?.error);
       if (!res?.ok || !res.mermaid) throw new Error(res?.error || 'no mermaid');
       onImplementationExplanations?.(mode === 'implementation' ? (res.descriptions ?? {}) : null);
-      onCodeStoryDataFlow?.(mode === 'story'
-        ? ((('dataFlow' in res ? res.dataFlow : undefined) ?? {}) as Record<string, { input: string; output: string; change: string }>)
-        : null);
-
       const { buildMermaidScene: bms } = await import('./mermaidScene');
       const flowScene = await bms(res.mermaid, res.descriptions);
 

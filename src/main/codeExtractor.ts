@@ -47,15 +47,98 @@ const SOURCE_EXTS = new Set([
   '.sql', '.sh', '.bash', '.zsh', '.ps1', '.yaml', '.yml', '.json', '.toml',
 ]);
 
-const MAX_FILES   = 80;
-const MAX_DEPTH   = 4;
+const MAX_FILES   = 150;
+// Android/JVM projects nest source files very deeply (e.g. fenix/app/src/main/java/org/mozilla/fenix/…).
+// A low hard limit cuts off real source trees. We cap depth only on low-value branches using the
+// directory importance score — high-value dirs (src, app, java, features, …) get unlimited depth.
+const MAX_DEPTH        = 12;
+const MAX_DEPTH_LOW    = 4;  // stop early inside docs, scripts, infra, test dirs
+
+// Score a file path for importance: lower = more important.
+// Used to rank candidates when the project exceeds MAX_FILES.
+function fileImportanceScore(filePath: string): number {
+  const v = filePath.toLowerCase();
+  const base = path.basename(v);
+  // Test files always score worst — they duplicate production names but add noise.
+  if (/(test|spec|mock|fixture|__tests__)/.test(v) || /test\.[^/]+$/.test(base) || /spec\.[^/]+$/.test(base)) return 7;
+  // Entry points / app shells
+  if (/^(main|index|app|router|routes|server|application)\.[^/]+$/.test(base)) return 0;
+  // Screen / feature / navigation files
+  if (/(activity|fragment|screen|page|view|navigation|navigator|route|scene)/.test(v)) return 1;
+  // Feature domain files (search, settings, auth, etc.)
+  if (/(search|explore|article|readinglist|saved|history|settings|nearby|map|login|edit|auth|home|feed|detail|profile|dashboard|checkout|cart|payment|onboard)/.test(v)) return 2;
+  // API / service / repository layer
+  if (/(api|service|repository|store|manager|controller|handler|endpoint)/.test(v)) return 3;
+  // Models / data
+  if (/(model|entity|schema|dto|type|interface)/.test(v)) return 4;
+  // Utilities / helpers / config / build scripts — lowest priority
+  if (/(util|helper|config|setup|build|gradle|release|generate|upload)/.test(v)) return 6;
+  return 5;
+}
+
+// Score a directory name for how likely it is to contain high-value source.
+// Lower = descend first. Used to prioritise traversal in monorepos.
+function dirImportanceScore(dirName: string): number {
+  const v = dirName.toLowerCase();
+  // Canonical source roots
+  if (/^(src|app|lib|source|sources)$/.test(v)) return 0;
+  // Language-specific source layouts
+  if (/^(java|kotlin|swift|dart|python)$/.test(v)) return 1;
+  if (/^(main|fenix|components|features|modules|packages|core|ui|pages|screens|views|routes|navigation)$/.test(v)) return 2;
+  // Common feature folders
+  if (/(activity|fragment|screen|feature|service|repository|store|controller|handler|browser|home|search|settings|auth|login|profile|onboard)/.test(v)) return 3;
+  // Docs, scripts, infra, tests — traverse last
+  if (/^(docs?|doc|test|tests|spec|specs|__tests__|scripts?|tools?|infra|ci|taskcluster|automation|build|gradle|vendor|third.?party|examples?|sample|demo|mock|fixture|release|deploy|publish)$/.test(v)) return 8;
+  return 5;
+}
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 export function extractStructure(projectPath: string): ExtractedStructure {
-  let totalFiles = 0;
   const languages = new Set<string>();
   const nodePaths: Record<string, string> = {}; // name → absolute path
+
+  // Phase 1: discover all candidate files up to a generous ceiling.
+  // Directories are sorted by importance before recursing so high-value
+  // source trees (src/, app/, fenix/app/src/main/java/…) are visited
+  // before docs, scripts, and infra — critical for monorepos.
+  const DISCOVERY_CAP = 3000;
+  const allCandidates: { filePath: string; name: string; ext: string; score: number }[] = [];
+
+  function walkDir(dir: string, depth: number, lowValueDepth: number) {
+    if (depth > MAX_DEPTH || lowValueDepth > MAX_DEPTH_LOW || allCandidates.length >= DISCOVERY_CAP) return;
+
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch { return; }
+
+    const folders = entries
+      .filter(e => e.isDirectory() && !IGNORE_DIRS.has(e.name) && !e.name.startsWith('.'))
+      .sort((a, b) => dirImportanceScore(a.name) - dirImportanceScore(b.name) || a.name.localeCompare(b.name));
+    const files = entries.filter(e => e.isFile() && SOURCE_EXTS.has(path.extname(e.name).toLowerCase()));
+
+    // Recurse into folders before collecting files at this level so we reach
+    // deep source trees (e.g. fenix/app/src/main/java/…) early.
+    for (const folder of folders) {
+      if (allCandidates.length >= DISCOVERY_CAP) break;
+      const ds = dirImportanceScore(folder.name);
+      const nextLowDepth = ds >= 8 ? lowValueDepth + 1 : lowValueDepth;
+      walkDir(path.join(dir, folder.name), depth + 1, nextLowDepth);
+    }
+
+    for (const file of files) {
+      if (allCandidates.length >= DISCOVERY_CAP) break;
+      const filePath = path.join(dir, file.name);
+      const ext = path.extname(file.name).toLowerCase();
+      allCandidates.push({ filePath, name: file.name, ext, score: fileImportanceScore(filePath) });
+    }
+  }
+
+  walkDir(projectPath, 0, 0);
+
+  // Phase 2: sort by importance and keep only MAX_FILES of the best candidates.
+  allCandidates.sort((a, b) => a.score - b.score || a.filePath.localeCompare(b.filePath));
+  const selected = allCandidates.slice(0, MAX_FILES);
 
   const root: CodeNode = {
     name: path.basename(projectPath),
@@ -65,46 +148,31 @@ export function extractStructure(projectPath: string): ExtractedStructure {
     children: [],
   };
 
-  function walkDir(dir: string, node: CodeNode, depth: number) {
-    if (depth > MAX_DEPTH || totalFiles >= MAX_FILES) return;
+  // Phase 3: parse selected files and reconstruct the folder tree.
+  // We insert each file into the correct folder node, creating intermediate
+  // folder nodes on demand so the tree reflects the actual directory layout.
+  const folderNodes = new Map<string, CodeNode>();
+  folderNodes.set(projectPath, root);
 
-    let entries: fs.Dirent[];
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
-    catch { return; }
-
-    // Folders first, then files
-    const folders = entries.filter(e => e.isDirectory() && !IGNORE_DIRS.has(e.name) && !e.name.startsWith('.'));
-    const files   = entries.filter(e => e.isFile() && SOURCE_EXTS.has(path.extname(e.name).toLowerCase()));
-
-    for (const folder of folders) {
-      if (totalFiles >= MAX_FILES) break;
-      const folderNode: CodeNode = {
-        name: folder.name,
-        type: 'folder',
-        path: path.join(dir, folder.name),
-        imports: [],
-        children: [],
-      };
-      walkDir(path.join(dir, folder.name), folderNode, depth + 1);
-      if (folderNode.children.length > 0) {
-        node.children.push(folderNode);
-      }
-    }
-
-    for (const file of files) {
-      if (totalFiles >= MAX_FILES) break;
-      totalFiles++;
-      const ext = path.extname(file.name).toLowerCase();
-      languages.add(ext.slice(1));
-
-      const filePath = path.join(dir, file.name);
-      const fileNode = parseFile(filePath, file.name);
-      nodePaths[file.name] = filePath; // map filename → absolute path
-      node.children.push(fileNode);
-    }
+  function getOrCreateFolder(dir: string): CodeNode {
+    const existing = folderNodes.get(dir);
+    if (existing) return existing;
+    const parentNode = getOrCreateFolder(path.dirname(dir));
+    const node: CodeNode = { name: path.basename(dir), type: 'folder', path: dir, imports: [], children: [] };
+    parentNode.children.push(node);
+    folderNodes.set(dir, node);
+    return node;
   }
 
-  walkDir(projectPath, root, 0);
+  let totalFiles = 0;
+  for (const { filePath, name, ext } of selected) {
+    totalFiles++;
+    languages.add(ext.slice(1));
+    const fileNode = parseFile(filePath, name);
+    nodePaths[name] = filePath;
+    const parentNode = getOrCreateFolder(path.dirname(filePath));
+    parentNode.children.push(fileNode);
+  }
 
   // Build a relationship graph after parsing. This is deliberately evidence-led:
   // an edge exists only when a source file imports another module/package.
@@ -129,7 +197,7 @@ export function extractStructure(projectPath: string): ExtractedStructure {
       for (const to of targets) {
         const kind: CodeRelationship['kind'] = matches.length ? 'local-import' : 'external-import';
         const key = `${from}|${kind}|${to}`;
-        if (!seen.has(key) && relationships.length < 240) {
+        if (!seen.has(key) && relationships.length < 400) {
           seen.add(key);
           relationships.push({ from, to, kind });
         }
@@ -372,6 +440,6 @@ export function toClaudePromptJSON(structure: ExtractedStructure): string {
     project: compact(structure.root),
     // This graph helps follow relationships across folders even when filenames
     // alone are ambiguous. It is static evidence, not a claim of runtime calls.
-    relationships: structure.relationships.slice(0, 180),
+    relationships: structure.relationships.slice(0, 360),
   }, null, 1);
 }

@@ -272,26 +272,38 @@ const ANALYSIS_SCHEMA_VERSION = 'user-interaction-map-v5';
 
 /** File and symbol names are insufficient to infer product behaviour. */
 function buildAnalysisSourceContext(structure: ExtractedStructure): string {
-  const files = Object.entries(structure.nodePaths).sort(([a], [b]) => {
-    const score = (name: string, filePath: string) => {
-      const value = (name + ' ' + filePath).toLowerCase();
-      if (/(activity|fragment|screen|navigation|navigator|router|search|explore|article|readinglist|saved|history|settings|nearby|map|login|edit)/.test(value)) return 0;
-      if (/^(main|index|app|router|routes|server|api)/i.test(name)) return 1;
-      if (/(build|gradle|script|release|generate|upload|testkitchen)/.test(value)) return 4;
-      return 2;
+  // Sort files by signal strength so the most important files fill the budget first.
+  // The extractor already ranked and capped files, but nodePaths is unordered — re-sort here.
+  const files = Object.entries(structure.nodePaths).sort(([, a], [, b]) => {
+    const score = (filePath: string) => {
+      const v = filePath.toLowerCase();
+      const base = path.basename(v);
+      if (/^(main|index|app|router|routes|server|application)\.[^/]+$/.test(base)) return 0;
+      if (/(activity|fragment|screen|page|view|navigation|navigator|route|scene)/.test(v)) return 1;
+      if (/(search|explore|article|readinglist|saved|history|settings|nearby|map|login|edit|auth|home|feed|detail|profile|dashboard|checkout|cart|payment|onboard)/.test(v)) return 2;
+      if (/(api|service|repository|store|manager|controller|handler|endpoint)/.test(v)) return 3;
+      if (/(model|entity|schema|dto|type|interface)/.test(v)) return 4;
+      if (/(util|helper|test|spec|mock|fixture|config|setup|build|gradle|release|generate|upload)/.test(v)) return 6;
+      return 5;
     };
-    return score(a, structure.nodePaths[a]) - score(b, structure.nodePaths[b]) || a.localeCompare(b);
+    return score(a) - score(b) || a.localeCompare(b);
   });
+
   const chunks: string[] = [];
-  let remaining = 50000;
+  // Doubled budget — large projects need more evidence to get accurate maps.
+  let remaining = 100000;
   for (const [, filePath] of files) {
     if (remaining <= 0) break;
     try {
       const source = fs.readFileSync(filePath, 'utf8');
       if (source.includes('\0')) continue;
-      const isEntry = /(?:^|\/)(?:index|main|app|router|routes|server)\./i.test(filePath);
-      const isJourneySource = /(activity|fragment|screen|navigation|navigator|router|search|explore|article|readinglist|saved|history|settings|nearby|map|login|edit)/i.test(filePath);
-      const excerpt = source.slice(0, Math.min(isEntry ? 2800 : isJourneySource ? 1800 : 900, remaining));
+      const v = filePath.toLowerCase();
+      const base = path.basename(v);
+      const isEntry        = /^(main|index|app|router|routes|server|application)\.[^/]+$/.test(base);
+      const isJourney      = /(activity|fragment|screen|page|view|navigation|navigator|route|scene|search|explore|article|readinglist|saved|history|settings|nearby|map|login|edit|auth|home|feed|detail|profile|dashboard|checkout|cart|payment|onboard)/.test(v);
+      const isServiceLayer = /(api|service|repository|store|manager|controller|handler|endpoint)/.test(v);
+      const limit = isEntry ? 4000 : isJourney ? 2500 : isServiceLayer ? 1500 : 900;
+      const excerpt = source.slice(0, Math.min(limit, remaining));
       chunks.push(`\n// ── ${path.basename(filePath)} ──\n${excerpt}`);
       remaining -= excerpt.length;
     } catch { /* omit unreadable source */ }

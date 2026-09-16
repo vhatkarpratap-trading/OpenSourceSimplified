@@ -20,7 +20,7 @@ export interface GraphifyPromptContext {
 interface GraphNode { id: string; label: string; sourceFile?: string; fileType?: string }
 interface GraphEdge { source: string; target: string; relation: string; confidence: string; score?: number; sourceFile?: string }
 
-const MAX_GRAPH_BYTES = 20 * 1024 * 1024;
+const MAX_GRAPH_BYTES = 200 * 1024 * 1024; // 200 MB — large monorepo graphs are expected
 const text = (value: unknown, max = 220): string => String(value ?? '').replace(/[\u0000-\u001f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
 
 function graphFile(folder: string) { return path.join(folder, 'graphify-out', 'graph.json'); }

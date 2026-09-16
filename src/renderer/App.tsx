@@ -101,7 +101,6 @@ export default function App() {
   const [sourcePanelOpen, setSourcePanelOpen] = useState(false);
   const [sourceView, setSourceView] = useState<{ files?: Array<{ path: string; content: string; highlight?: string }>; error?: string } | null>(null);
   const [sourceFileIndex, setSourceFileIndex] = useState(0);
-  const [codeStoryData, setCodeStoryData] = useState<Record<string, { input: string; output: string; change: string }> | null>(null);
   const [graphBuilding, setGraphBuilding] = useState(false);
   const [aiProvider, setAiProvider] = useState('claude');
   const [analysisDepth, setAnalysisDepth] = useState<1 | 2 | 3>(2);
@@ -1399,8 +1398,7 @@ export default function App() {
               onAPIReady={(api) => { excalidrawAPIRef.current = api; }}
               onRenderError={setRenderError}
               onDrilldownChange={(active) => { setDrilldownActive(active); if (!active) setDrillDepth(0); }}
-              onCodeFlowChange={(active) => { setCodeFlowActive(active); if (!active) { setCodeFlowDepth(0); setCodeStoryData(null); } }}
-              onCodeStoryDataFlow={setCodeStoryData}
+              onCodeFlowChange={(active) => { setCodeFlowActive(active); if (!active) setCodeFlowDepth(0); }}
               onSelectionChange={handleSelectionChange}
               clearDrilldownRef={clearDrilldownRef}
               clearCodeFlowRef={clearCodeFlowRef}
@@ -1415,32 +1413,6 @@ export default function App() {
               selectionAnswerRef={selectionAnswerRef}
             />
             </div>
-
-            {codeFlowActive && codeStoryData && Object.keys(codeStoryData).length > 0 && (
-              <aside style={{
-                width: 330, minWidth: 300, flexShrink: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden',
-                background: '#0f172a', borderLeft: '1px solid #334155', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-              }}>
-                <div style={{ padding: '9px 12px', borderBottom: '1px solid #334155', color: '#bfdbfe', fontSize: 10, fontFamily: 'system-ui, sans-serif', fontWeight: 700, letterSpacing: '0.08em' }}>
-                  DATA FLOW · BEFORE → AFTER
-                </div>
-                <div style={{ overflowY: 'auto', padding: 8 }}>
-                  {Object.entries(codeStoryData).map(([step, data]) => (
-                    <div key={step} style={{ marginBottom: 10, border: '1px solid #334155', borderRadius: 7, overflow: 'hidden' }}>
-                      <div style={{ padding: '6px 8px', color: '#e0f2fe', background: '#172554', fontFamily: 'system-ui, sans-serif', fontWeight: 600, fontSize: 11 }}>{step}</div>
-                      <div style={{ padding: 8, fontSize: 10, color: '#cbd5e1', lineHeight: 1.45 }}>
-                        <div style={{ color: '#94a3b8', fontFamily: 'system-ui, sans-serif', fontSize: 9, marginBottom: 2 }}>IN</div>
-                        <pre style={{ margin: '0 0 7px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: '#bfdbfe' }}>{data.input}</pre>
-                        <div style={{ color: '#94a3b8', fontFamily: 'system-ui, sans-serif', fontSize: 9, marginBottom: 2 }}>TRANSFORM</div>
-                        <div style={{ marginBottom: 7, color: '#fef3c7', fontFamily: 'system-ui, sans-serif' }}>{data.change}</div>
-                        <div style={{ color: '#94a3b8', fontFamily: 'system-ui, sans-serif', fontSize: 9, marginBottom: 2 }}>OUT</div>
-                        <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: '#bbf7d0' }}>{data.output}</pre>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </aside>
-            )}
 
             {sourcePanelOpen && (
               <aside style={{
