@@ -1667,57 +1667,43 @@ function shouldRunCodeStoryReview(sourceCode: string, candidate: { mermaid?: str
 
 function buildImplementationPrompt(name: string, sourceCode: string, hierarchyContext = ''): string {
   return [
-    'Create an example-led technical story called "How this is built" for the selected feature, "' + name + '". It must let a developer follow one representative piece of data through the real implementation, from trigger to result.',
+    'Explain how “' + name + '” is built, in plain English, using only the supplied source code as evidence.',
     'Output ONLY the JSON below — no fences, no prose.',
     analysisDepthGuidance(), '',
-    'PRIORITY:',
-    '- Clarity beats completeness, but never hide a source-proven HTTP endpoint, request, response, or important data transformation merely to keep the diagram short.',
-    '- Start with what this feature enables: the trigger and the useful result it produces. Then show the small number of internal handoffs that make it happen.',
-    '- Use everyday labels. Say "Check the saved project", "Ask the project service", "Show the project details"—not class names, architecture patterns, or a line of source code.',
-    '- Use 6–14 main nodes. Include an extra node whenever it reveals a real endpoint contract, data transformation, decision, or useful failure outcome.',
+    'YOUR GOAL:',
+    'A developer reading this should understand exactly how this piece of code works — what triggers it, what it does step by step, and what comes out. Write it as a guided story, not a technical inventory.',
+    '',
+    'LANGUAGE RULES (most important):',
+    '- Write every node label and description in plain English. No class names, function names, file paths, or framework jargon anywhere in the output.',
+    '- Instead of “ViewModel.fetchData()” say “Ask for the latest data”.',
+    '- Instead of “Repository.insert(entity)” say “Save the new record”.',
+    '- Instead of “StateFlow<UiState>” say “the current screen state”.',
+    '- Short node labels (3–6 words). Descriptions are 1–3 sentences explaining what happens and why.',
+    '',
+    'STORY RULES:',
+    '- Pick one concrete action the user takes (or one trigger that fires) that is proven by the source. Make that the first node.',
+    '- Follow that same action through every step: what the code checks, what it asks for, what comes back, how the result is used.',
+    '- Each node answers: “What happens next?” not “What does this class do?”',
+    '- Use 6–10 nodes. Add a node only when something meaningfully new happens to the data or control flow.',
+    '- Show the one or two most important failure outcomes if the source proves them (e.g. “nothing found”, “request failed”). Skip low-level error wrapping.',
     '',
     'TRUTHFULNESS:',
-    '- Use only facts proven by the supplied source.',
-    '- Treat DRILL FLOW CONTEXT as the feature scope. Preserve proved outcomes and branches, but do not redraw the user journey.',
-    '- Combine private helper functions into the component that owns them. Do not invent details, fields, endpoints, or error paths.',
-    hierarchyContext ? [
-      '',
-      'LOCAL AST EVIDENCE (authoritative):',
-      '- Use this local class/function hierarchy to identify component ownership and direct calls.',
-      '- A `contains` edge means ownership only; a `calls` edge is a source-proven direct call.',
-      '- Do not claim an unshown call or cross-component contract.',
-      hierarchyContext,
-    ].join('\n') : '',
-    '',
-    'EXAMPLE-LED IMPLEMENTATION STORY:',
-    '- Choose one representative input, record, request, or user action that is genuinely evidenced by the supplied source. Introduce it in the first node and follow that SAME example through every later step.',
-    '- Explain the sequence as a story: what arrives → what the feature checks → what it asks for → what comes back → how it changes or selects the data → what it finally shows, stores, or hands off.',
-    '- If source proves only a type or no concrete field names, use a clearly symbolic example such as "the selected item" or `{selectedId}`. Never make up sample values, endpoint fields, success statuses, or response objects.',
-    '- Do not draw a static architecture inventory. Each node must answer: "What happens next to our example?" Keep independent branches only for source-proven outcomes such as empty data, validation failure, or request failure.',
-    '- Begin every node description with `In this example:` and explain what happens to the same representative data at that point before giving the technical contract details.',
-    '',
-    'COMMUNICATION CONTRACTS:',
-    '- Show every meaningful handoff between components, layers, processes, services, repositories, storage, or external systems. A tiny private helper does not need its own contract.',
-    '- Make each handoff easy to read: `Caller -->|what it asks for and key input| Receiver` followed by `Receiver -->|what comes back or fails| Caller`.',
-    '- For EVERY source-proven REST/HTTP call, always draw all three parts: `Request — METHOD path and key input` → `Service — REST call` → `Response — status and result`. Do not collapse an endpoint into a vague “load data” or “call service” step.',
-    '- The REST request description MUST say: `Endpoint: METHOD /path. Request data: query, path, header, and body fields proven by source (or none/unknown).` Use placeholders such as `{visitId}`; never invent values or fields.',
-    '- The REST response description MUST say: `Response data: source-proven status, fields/types, and error behaviour (or unknown). Used by: exactly how this component reads, filters, transforms, stores, or displays that data.`',
-    '- A provider name is never enough. When an SDK hides HTTP, show two explicit nodes: `Send audio/data to provider SDK` and `Receive provider result`. Their descriptions MUST say `Endpoint: unknown (provider SDK)` plus the proved SDK operation, input fields/types, output fields/types, and error result; do not invent a URL.',
-    '- Follow returned data until its next meaningful use. If the code maps a response to view data, filters a list, chooses an item, saves it, or passes it to another component, show that handoff and describe the before → after data shape in plain English.',
-    '- For IPC, storage, repositories, and events use the same idea: show who asks, what they send, who handles it, and what returns. Do not create a separate node for request and response when an arrow label makes the contract clear.',
-    '- For a source-proven database or persistent store, state the storage contract: entity/table/collection or record key when proven, the fields or types that cross the boundary, and whether the operation reads, creates, updates, or deletes. If the schema is not present in the supplied source, say `schema unknown`; never infer it from a name.',
-    '- EVERY node description must teach the reader, not merely cite the code. Use this exact reader-friendly order: `In this example: [what happens to the representative input/data]. Data: [what comes in → what leaves, including fields/types when source proves them]. Communication: [endpoint/caller/receiver and request or response when applicable]. Why it happens: [why this step is needed for the feature to work].`',
-    '- Explain unfamiliar terms where they appear. For example: `What it means: Streaming links are optional saved web addresses for music services. Why it happens: Empty addresses cannot open a service, so the app keeps only usable links. Communication: The screen receives the usable list and creates one button for each link.`',
-    '- Keep descriptions free of source paths, function names, class names, and framework jargon. The chart should read like a guided explanation, not a code review.',
+    '- Only describe what is directly shown in the source code below. Do not invent endpoints, field names, or behaviours.',
+    '- If you cannot tell what a piece of data looks like, say “the result” or “the saved item” rather than guessing field names.',
+    '- Combine small private helpers into the step that calls them — they do not need their own node.',
+    hierarchyContext ? '\nCODE STRUCTURE EVIDENCE (use to understand ownership and call order):\n' + hierarchyContext : '',
     '',
     'DIAGRAM:',
-    '- Use flowchart TD. Rectangles are steps; diamonds are only for important decisions; database/cloud shapes are only for proven storage/external systems.',
-    '- Use short, plain-English node labels and short arrow labels. Keep source-level names in descriptions only.',
-    '- Show meaningful success and failure/empty outcomes, but merge low-level errors that lead to the same result.',
-    '- Never expose secrets.', '',
+    '- flowchart TD. Rectangles for steps, diamonds only for real decisions in the code, database shape only for actual storage.',
+    '- Arrow labels say what is passed or decided, in plain English.',
+    '',
     'Schema:',
-    '{"mermaid":"flowchart TD string — use \n for newlines","descriptions":{"Node Label":"In this example: ... Data: input → output. Communication: Endpoint: METHOD /path; Request data: ...; Response data: ...; Used by: ... Why it happens: ..."},"happyPath":["nodeId1","nodeId2"]}', '',
-    'SOURCE CODE of ' + name + ':', sourceCode.slice(0, 16000), '', 'JSON only.',
+    '{“mermaid”:”flowchart TD string”,”descriptions”:{“Node Label”:”Plain English explanation of what happens at this step and why.”},”happyPath”:[“nodeId1”,”nodeId2”]}',
+    '',
+    'SOURCE CODE of ' + name + ':',
+    sourceCode.slice(0, 16000),
+    '',
+    'JSON only.',
   ].join('\n');
 }
 
@@ -2142,7 +2128,7 @@ async function runComponentImplementation(rawName: string, drillMermaid = ''): P
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
       const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] };
-      if (!drillMermaid && cached.version === 19 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, happyPath: cached.happyPath ?? [] };
+      if (!drillMermaid && cached.version === 20 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, happyPath: cached.happyPath ?? [] };
     }
     const structure = extractStructure(currentFolder);
     const sourceFiles = findSourceFiles(name, structure.nodePaths, currentFolder, 6);
@@ -2161,7 +2147,7 @@ async function runComponentImplementation(rawName: string, drillMermaid = ''): P
     const hierarchyContext = [buildHierarchyContext(sourceFiles), graphifyPromptContext(currentFolder, name).evidence].filter(Boolean).join('\n\n');
     const parsed = extractJson(await runCapture(buildImplementationPrompt(name, sourceCode + scope, hierarchyContext), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
-    const result = { version: 19, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {}, happyPath: parsed.happyPath ?? [] };
+    const result = { version: 20, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {}, happyPath: parsed.happyPath ?? [] };
     saveCodeFlow(currentFolder, cacheKey, JSON.stringify(result));
     return { ok: true, mermaid: result.mermaid, descriptions: result.descriptions, happyPath: result.happyPath };
   } catch (err: unknown) { return { error: err instanceof Error ? err.message : String(err) }; }
