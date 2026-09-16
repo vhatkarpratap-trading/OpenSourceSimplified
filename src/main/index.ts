@@ -1667,38 +1667,41 @@ function shouldRunCodeStoryReview(sourceCode: string, candidate: { mermaid?: str
 
 function buildImplementationPrompt(name: string, sourceCode: string, hierarchyContext = ''): string {
   return [
-    'Explain how “' + name + '” is built, in plain English, using only the supplied source code as evidence.',
+    'Produce a technical code walkthrough for “' + name + '” — explain exactly what the code does, method by method, in English sentences rather than code.',
     'Output ONLY the JSON below — no fences, no prose.',
     analysisDepthGuidance(), '',
-    'YOUR GOAL:',
-    'A developer reading this should understand exactly how this piece of code works — what triggers it, what it does step by step, and what comes out. Write it as a guided story, not a technical inventory.',
+    'GOAL:',
+    'A developer who has not read this code should finish understanding: which methods exist, what each one does, what data enters and leaves, how they call each other, and where side-effects happen (storage, network, events, IPC). Write it as a walkthrough, not a summary.',
     '',
-    'LANGUAGE RULES (most important):',
-    '- Write every node label and description in plain English. No class names, function names, file paths, or framework jargon anywhere in the output.',
-    '- Instead of “ViewModel.fetchData()” say “Ask for the latest data”.',
-    '- Instead of “Repository.insert(entity)” say “Save the new record”.',
-    '- Instead of “StateFlow<UiState>” say “the current screen state”.',
-    '- Short node labels (3–6 words). Descriptions are 1–3 sentences explaining what happens and why.',
+    'WHAT TO SHOW:',
+    '- One node per meaningful method, function, or handler — use the real method/function name as the node label.',
+    '- Show every call chain: if method A calls B which calls C, draw that sequence.',
+    '- For each method explain: what parameters it receives and their types/shapes, what it does internally (the logic, any important decisions or loops), what it returns or emits, and any side-effects (writes to storage, fires an event, makes a network call).',
+    '- For network calls: show the HTTP method, path, request payload shape, and response shape as proven by source.',
+    '- For storage: show the operation (read/write/delete), the key or table, and the data shape.',
+    '- For events/IPC: show the channel name, what is sent, and what handler receives it.',
+    '- Data transformations matter: if a method maps, filters, or reshapes data, describe the before and after shape.',
     '',
-    'STORY RULES:',
-    '- Pick one concrete action the user takes (or one trigger that fires) that is proven by the source. Make that the first node.',
-    '- Follow that same action through every step: what the code checks, what it asks for, what comes back, how the result is used.',
-    '- Each node answers: “What happens next?” not “What does this class do?”',
-    '- Use 6–10 nodes. Add a node only when something meaningfully new happens to the data or control flow.',
-    '- Show the one or two most important failure outcomes if the source proves them (e.g. “nothing found”, “request failed”). Skip low-level error wrapping.',
+    'LANGUAGE:',
+    '- Use real method and class names in node labels (e.g. “runComponentImplementation”, “saveCodeFlow”).',
+    '- Write descriptions in English sentences, not code. Explain intent and mechanism together.',
+    '- Example description: “Receives the component name and an optional drill diagram string. Checks the disk cache first using a version-stamped key. If no cache hit, collects source files up to a 16 000-character budget, builds the prompt, calls the AI, parses the JSON response, saves it to cache, and returns the mermaid diagram with descriptions.”',
+    '- Avoid vague words like “handles”, “processes”, “manages”. Say what specifically happens.',
     '',
     'TRUTHFULNESS:',
-    '- Only describe what is directly shown in the source code below. Do not invent endpoints, field names, or behaviours.',
-    '- If you cannot tell what a piece of data looks like, say “the result” or “the saved item” rather than guessing field names.',
-    '- Combine small private helpers into the step that calls them — they do not need their own node.',
-    hierarchyContext ? '\nCODE STRUCTURE EVIDENCE (use to understand ownership and call order):\n' + hierarchyContext : '',
+    '- Only describe what the supplied source proves. Do not invent parameters, return types, or behaviour.',
+    '- If a method delegates to a private helper, absorb the helper into that method\'s description rather than creating a separate node for trivial wrappers.',
+    '- If a field name or type is not visible in the source, say “type unknown” rather than guessing.',
+    hierarchyContext ? '\nCODE STRUCTURE EVIDENCE (authoritative — use for call order and ownership):\n' + hierarchyContext : '',
     '',
     'DIAGRAM:',
-    '- flowchart TD. Rectangles for steps, diamonds only for real decisions in the code, database shape only for actual storage.',
-    '- Arrow labels say what is passed or decided, in plain English.',
+    '- flowchart TD. Each node is a method/function/handler.',
+    '- Arrow labels describe what is passed between them (parameter name and type/shape when known).',
+    '- Diamonds only for real conditional branches proven in source. Database/cloud shapes for actual storage or external systems.',
+    '- 6–14 nodes. Merge trivial one-liner helpers into their caller.',
     '',
     'Schema:',
-    '{“mermaid”:”flowchart TD string”,”descriptions”:{“Node Label”:”Plain English explanation of what happens at this step and why.”},”happyPath”:[“nodeId1”,”nodeId2”]}',
+    '{“mermaid”:”flowchart TD string”,”descriptions”:{“methodName”:”English walkthrough: parameters, internal logic, return value, side-effects.”},”happyPath”:[“nodeId1”,”nodeId2”]}',
     '',
     'SOURCE CODE of ' + name + ':',
     sourceCode.slice(0, 16000),
@@ -2128,7 +2131,7 @@ async function runComponentImplementation(rawName: string, drillMermaid = ''): P
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
       const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] };
-      if (!drillMermaid && cached.version === 20 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, happyPath: cached.happyPath ?? [] };
+      if (!drillMermaid && cached.version === 21 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, happyPath: cached.happyPath ?? [] };
     }
     const structure = extractStructure(currentFolder);
     const sourceFiles = findSourceFiles(name, structure.nodePaths, currentFolder, 6);
@@ -2147,7 +2150,7 @@ async function runComponentImplementation(rawName: string, drillMermaid = ''): P
     const hierarchyContext = [buildHierarchyContext(sourceFiles), graphifyPromptContext(currentFolder, name).evidence].filter(Boolean).join('\n\n');
     const parsed = extractJson(await runCapture(buildImplementationPrompt(name, sourceCode + scope, hierarchyContext), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
-    const result = { version: 20, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {}, happyPath: parsed.happyPath ?? [] };
+    const result = { version: 21, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {}, happyPath: parsed.happyPath ?? [] };
     saveCodeFlow(currentFolder, cacheKey, JSON.stringify(result));
     return { ok: true, mermaid: result.mermaid, descriptions: result.descriptions, happyPath: result.happyPath };
   } catch (err: unknown) { return { error: err instanceof Error ? err.message : String(err) }; }
