@@ -1,7 +1,6 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import type { ExcalidrawImperativeAPI } from '@excalidraw/excalidraw/types/types';
 import Canvas from './Canvas';
-import MermaidRenderer from './MermaidRenderer';
 import { DiagramData, DiagramKind } from './diagramBuilder';
 import type { CommitInfo, CommitDiffResult, PRInfo, PRReviewResult, ChangeContextNode } from './global';
 
@@ -99,6 +98,7 @@ export default function App() {
   const [drilling, setDrilling]               = useState(false);
   const [storyLoading, setStoryLoading]       = useState(false);
   const [implLoading, setImplLoading]         = useState(false);
+  const [bulkPlot, setBulkPlot] = useState<{ mode: 'drill' | 'story' | 'implementation'; current: number; total: number } | null>(null);
   const codeFlowLoading = storyLoading || implLoading;
   const [sourcePanelOpen, setSourcePanelOpen] = useState(false);
   const [sourceView, setSourceView] = useState<{ files?: Array<{ path: string; content: string; highlight?: string }>; error?: string } | null>(null);
@@ -185,6 +185,7 @@ export default function App() {
   const clearAllCodeFlowsRef = useRef<(() => void) | null>(null);
   const renderDrilldownRef = useRef<((name: string) => void) | null>(null);
   const renderCodeFlowRef  = useRef<((name: string, mode?: 'story' | 'implementation' | 'actual', drillMermaid?: string) => Promise<void>) | null>(null);
+  const componentNamesRef  = useRef<(() => string[]) | null>(null);
   const flowInFlightRef    = useRef(false);
   const canvasContextRef   = useRef<(() => string) | null>(null);
   const rawElementsRef     = useRef<(() => unknown[]) | null>(null);
@@ -405,6 +406,8 @@ export default function App() {
 
   const folderName = folder ? folder.split('/').filter(Boolean).pop() : null;
   const busy = status === 'running' || status === 'patching';
+  const bulkPlotting = !!bulkPlot;
+  const canBulkPlot = !!folder && !!diagram && !bulkPlotting && !drilling && !codeFlowLoading;
   const canvasLabel = (drilldownActive || codeFlowActive)
     ? [drilldownActive && `Drill: ${selectedComponent ?? ''}`, codeFlowActive && `Flow: ${selectedComponent ?? ''}`].filter(Boolean).join(' · ')
     : prActive && activePR
@@ -439,16 +442,19 @@ export default function App() {
   }, [selectedComponent, drilling]);
 
   const handleCodeFlow = useCallback(async () => {
-    if (!selectedComponent || codeFlowLoading || flowInFlightRef.current) return;
+    if (!selectedComponent || flowInFlightRef.current) return;
     flowInFlightRef.current = true;
     setStoryLoading(true);
-    await renderCodeFlowRef.current?.(selectedComponent);
-    setCodeFlowDepth(d => d + 1);
-    sessionPanelsRef.current = [...sessionPanelsRef.current, { name: selectedComponent, mode: 'story' }];
-    window.electronAPI.saveSessionPanels(sessionPanelsRef.current);
-    setStoryLoading(false);
-    flowInFlightRef.current = false;
-  }, [selectedComponent, codeFlowLoading]);
+    try {
+      await renderCodeFlowRef.current?.(selectedComponent);
+      setCodeFlowDepth(d => d + 1);
+      sessionPanelsRef.current = [...sessionPanelsRef.current, { name: selectedComponent, mode: 'story' }];
+      window.electronAPI.saveSessionPanels(sessionPanelsRef.current);
+    } finally {
+      setStoryLoading(false);
+      flowInFlightRef.current = false;
+    }
+  }, [selectedComponent]);
 
   const handleActualCodeFlow = useCallback(async () => {
     if (!selectedComponent) return;
@@ -462,16 +468,56 @@ export default function App() {
   }, [selectedComponent]);
 
   const handleImplementation = useCallback(async () => {
-    if (!selectedComponent || codeFlowLoading || flowInFlightRef.current) return;
+    if (!selectedComponent || flowInFlightRef.current) return;
     flowInFlightRef.current = true;
     setImplLoading(true);
-    await renderCodeFlowRef.current?.(selectedComponent, 'implementation');
-    setCodeFlowDepth(d => d + 1);
-    sessionPanelsRef.current = [...sessionPanelsRef.current, { name: selectedComponent, mode: 'implementation' }];
-    window.electronAPI.saveSessionPanels(sessionPanelsRef.current);
-    setImplLoading(false);
-    flowInFlightRef.current = false;
-  }, [selectedComponent, codeFlowLoading]);
+    try {
+      await renderCodeFlowRef.current?.(selectedComponent, 'implementation');
+      setCodeFlowDepth(d => d + 1);
+      sessionPanelsRef.current = [...sessionPanelsRef.current, { name: selectedComponent, mode: 'implementation' }];
+      window.electronAPI.saveSessionPanels(sessionPanelsRef.current);
+    } finally {
+      setImplLoading(false);
+      flowInFlightRef.current = false;
+    }
+  }, [selectedComponent]);
+
+  const handlePlotAll = useCallback(async (mode: 'drill' | 'story' | 'implementation') => {
+    if (bulkPlot || flowInFlightRef.current) return;
+    const names = Array.from(new Set((componentNamesRef.current?.() ?? [])
+      .map(name => name.trim())
+      .filter(Boolean)));
+    if (names.length === 0) {
+      setRenderError('There are no components on the current diagram to plot.');
+      return;
+    }
+
+    setBulkPlot({ mode, current: 0, total: names.length });
+    if (mode === 'drill') setDrilling(true);
+    else {
+      flowInFlightRef.current = true;
+      mode === 'story' ? setStoryLoading(true) : setImplLoading(true);
+    }
+
+    try {
+      for (let index = 0; index < names.length; index += 1) {
+        const name = names[index];
+        setBulkPlot({ mode, current: index + 1, total: names.length });
+        if (mode === 'drill') await renderDrilldownRef.current?.(name);
+        else await renderCodeFlowRef.current?.(name, mode);
+        sessionPanelsRef.current = [...sessionPanelsRef.current, { name, mode }];
+      }
+      if (mode === 'drill') setDrillDepth(depth => depth + names.length);
+      else setCodeFlowDepth(depth => depth + names.length);
+      window.electronAPI.saveSessionPanels(sessionPanelsRef.current);
+    } finally {
+      setBulkPlot(null);
+      setDrilling(false);
+      setStoryLoading(false);
+      setImplLoading(false);
+      flowInFlightRef.current = false;
+    }
+  }, [bulkPlot]);
 
   const handleRepositoryCodeStory = useCallback(async () => {
     if (!folder || codeFlowLoading || flowInFlightRef.current) return;
@@ -823,6 +869,31 @@ export default function App() {
           {drilling ? 'Drilling…' : selectedComponent ? `Drill: ${selectedComponent}` : 'Drill'}
         </button>
 
+        {(['drill', 'story', 'implementation'] as const).map(mode => {
+          const label = mode === 'drill' ? 'Plot all drills' : mode === 'story' ? 'Plot all stories' : 'Plot all builds';
+          const active = bulkPlot?.mode === mode;
+          return (
+            <button
+              key={mode}
+              onClick={() => void handlePlotAll(mode)}
+              disabled={!canBulkPlot}
+              title={`${label} for every component in the current diagram`}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 5, padding: '6px 9px',
+                background: canBulkPlot || active ? '#263449' : '#1b1b24',
+                border: `1px solid ${canBulkPlot || active ? '#4b6b91' : '#3b3b47'}`, borderRadius: 6,
+                color: canBulkPlot || active ? '#dbeafe' : '#777782', fontSize: 11,
+                fontFamily: 'system-ui, -apple-system, sans-serif', cursor: canBulkPlot ? 'pointer' : 'not-allowed',
+                opacity: canBulkPlot || active ? 1 : 0.45, flexShrink: 0,
+                // @ts-ignore
+                WebkitAppRegion: 'no-drag',
+              }}
+            >
+              {active ? `${bulkPlot!.current}/${bulkPlot!.total}` : label}
+            </button>
+          );
+        })}
+
         {/* Code Story button */}
         <button
           onClick={() => { if (flowInFlightRef.current) return; if (selectedComponent) void handleCodeFlow(); else void handleRepositoryCodeStory(); }}
@@ -876,7 +947,7 @@ export default function App() {
             WebkitAppRegion: 'no-drag',
           }}
         >
-          <FlowIcon /> {implLoading ? 'Explaining…' : selectedComponent ? 'How it is built' : 'How the project is built'}
+          <FlowIcon /> {implLoading ? 'Explaining…' : selectedComponent ? 'How it builds' : 'How the project builds'}
         </button>
 
         <button
@@ -1433,6 +1504,7 @@ export default function App() {
               clearAllCodeFlowsRef={clearAllCodeFlowsRef}
               renderDrilldownRef={renderDrilldownRef}
               renderCodeFlowRef={renderCodeFlowRef}
+              componentNamesRef={componentNamesRef}
               canvasContextRef={canvasContextRef}
               rawElementsRef={rawElementsRef}
               renderCommitDiffRef={renderCommitDiffRef}

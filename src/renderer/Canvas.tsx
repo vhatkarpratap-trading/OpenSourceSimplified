@@ -14,13 +14,13 @@ interface CanvasProps {
   onRenderError?: (message: string | null) => void;
   onDrilldownChange?: (active: boolean) => void;
   onCodeFlowChange?: (active: boolean) => void;
-  onImplementationExplanations?: (descriptions: Record<string, string> | null) => void;
   onSelectionChange?: (names: string[]) => void;
   clearDrilldownRef?: React.MutableRefObject<(() => void) | null>;
   clearCodeFlowRef?: React.MutableRefObject<(() => void) | null>;
   clearAllCodeFlowsRef?: React.MutableRefObject<(() => void) | null>;
   renderDrilldownRef?: React.MutableRefObject<((name: string) => void) | null>;
   renderCodeFlowRef?: React.MutableRefObject<((name: string, mode?: 'story' | 'implementation' | 'actual', drillMermaid?: string) => Promise<void>) | null>;
+  componentNamesRef?: React.MutableRefObject<(() => string[]) | null>;
   canvasContextRef?: React.MutableRefObject<(() => string) | null>;
   rawElementsRef?: React.MutableRefObject<(() => unknown[]) | null>;
   renderCommitDiffRef?: React.MutableRefObject<((diff: CommitDiffResult) => Promise<void>) | null>;
@@ -128,7 +128,7 @@ function applyZoomAndGit(
   });
 }
 
-export default function Canvas({ diagramData, activeKind = 'structure', onAPIReady, onRenderError, onDrilldownChange, onCodeFlowChange, onImplementationExplanations, onSelectionChange, clearDrilldownRef, clearCodeFlowRef, clearAllCodeFlowsRef, renderDrilldownRef, renderCodeFlowRef, canvasContextRef, rawElementsRef, renderCommitDiffRef, clearCommitDiffRef, addNoteRef, selectionAnswerRef, errorAnnotations }: CanvasProps) {
+export default function Canvas({ diagramData, activeKind = 'structure', onAPIReady, onRenderError, onDrilldownChange, onCodeFlowChange, onSelectionChange, clearDrilldownRef, clearCodeFlowRef, clearAllCodeFlowsRef, renderDrilldownRef, renderCodeFlowRef, componentNamesRef, canvasContextRef, rawElementsRef, renderCommitDiffRef, clearCommitDiffRef, addNoteRef, selectionAnswerRef, errorAnnotations }: CanvasProps) {
   const [apiReady, setApiReady] = useState(false);
   const apiRef          = useRef<ExcalidrawImperativeAPI | null>(null);
   const lastDataRef     = useRef<DiagramData | null>(null);
@@ -1000,7 +1000,6 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
           : await window.electronAPI.getComponentCodeFlow(name, drillMermaid);
       console.log('[codeflow] ok:', res?.ok, 'error:', res?.error);
       if (!res?.ok || !res.mermaid) throw new Error(res?.error || 'no mermaid');
-      onImplementationExplanations?.(mode === 'implementation' ? (res.descriptions ?? {}) : null);
       const { buildMermaidScene: bms } = await import('./mermaidScene');
       const flowScene = await bms(res.mermaid, res.descriptions);
 
@@ -1008,14 +1007,9 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       const freshRects = freshEls.filter(e =>
         e.type === 'rectangle' && !e.id.startsWith('flow-loading')
       ) as (ExcalidrawElement & { x: number; y: number; width: number; height: number })[];
-      // Code Story is a companion panel. Implementation is a focused learning
-      // view: replacing the user-flow scene makes contracts readable instead
-      // of shrinking them beside a second diagram.
-      const panelOffsetX = mode === 'implementation'
-        ? 80
-        : freshRects.reduce((m, e) => Math.max(m, e.x + e.width), 0) + 100;
+      const panelOffsetX = freshRects.reduce((m, e) => Math.max(m, e.x + e.width), 0) + 100;
       const panelOffsetY = freshRects.reduce((m, e) => Math.min(m, e.y), Infinity);
-      const panelY = mode === 'implementation' ? 60 : (isFinite(panelOffsetY) ? panelOffsetY : 0);
+      const panelY = isFinite(panelOffsetY) ? panelOffsetY : 0;
 
       const depth = flowStackRef.current.length;
       seed = 7000000 + depth * 100000;
@@ -1185,7 +1179,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
         startBinding: null, endBinding: null, roundness: { type: 2 }, elbowed: false,
       }] : [];
 
-      const title = mode === 'actual' ? 'Actual Code Flow' : mode === 'implementation' ? 'Implementation story' : 'Code Story';
+      const title = mode === 'actual' ? 'Actual Code Flow' : mode === 'implementation' ? 'How it builds' : 'Code Story';
       const labelText = happyPath.length > 0
         ? `⟳ ${title}: ${name}  ·  🔴 = main path (read in order)`
         : `⟳ ${title}: ${name}`;
@@ -1204,9 +1198,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
 
       const withoutLoading = (api.getSceneElements() as unknown as ExcalidrawElement[])
         .filter(e => !e.id.startsWith('flow-loading'));
-      const finalEls = mode === 'implementation'
-        ? [...labelEls, ...flowElsMutable, ...happyOverlayEls]
-        : [...withoutLoading, ...connEls, ...labelEls, ...flowElsMutable, ...happyOverlayEls];
+      const finalEls = [...withoutLoading, ...connEls, ...labelEls, ...flowElsMutable, ...happyOverlayEls];
 
       flowStackRef.current.push(withoutLoading as ExcalidrawElement[]);
 
@@ -1228,7 +1220,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
           e.id.startsWith(`flow-d${depth}`) || e.id === `flow-conn-d${depth}` || e.id === `flow-label-d${depth}`
         );
         if (newEls.length > 0)
-          api.scrollToContent(newEls as unknown as EXEl[], { fitToContent: mode === 'implementation', animate: true });
+          api.scrollToContent(newEls as unknown as EXEl[], { fitToContent: false, animate: true });
       }, 150);
 
     } catch (err) {
@@ -1244,6 +1236,15 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
   useEffect(() => {
     if (renderCodeFlowRef) renderCodeFlowRef.current = renderCodeFlow;
   }, [renderCodeFlow, renderCodeFlowRef]);
+
+  // Keep bulk plotting scoped to original diagram components; explanatory
+  // panels add nodes which must not become new analysis targets.
+  useEffect(() => {
+    if (componentNamesRef) componentNamesRef.current = () => Object.keys(flatRef.current?.nodeIds ?? {});
+    return () => {
+      if (componentNamesRef) componentNamesRef.current = null;
+    };
+  }, [componentNamesRef]);
 
   // ── Error annotation badges ───────────────────────────────────────────────────
 
