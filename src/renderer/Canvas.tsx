@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Excalidraw } from '@excalidraw/excalidraw';
+import { Excalidraw, FONT_FAMILY } from '@excalidraw/excalidraw';
 import type { ExcalidrawImperativeAPI } from '@excalidraw/excalidraw/types/types';
 import type { ExcalidrawElement as EXEl } from '@excalidraw/excalidraw/types/element/types';
 import { DiagramData, DiagramKind, FlatScene, ExcalidrawElement, TYPE_COLORS } from './diagramBuilder';
@@ -44,6 +44,55 @@ interface GitAnnotation { name: string; summary: string; added: number; removed:
  */
 
 interface ClaudeHighlights { changedNames: string[]; impactedNames: string[] }
+
+/** Render Implementation descriptions as readable Excalidraw code cards. */
+function applyImplementationCodeCards(elements: ExcalidrawElement[], descriptions?: Record<string, string>): ExcalidrawElement[] {
+  if (!descriptions) return elements;
+  const descriptionByLabel = new Map(Object.entries(descriptions).map(([key, value]) => [key.trim().toLowerCase(), value]));
+  const labelByContainer = new Map<string, string>();
+  for (const el of elements) {
+    if (el.type === 'text') {
+      const text = el as ExcalidrawElement & { containerId?: string | null; text?: string };
+      if (text.containerId && text.text) labelByContainer.set(text.containerId, text.text.trim());
+    }
+  }
+
+  const cards = new Map<string, { title: string; code: string; explanation: string; height: number }>();
+  for (const el of elements) {
+    if (el.type !== 'rectangle') continue;
+    const label = labelByContainer.get(el.id);
+    const description = label ? descriptionByLabel.get(label.toLowerCase()) : undefined;
+    const match = description?.match(/^Code:\s*([\s\S]*?)(?:\n\s*Explanation:\s*([\s\S]*))?$/i);
+    if (!label || !match?.[1]?.trim()) continue;
+    const code = match[1].trim();
+    const explanation = (match[2] ?? '').trim();
+    const codeLines = code.split('\n').length;
+    cards.set(el.id, { title: label, code, explanation, height: Math.max(180, 108 + codeLines * 23 + (explanation ? 42 : 0)) });
+  }
+  if (cards.size === 0) return elements;
+
+  let seed = 6300000;
+  const extras: ExcalidrawElement[] = [];
+  const updated = elements.map(el => {
+    if (el.type === 'rectangle' && cards.has(el.id)) {
+      const card = cards.get(el.id)!;
+      return { ...el, width: Math.max((el as { width: number }).width, 600), height: card.height, backgroundColor: '#ffffff', strokeColor: '#242424', strokeWidth: 2, roughness: 0.8, roundness: { type: 3 } } as ExcalidrawElement;
+    }
+    if (el.type === 'text') {
+      const text = el as ExcalidrawElement & { containerId?: string | null; x: number; y: number; width: number; height: number; text: string };
+      const card = text.containerId ? cards.get(text.containerId) : undefined;
+      if (card) {
+        const rect = elements.find(candidate => candidate.id === text.containerId) as ExcalidrawElement & { x: number; y: number; width: number };
+        const groupIds = [...new Set([...(text.groupIds ?? []), 'node-group-' + text.containerId])];
+        extras.push({ type: 'text', id: 'code-card-' + text.containerId, x: rect.x + 26, y: rect.y + 66, width: 548, height: card.code.split('\n').length * 23, text: card.code, originalText: card.code, fontSize: 16, fontFamily: FONT_FAMILY.Cascadia, textAlign: 'left', verticalAlign: 'top', strokeColor: '#1f2937', backgroundColor: 'transparent', fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid', angle: 0, roughness: 0, opacity: 100, roundness: null, groupIds, frameId: null, seed: seed++, version: 1, versionNonce: seed++, isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false, containerId: null, lineHeight: 1.35, baseline: 13 } as unknown as ExcalidrawElement);
+        if (card.explanation) extras.push({ type: 'text', id: 'code-note-' + text.containerId, x: rect.x + 26, y: rect.y + 76 + card.code.split('\n').length * 23, width: 548, height: 36, text: card.explanation, originalText: card.explanation, fontSize: 13, fontFamily: FONT_FAMILY.Helvetica, textAlign: 'left', verticalAlign: 'top', strokeColor: '#374151', backgroundColor: 'transparent', fillStyle: 'solid', strokeWidth: 1, strokeStyle: 'solid', angle: 0, roughness: 0, opacity: 100, roundness: null, groupIds, frameId: null, seed: seed++, version: 1, versionNonce: seed++, isDeleted: false, boundElements: null, updated: Date.now(), link: null, locked: false, containerId: null, lineHeight: 1.35, baseline: 11 } as unknown as ExcalidrawElement);
+        return { ...text, x: rect.x + 26, y: rect.y + 22, width: 548, height: 24, text: card.title, originalText: card.title, fontSize: 19, fontFamily: FONT_FAMILY.Helvetica, textAlign: 'left', verticalAlign: 'top', lineHeight: 1.25 } as ExcalidrawElement;
+      }
+    }
+    return el;
+  });
+  return [...updated, ...extras];
+}
 
 function getTypeColor(el: ExcalidrawElement) {
   const nodeType = (el.customData?.nodeType as string | undefined) || '';
@@ -1002,6 +1051,14 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       if (!res?.ok || !res.mermaid) throw new Error(res?.error || 'no mermaid');
       const { buildMermaidScene: bms } = await import('./mermaidScene');
       const flowScene = await bms(res.mermaid, res.descriptions);
+
+      // Excalidraw styles text per element rather than per line. A Code
+      // Walkthrough node contains an exact source snippet, so use its native
+      // Cascadia (monospace) font for the complete node label. This preserves
+      // indentation and makes the snippet reliably legible when zoomed.
+      if (mode === 'implementation') {
+        flowScene.elements = applyImplementationCodeCards(flowScene.elements, res.descriptions);
+      }
 
       const freshEls = api.getSceneElements() as unknown as ExcalidrawElement[];
       const freshRects = freshEls.filter(e =>

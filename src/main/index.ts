@@ -1,4 +1,5 @@
-import { app, BrowserWindow, ipcMain, dialog } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog } from 'electron/main';
+import { shell } from 'electron/common';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -10,6 +11,7 @@ import { extractStructure, toClaudePromptJSON, ExtractedStructure } from './code
 import { buildGraphifyIndex, graphifyPromptContext, graphifySourceFiles } from './graphifyContext';
 import { startMcpServer, stopMcpServer, recordPtyOutput, updateClaudeJsonMcpConfig } from './mcpServer';
 import { listPRs, listLocalBranches, reviewPR, PRInfo } from './prReviewer';
+import { AccountService, PlanId } from './accountService';
 
 let mainWindow: BrowserWindow | null = null;
 let currentFolder: string | null = null;
@@ -18,6 +20,7 @@ let currentNodePaths: Record<string, string> = {};
 let patchInProgress = false;
 let preferredDiagramType = 'flowchart'; // updated by renderer type picker
 let analysisDepth: 1 | 2 | 3 = 2; // overview, balanced, deep — set by the user
+let accountService: AccountService | null = null;
 
 function analysisDepthGuidance(): string {
   if (analysisDepth === 1) return 'DEPTH: Overview. Show only the 4–6 essential steps, the main success path, and at most one important choice. Prefer a short explanation over completeness.';
@@ -63,6 +66,65 @@ interface CommitDiagram {
 }
 
 interface SessionPanel { name: string; mode: 'story' | 'implementation' | 'actual' | 'drill' }
+
+interface WalkthroughSettings {
+  entryPoints: boolean; callChain: boolean; asyncPatterns: boolean; branchingLogic: boolean;
+  dataFlow: boolean; dataTypes: boolean; stateManagement: boolean;
+  dbInteractions: boolean; dbSchema: boolean;
+  restCalls: boolean; graphqlOps: boolean; externalIntegrations: boolean;
+  authChecks: boolean; permissions: boolean;
+  inputValidation: boolean; sensitiveData: boolean;
+  errorHandling: boolean; fallbacks: boolean;
+  caching: boolean; concurrency: boolean;
+  logging: boolean; events: boolean; testCoverage: boolean;
+  designPatterns: boolean; businessLogic: boolean; frameworkUnderstanding: boolean;
+}
+
+const DEFAULT_WALKTHROUGH_SETTINGS: WalkthroughSettings = {
+  entryPoints: false, callChain: false, asyncPatterns: false, branchingLogic: false,
+  dataFlow: false, dataTypes: false, stateManagement: false,
+  dbInteractions: false, dbSchema: false,
+  restCalls: false, graphqlOps: false, externalIntegrations: false,
+  authChecks: false, permissions: false,
+  inputValidation: false, sensitiveData: false,
+  errorHandling: false, fallbacks: false,
+  caching: false, concurrency: false,
+  logging: false, events: false, testCoverage: false,
+  designPatterns: false, businessLogic: false, frameworkUnderstanding: false,
+};
+
+const WALKTHROUGH_SETTING_KEYS = Object.keys(DEFAULT_WALKTHROUGH_SETTINGS) as Array<keyof WalkthroughSettings>;
+
+/** Only accept the known boolean settings from disk or the renderer. */
+function normalizeWalkthroughSettings(settings: Partial<WalkthroughSettings> | null | undefined): WalkthroughSettings {
+  return WALKTHROUGH_SETTING_KEYS.reduce((result, key) => {
+    result[key] = settings?.[key] === true;
+    return result;
+  }, { ...DEFAULT_WALKTHROUGH_SETTINGS });
+}
+
+/** Stable, versioned cache identity for the settings that shape a walkthrough. */
+function walkthroughSettingsFingerprint(settings: WalkthroughSettings): string {
+  const values = WALKTHROUGH_SETTING_KEYS.map(key => `${key}:${settings[key] ? '1' : '0'}`).join('|');
+  return crypto.createHash('sha256').update(`walkthrough-focus-v1|${values}`).digest('hex').slice(0, 12);
+}
+
+let walkthroughSettings: WalkthroughSettings = { ...DEFAULT_WALKTHROUGH_SETTINGS };
+
+function walkthroughSettingsFile() { return path.join(app.getPath('userData'), 'walkthrough-settings.json'); }
+
+function loadWalkthroughSettings(): WalkthroughSettings {
+  try {
+    const raw = JSON.parse(fs.readFileSync(walkthroughSettingsFile(), 'utf8')) as Partial<WalkthroughSettings>;
+    return normalizeWalkthroughSettings(raw);
+  } catch { return { ...DEFAULT_WALKTHROUGH_SETTINGS }; }
+}
+
+function saveWalkthroughSettings(settings: WalkthroughSettings): WalkthroughSettings {
+  walkthroughSettings = normalizeWalkthroughSettings(settings);
+  try { fs.writeFileSync(walkthroughSettingsFile(), JSON.stringify(walkthroughSettings, null, 2), 'utf8'); } catch {}
+  return walkthroughSettings;
+}
 
 interface CacheFile {
   structureHash: string;
@@ -823,6 +885,8 @@ function impactSummaryFromAnnotations(annotations: GitAnnotation[]): ImpactSumma
 
 function createWindow() {
   loadAiProvider();
+  walkthroughSettings = loadWalkthroughSettings();
+  accountService = new AccountService(app.getPath('userData'), url => shell.openExternal(url));
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -873,8 +937,11 @@ function createWindow() {
         currentDiagram = cached.diagram;
         mainWindow.webContents.send('canvas:diagram', cached.diagram);
         mainWindow.webContents.send('folder:restored', { folder: last, hasCachedDiagram: true });
-        if (cached.lastSession?.length) {
-          mainWindow.webContents.send('canvas:restoreSession', cached.lastSession);
+        // Drilldowns are intentionally ephemeral: reopening a project should
+        // show its base map, not begin an AI drill automatically.
+        const restorablePanels = cached.lastSession?.filter((panel) => panel.mode !== 'drill') ?? [];
+        if (restorablePanels.length) {
+          mainWindow.webContents.send('canvas:restoreSession', restorablePanels);
         }
       } else {
         mainWindow.webContents.send('folder:restored', { folder: last, hasCachedDiagram: false });
@@ -904,10 +971,26 @@ app.on('activate', () => { if (mainWindow === null) createWindow(); });
 ipcMain.handle('ai:getProvider', () => ({ provider: getAiProvider(), providers: AI_PROVIDERS }));
 ipcMain.handle('ai:setProvider', (_e, provider: string) => ({ provider: saveAiProvider(provider), providers: AI_PROVIDERS }));
 ipcMain.handle('analysis:getDepth', () => analysisDepth);
+ipcMain.handle('walkthrough:getSettings', () => walkthroughSettings);
+ipcMain.handle('walkthrough:setSettings', (_e, settings: WalkthroughSettings) => saveWalkthroughSettings(settings));
 ipcMain.handle('analysis:setDepth', (_e, depth: number) => {
   analysisDepth = depth === 1 || depth === 3 ? depth : 2;
   return analysisDepth;
 });
+// Unpackaged Electron runs are developer/debug builds. Subscription checks must
+// never block local development, but remain enforced in packaged releases.
+ipcMain.handle('app:isDebugMode', () => !app.isPackaged);
+ipcMain.handle('account:getState', () => accountService?.getState() ?? { configured: false, user: null, subscription: null });
+ipcMain.handle('account:signInGoogle', async () => {
+  if (!accountService) throw new Error('Account service is not ready.');
+  return accountService.signInWithGoogle();
+});
+ipcMain.handle('billing:startSubscription', async (_e, plan: PlanId) => {
+  if (plan !== 'monthly' && plan !== 'yearly') throw new Error('Invalid subscription plan.');
+  if (!accountService) throw new Error('Account service is not ready.');
+  return accountService.startSubscription(plan);
+});
+ipcMain.handle('account:signOut', () => accountService?.signOut() ?? { configured: false, user: null, subscription: null });
 ipcMain.handle('project:relationships', () => {
   if (!currentFolder) return { ok: false, error: 'No project is open' };
   const structure = extractStructure(currentFolder);
@@ -942,8 +1025,10 @@ ipcMain.handle('folder:open', async () => {
   if (hasCurrentCachedDiagram && cached?.diagram) {
     currentDiagram = cached.diagram;
     mainWindow.webContents.send('canvas:diagram', cached.diagram);
-    if (cached.lastSession?.length) {
-      mainWindow.webContents.send('canvas:restoreSession', cached.lastSession);
+    // A drill is an explicit navigation action, never an opening action.
+    const restorablePanels = cached.lastSession?.filter((panel) => panel.mode !== 'drill') ?? [];
+    if (restorablePanels.length) {
+      mainWindow.webContents.send('canvas:restoreSession', restorablePanels);
     }
   }
 
@@ -1025,8 +1110,9 @@ async function runAnalysisInternal(): Promise<{ ok?: boolean; error?: string; fr
     currentDiagram = diagram;
     currentNodePaths = structure.nodePaths;
 
-    // Persist to cache; structure changed so drilldowns are stale — wipe them
+    // Persist to cache; structure changed so drilldowns and Code Stories are stale.
     saveCache(currentFolder, { structureHash, diagram });
+    invalidateDrilldowns(currentFolder);
 
     mainWindow.webContents.send('canvas:diagram', diagram);
     mainWindow.webContents.send('analysis:status', 'done');
@@ -1094,10 +1180,21 @@ async function runComponentDetail(name: string): Promise<{ ok?: boolean; error?:
   if (!currentFolder || !name) return { error: 'no component' };
   try {
     const nodeNames = extractNodeNames(currentDiagram);
+    const cacheKey = `__detail__:v1:${name}:${hashStructure(JSON.stringify(currentDiagram ?? {}))}`;
+    const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
+    if (typeof cachedValue === 'string') {
+      try {
+        const cached = JSON.parse(cachedValue) as { version?: number; detail?: unknown };
+        if (cached.version === 1 && cached.detail) return { ok: true, detail: cached.detail };
+      } catch {
+        // Regenerate malformed cache data.
+      }
+    }
     const prompt = buildComponentDetailPrompt(name, nodeNames);
     const raw = await runCapture(prompt, currentFolder);
     const detail = extractJson(raw);
     if (!detail) return { error: 'no detail' };
+    saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 1, detail }));
     return { ok: true, detail };
   } catch (err: unknown) {
     return { error: err instanceof Error ? err.message : String(err) };
@@ -1215,6 +1312,14 @@ function findSourceFiles(
   candidates.sort((a, b) => (b.score + Math.min(callCount(b.content), 6) * 6) - (a.score + Math.min(callCount(a.content), 6) * 6));
   const ranked = [...candidates, ...results.slice(14)];
   return ranked.slice(0, maxResults).filter(r => r.score > 0).map(r => ({ filePath: r.filePath, content: r.content }));
+}
+
+/** Cache results against the exact source evidence, not just a canvas label. */
+function componentEvidenceFingerprint(name: string, sourceFiles: { filePath: string; content: string }[]): string {
+  const evidence = sourceFiles
+    .map(({ filePath, content }) => `${filePath}\n${content}`)
+    .join('\n\0\n');
+  return hashStructure(`${name}\n${evidence}`);
 }
 
 /**
@@ -1437,14 +1542,13 @@ async function runComponentDrilldown(rawName: string): Promise<{ ok?: boolean; e
   const name = rawName.trim();
   if (!currentFolder || !name) return { error: 'no component' };
   try {
+    const structure = extractStructure(currentFolder);
+    const sourceFiles = findSourceFiles(name, structure.nodePaths, currentFolder);
+    const cacheKey = 'canonical-v5:depth-' + analysisDepth + ':' + name + ':' + componentEvidenceFingerprint(name, sourceFiles);
     const cached = loadCache(currentFolder);
-    const cacheKey = 'canonical-v4:depth-' + analysisDepth + ':' + name;
     if (cached?.drilldowns?.[cacheKey]) {
       return { ok: true, mermaid: cached.drilldowns[cacheKey], fromCache: true };
     }
-
-    const structure = extractStructure(currentFolder);
-    const sourceFiles = findSourceFiles(name, structure.nodePaths, currentFolder);
 
     // Combine source from top matching files (cap at 8000 chars total)
     let sourceCode = '';
@@ -1553,7 +1657,7 @@ function buildCodeFlowPrompt(name: string, sourceCode: string): string {
   ].join('\n');
 }
 
-function buildCodeStoryPrompt(name: string, sourceCode: string, hierarchyContext = ''): string {
+function buildCodeStoryPrompt(name: string, sourceCode: string, hierarchyContext = '', settings: WalkthroughSettings = DEFAULT_WALKTHROUGH_SETTINGS): string {
   return [
     'Explain how the selected component, "' + name + '", behaves when its code runs. Create a plain-English Code Story, not a feature map or a user journey.',
     'Output ONLY the JSON below — no fences, no prose.',
@@ -1619,6 +1723,9 @@ function buildCodeStoryPrompt(name: string, sourceCode: string, hierarchyContext
     'SOURCE CODE of ' + name + ':',
     sourceCode.slice(0, 16000),
     '',
+    buildWalkthroughFocusSection(settings),
+    buildImplementationFocusEvidence(settings),
+    '',
     'JSON only.',
   ].join('\n');
 }
@@ -1665,46 +1772,105 @@ function shouldRunCodeStoryReview(sourceCode: string, candidate: { mermaid?: str
   return /\b(https?|retrofit|okhttp|api|repository|dao|database|datastore|storage|sharedpreferences|ipc|socket|fetch|axios|service|insert|update|delete|select|emit|event)\b/i.test(evidence);
 }
 
-function buildImplementationPrompt(name: string, sourceCode: string, hierarchyContext = ''): string {
+function buildWalkthroughFocusSection(settings: WalkthroughSettings): string {
+  const lines: string[] = [];
+  if (settings.entryPoints) lines.push('- ENTRY POINTS: Explicitly identify every trigger, entry function, or starting event and explain its real signature.');
+  if (settings.callChain) lines.push('- CALL CHAIN: Show the complete caller → callee chain from entry to exit, naming every function that crosses a boundary.');
+  if (settings.asyncPatterns) lines.push('- ASYNC PATTERNS: Flag every async/await, Promise chain, and callback. State whether operations run sequentially or in parallel. Call out any unhandled Promise.');
+  if (settings.branchingLogic) lines.push('- BRANCHING LOGIC: Show every meaningful if/else, switch/case, and try/catch. Name the condition and both outcome paths.');
+  if (settings.dataFlow) lines.push('- DATA FLOW: Trace the data shape at each key step — what enters, what changes, what leaves. Use source-proven field names.');
+  if (settings.dataTypes) lines.push('- DATA TYPES: Name proven input/output types, DTOs, and schemas at every boundary. Use "unknown" where the source does not prove it.');
+  if (settings.stateManagement) lines.push('- STATE: Show every piece of state the code reads or writes — where it lives, what mutates it, and in what order.');
+  if (settings.dbInteractions) lines.push('- DATABASE: For every DB read/write show the operation (SELECT/INSERT/UPDATE/DELETE), the proven table/entity, key fields used, and result shape returned.');
+  if (settings.dbSchema) lines.push('- DB SCHEMA: Show proven table/entity structure at each persistence boundary: primary keys, foreign keys, important columns, and relationships.');
+  if (settings.restCalls) lines.push('- REST CALLS: This is required output. For every source-proven HTTP call, add visible request and response nodes to the Mermaid diagram. Include METHOD and path plus proven request fields as symbolic examples like {id}, response shape, status codes, and error cases. Use "unknown" for anything unproven.');
+  if (settings.graphqlOps) lines.push('- GRAPHQL: For every GraphQL operation show: type (query/mutation/subscription), name, proven arguments, selection fields, and result/error shape.');
+  if (settings.externalIntegrations) lines.push('- EXTERNAL INTEGRATIONS: Show every third-party SDK or external service call — input, result, and how it is used. State "Endpoint: unknown (SDK)" when the HTTP layer is hidden.');
+  if (settings.authChecks) lines.push('- AUTH: Show exactly where authentication is verified, what credential or token is checked, what roles are required, and the failure path.');
+  if (settings.permissions) lines.push('- PERMISSIONS: Show every authorisation gate: roles/scopes required, where in the call chain they are checked, and any paths that bypass them.');
+  if (settings.inputValidation) lines.push('- INPUT VALIDATION: Identify every validation/sanitisation point for external input. Flag any input that reaches a database or shell without validation.');
+  if (settings.sensitiveData) lines.push('- SENSITIVE DATA: Flag every read/write/log/transmit of PII, passwords, tokens, or secrets. State how each is protected. Flag any leakage into logs or error messages.');
+  if (settings.errorHandling) lines.push('- ERROR HANDLING: Show every try/catch and error path — what errors are expected, how they are transformed, and whether they surface to the caller or are swallowed silently.');
+  if (settings.fallbacks) lines.push('- FALLBACKS & RETRIES: Show every fallback value, retry loop, circuit breaker, and timeout — what triggers it and what the caller receives when it fires.');
+  if (settings.caching) lines.push('- CACHING: Show every cache read/write: key strategy, TTL if proven, what triggers invalidation, and the cache-miss path.');
+  if (settings.concurrency) lines.push('- CONCURRENCY: Show parallel operations and shared mutable state. Flag race condition risks and debounce/throttle patterns.');
+  if (settings.logging) lines.push('- LOGGING: Show every log write, metric emission, or tracing span. State what data is included and at what level. Flag any sensitive data that could appear in logs.');
+  if (settings.events) lines.push('- EVENTS & MESSAGING: Show every event emitted or consumed — name, proven payload shape, transport mechanism, and ordering guarantees.');
+  if (settings.testCoverage) lines.push('- TEST COVERAGE: Identify which functions and branches have associated tests. Show mock/stub boundaries. Flag important paths with no proven test coverage.');
+  if (settings.designPatterns) lines.push('- DESIGN PATTERNS: Name every design pattern present and every layer boundary. Explain why the pattern is used when the source makes it clear.');
+  if (settings.businessLogic) lines.push('- BUSINESS LOGIC: Identify every business rule, domain constraint, and invariant enforced. State each rule in plain English and point to where in the code it is enforced.');
+  if (settings.frameworkUnderstanding) lines.push('- FRAMEWORK UNDERSTANDING: Identify the framework and its source-proven conventions used by this feature. Explain each convention in plain English: what the framework does for this code, what the application supplies, and how the request/event/result moves through it.');
+  if (lines.length === 0) return '';
+  return '\n\nREQUIRED FOCUS AREAS (the user selected these):\n'
+    + '- For every selected area that the source proves, add at least one explicit, visible node or branch in the Mermaid diagram and explain it in its matching description. Do not satisfy a selected area only in prose.\n'
+    + '- If the supplied source contains no evidence for a selected area, do not invent it; state that it is not evidenced in the relevant description when the diagram has an applicable boundary.\n'
+    + lines.join('\n');
+}
+
+/** Focus settings need concrete code-card evidence, not a passing mention. */
+function buildImplementationFocusEvidence(settings: WalkthroughSettings): string {
+  const rules: string[] = [];
+  if (settings.restCalls) rules.push('- REST CALLS: when the selected chain reaches a source-proven HTTP boundary, prioritize separate cards for (1) request data-class/DTO construction with its proven fields, (2) the client call with METHOD and path, and (3) response data-class/DTO decoding or consumption with its proven fields. A status code alone is incomplete. If the source does not prove a boundary, field, or endpoint, do not add it.');
+  if (settings.graphqlOps) rules.push('- GRAPHQL: include separate cards for the operation definition, proven variables/input fields, and the returned selection/result fields. A bare operation name is incomplete.');
+  if (settings.dataFlow || settings.dataTypes) rules.push('- DATA FLOW / TYPES: each important handoff must name the source-proven input shape, fields read or changed, and output shape in its card explanation. Do not replace a data class with a vague word such as payload.');
+  if (settings.dbInteractions || settings.dbSchema) rules.push('- DATABASE: show the call that constructs/reads the entity, the repository/DAO operation, and the returned entity/result. Name only fields, keys, and operations proved by the source.');
+  if (settings.authChecks || settings.permissions) rules.push('- AUTH / PERMISSIONS: show the exact guard or credential read, the decision it makes, and the failure handoff as distinct cards.');
+  if (settings.inputValidation) rules.push('- INPUT VALIDATION: show the input read, the validation condition, and both accepted and rejected outcomes as distinct cards when source-proven.');
+  if (settings.errorHandling || settings.fallbacks) rules.push('- ERRORS / FALLBACKS: show the throwing call or failure result, the catch/branch, and what the caller receives next. Do not summarize this as only an error status.');
+  if (settings.asyncPatterns || settings.concurrency) rules.push('- ASYNC / CONCURRENCY: show the awaited or parallel call and the point where its result is joined, handled, or returned.');
+  if (settings.stateManagement || settings.caching || settings.events) rules.push('- STATE / CACHE / EVENTS: show the exact read, write, emit, or consume operation and the state/value before and after it.');
+  if (settings.frameworkUnderstanding) rules.push('- FRAMEWORK UNDERSTANDING: when the selected chain uses a source-proven framework convention, add a dedicated card that shows the relevant framework hook, base-class method, annotation, lifecycle callback, middleware, or injected service. Explain in plain English what the framework invokes automatically, what this application code contributes, and why this convention leads to the next step. Do not name a framework that source evidence does not prove.');
+  if (rules.length === 0) return '';
+  return '\n\nFOCUS DISCOVERY RULES:\n- Treat selected focus areas as lenses while tracing the source. When the selected chain contains source-proven evidence for one, surface that evidence in dedicated code cards instead of a generic summary, status, or label.\n- Do not invent a focus area, add unrelated calls, or claim missing details just because its setting is selected.\n' + rules.join('\n');
+}
+
+function buildImplementationPrompt(name: string, sourceCode: string, hierarchyContext = '', settings: WalkthroughSettings = DEFAULT_WALKTHROUGH_SETTINGS): string {
   return [
-    'Produce a technical code walkthrough for “' + name + '” — explain exactly what the code does, method by method, in English sentences rather than code.',
+    'You are a senior engineer translating the source code of “' + name + '” for a new team member.',
+    'Produce a simple-English code walkthrough in flowchart form. Every visible step must be anchored to the real function, method, class, or handler that performs it, so someone can follow the chart and then find that code in the source.',
     'Output ONLY the JSON below — no fences, no prose.',
     analysisDepthGuidance(), '',
-    'GOAL:',
-    'A developer who has not read this code should finish understanding: which methods exist, what each one does, what data enters and leaves, how they call each other, and where side-effects happen (storage, network, events, IPC). Write it as a walkthrough, not a summary.',
+    'YOUR GOAL:',
+    'After reading the flowchart, the developer should know which real code entry point starts the work, which functions it calls, what each one reads or changes, what it checks, and how it finishes. Cover every meaningful part, but combine tiny helpers when that makes the story easier to follow.',
     '',
-    'WHAT TO SHOW:',
-    '- One node per meaningful method, function, or handler — use the real method/function name as the node label.',
-    '- Show every call chain: if method A calls B which calls C, draw that sequence.',
-    '- For each method explain: what parameters it receives and their types/shapes, what it does internally (the logic, any important decisions or loops), what it returns or emits, and any side-effects (writes to storage, fires an event, makes a network call).',
-    '- For network calls: show the HTTP method, path, request payload shape, and response shape as proven by source.',
-    '- For storage: show the operation (read/write/delete), the key or table, and the data shape.',
-    '- For events/IPC: show the channel name, what is sent, and what handler receives it.',
-    '- Data transformations matter: if a method maps, filters, or reshapes data, describe the before and after shape.',
+    'DIAGRAM — flowchart TD:',
+    '- This is a FOCUSED FUNCTION CHAIN, not a full call dump. Show only the 5–12 most important source-proven functions, methods, handlers, or external boundaries: the entry point, meaningful orchestration, decisions that alter control flow, data reads/writes, cross-component calls, and final result. Skip logging, trivial getters/setters, simple adapters, and boilerplate.',
+    '- SEQUENCE IS THE PRIMARY TEACHING GOAL: number the main chain in execution order. Every main-path node label starts with Step N — followed by its exact source symbol and short explanation, for example Step 1 — MainServlet.service receives request. Use consecutive numbers with no gaps.',
+    '- Every arrow represents a real caller → callee relationship in that focused chain. Label it calls functionName() for a direct call, or returns result to functionName() for a meaningful return. Use an explicit source symbol in every call label so a developer can follow the code without guessing.',
+    '- On the main chain, every arrow label must start with the destination step number, for example Step 2 — calls requestForTenant(). This makes the reading order unambiguous even when cards are far apart.',
+    '- Mermaid node labels must be a single line, maximum 64 characters. Do not put source code or multiline content in Mermaid labels.',
+    '- The renderer turns each node into an Excalidraw code card. Put the exact source snippet in its description as specified below; never put code inside Mermaid.',
+    '- For branches, label outgoing arrows with the source-proven condition and then the next function, such as tenant exists → calls checkTenant().',
+    '- One node per important function or boundary. Each node must contribute a distinct step in the outcome; merge nearby implementation details into the nearest important caller.',
+    '- FUNCTION CHAIN IS REQUIRED: draw one clear source-proven caller → callee route from entry point through the important work to the returned result. Do not add disconnected utility functions or alternate paths unless they materially change the result.',
+    '- Node syntax: use short safe IDs (A, B, C...) and plain, quoted labels, for example: A["Load the saved project"].',
+    '- Draw an arrow from A to B wherever A calls B.',
+    '- Use a diamond node for every real conditional branch (if/else, try/catch, guard that changes the path).',
+    '- Represent an external service, storage area, or platform API with a normal plain-English action; do not name its implementation class or provider.',
+    '- Edge labels must say the meaning of the information or decision, not its code name or type.',
+    '- Use 5–12 nodes. Favor one obvious top-to-bottom numbered chain over exhaustive coverage. Return happyPath as every main-chain node ID in Step order.',
     '',
-    'LANGUAGE:',
-    '- Use real method and class names in node labels (e.g. “runComponentImplementation”, “saveCodeFlow”).',
-    '- Write descriptions in English sentences, not code. Explain intent and mechanism together.',
-    '- Example description: “Receives the component name and an optional drill diagram string. Checks the disk cache first using a version-stamped key. If no cache hit, collects source files up to a 16 000-character budget, builds the prompt, calls the AI, parses the JSON response, saves it to cache, and returns the mermaid diagram with descriptions.”',
-    '- Avoid vague words like “handles”, “processes”, “manages”. Say what specifically happens.',
+    'DESCRIPTIONS:',
+    '- Every description MUST use this exact layout: Code:\n[one to five exact, consecutive source lines; each line at most 72 characters]\n\nExplanation: [one or two concise sentences explaining the inputs, result/state change, and why this function runs after the preceding step].\nNext: [Step N and its function name, plus why this call happens; or final result].',
+    '- Preserve indentation in the Code section. A short method signature plus its key body line is preferred over a long expression. Do not use markdown fences.',
+    '- For a request, storage, event, or other boundary, say in ordinary language what is sent and what comes back. Include a method/path only if proven by source, but never raw function, class, variable, type, or provider names.',
+    '- Do not use vague wording such as “handles”, “processes”, or “manages”. Say the concrete action instead.',
+    '- The description key must match the plain-English node label exactly.',
     '',
-    'TRUTHFULNESS:',
-    '- Only describe what the supplied source proves. Do not invent parameters, return types, or behaviour.',
-    '- If a method delegates to a private helper, absorb the helper into that method\'s description rather than creating a separate node for trivial wrappers.',
-    '- If a field name or type is not visible in the source, say “type unknown” rather than guessing.',
-    hierarchyContext ? '\nCODE STRUCTURE EVIDENCE (authoritative — use for call order and ownership):\n' + hierarchyContext : '',
+    'WHAT TO EXCLUDE:',
+    '- No user-journey language (“user taps”, “screen opens”, “user sees”). This is about code execution, not UX.',
+    '- No invented behaviour. Only what the source proves.',
+    '- No file paths, import statements, or invented code. Every Code section must be copied from the supplied source.',
     '',
-    'DIAGRAM:',
-    '- flowchart TD. Each node is a method/function/handler.',
-    '- Arrow labels describe what is passed between them (parameter name and type/shape when known).',
-    '- Diamonds only for real conditional branches proven in source. Database/cloud shapes for actual storage or external systems.',
-    '- 6–14 nodes. Merge trivial one-liner helpers into their caller.',
-    '',
+    hierarchyContext ? 'CODE STRUCTURE EVIDENCE (authoritative — use for call order and ownership):\n' + hierarchyContext + '\n' : '',
     'Schema:',
-    '{“mermaid”:”flowchart TD string”,”descriptions”:{“methodName”:”English walkthrough: parameters, internal logic, return value, side-effects.”},”happyPath”:[“nodeId1”,”nodeId2”]}',
+    '{“mermaid”:”flowchart TD\\n  A[Read the sign-in details] -->|complete details| B{Are the details complete}\\n  B -->|yes| C[Ask the account service to verify them]\\n  B -->|no| D[Show what needs fixing]”,”descriptions”:{“Read the sign-in details”:”It starts with the sign-in details and prepares them for checking. This is needed before the account can be verified.”},”happyPath”:[“A”,”B”,”C”]}',
     '',
     'SOURCE CODE of ' + name + ':',
     sourceCode.slice(0, 16000),
+    '',
+    buildWalkthroughFocusSection(settings),
+    buildImplementationFocusEvidence(settings),
     '',
     'JSON only.',
   ].join('\n');
@@ -1783,9 +1949,9 @@ function buildArchitectureStoryPrompt(projectContext: string): string {
   ].join('\n');
 }
 
-function buildRepositoryImplementationPrompt(projectContext: string): string {
+function buildRepositoryImplementationPrompt(projectContext: string, settings: WalkthroughSettings = DEFAULT_WALKTHROUGH_SETTINGS): string {
   return [
-    'Create a feature-by-feature Implementation Map for this repository. Explain how EVERY meaningful feature found in the supplied source is implemented, in plain language for a developer.',
+    'Create a feature-by-feature “How it builds” map for this repository. Explain how EVERY meaningful feature found in the supplied source is implemented in plain English, so a developer can understand the code flow just by reading the chart.',
     'Output ONLY the JSON below — no fences or prose.',
     analysisDepthGuidance(), '',
     'WHAT TO SHOW:',
@@ -1794,14 +1960,14 @@ function buildRepositoryImplementationPrompt(projectContext: string): string {
     '- For every feature, show its actual implementation path and every meaningful component contract: trigger or entry → important logic/decision → state, data, or API work → result. Use as many contract nodes as needed; do not hide a component-to-component handoff to stay compact.',
     '- Cover all meaningful features the supplied source proves, up to 8 feature branches and 24 nodes total. If there are more, combine closely related minor features and state that in the description.',
     '- Node labels must be plain English operations, not raw class, function, variable, or file names.',
-    '- Every description explains concrete implementation details in plain language: request/input, important function calls, object/data movement, response or side effect, conditions, and source evidence in parentheses.',
+    '- Every description appears directly below its chart node. Use one or two short, plain-English sentences (under 260 characters) that explain the input, the work, the result, and why it matters. Do not include raw function, class, variable, type, or file names in it.',
     '- For EVERY communication between components, describe a contract as: caller → receiver → operation/event and source-proven input → source-proven result/error. State its transport: direct call, event/callback, IPC, HTTP/REST, repository, storage, or other proven mechanism.',
     '- For EVERY proved REST/HTTP endpoint, draw one compact request node and one compact response node: `Request — METHOD path` → `REST boundary` → `Response — result or error`. Keep detailed payloads in node descriptions, not node labels.',
     '- REST request descriptions MUST include a symbolic example: `HTTP Request: METHOD /path?key={Type.field}. Headers: [only proven headers]. Body: { only source-proven fields }.` Example values must be placeholders such as `{query}` or `<token>`, never invented real data.',
     '- REST response descriptions MUST include a symbolic example: `HTTP Response: status [only if proven, otherwise unknown]. Body: { only source-proven fields/types }. Error: [only source-proven error/result]`. If a field, status, header, or error is not proven, write `unknown` instead of guessing.',
     '- Include headers/auth only when source proves them. For direct calls, draw a forward arrow with operation/input and a return arrow with result/error.',
     '- Describe each important object with only source-proven fields or shape, and say whether the step reads, validates, creates, updates, stores, sends, or returns it. Never invent fields or response values.',
-    '- Use this exact description order: "Request/Input: [...]. Transport: [...]. Contract: [caller → receiver → operation]. HTTP Request: [... when applicable]. HTTP Response: [... when applicable]. Object: [before] → [after]. Response/Effect: [...]. Evidence: (path/file)."',
+    '- For a boundary, explain in plain English who gives what information to whom and what comes back. Include HTTP method/path only when source-proven; otherwise do not expose technical identifiers.',
     '- Show framework, runtime, persistence, API, or external integrations only when the supplied context proves them.',
     '- Do not invent missing layers. Say no persistence or integration is evident when appropriate.',
     '- Every edge is labelled with the data, event, or responsibility passed between steps.', '',
@@ -1810,8 +1976,10 @@ function buildRepositoryImplementationPrompt(projectContext: string): string {
     '- Use plain Id[Plain English operation] nodes with labelled edges. Create branches from the shared entry point; do NOT use subgraph, classDef, style, click, classDiagram, or sequenceDiagram.',
     '- Connect the shared entry point to every feature entry. No code snippets.', '',
     'Schema:',
-    '{"mermaid":"flowchart TD string","descriptions":{"Node Label":"Request/Input: ... Transport: ... Contract: ... HTTP Request: METHOD /path?field={value}. HTTP Response: status/body/error. Object: ... → ... Response/Effect: ... Evidence: (path/file)"},"happyPath":["nodeId1","nodeId2"]}', '',
-    'PROJECT CONTEXT:', projectContext.slice(0, 50000), '', 'JSON only.',
+    '{“mermaid”:”flowchart TD string”,”descriptions”:{“Node Label”:”It starts with the prepared information and sends it to the next part of the app. This is needed so the result can be saved or shown.”},”happyPath”:[“nodeId1”,”nodeId2”]}', '',
+    'PROJECT CONTEXT:', projectContext.slice(0, 50000), '',
+    buildWalkthroughFocusSection(settings),
+    '', 'JSON only.',
   ].join('\n');
 }
 
@@ -1897,17 +2065,17 @@ async function runArchitectureStory(): Promise<{ ok?: boolean; error?: string; m
 
 async function runRepositoryImplementation(): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string> }> {
   if (!currentFolder) return { error: 'no project folder' };
-    const cacheKey = '__repository_implementation__:depth-' + analysisDepth;
+    const cacheKey = '__repository_implementation__:depth-' + analysisDepth + ':focus-' + walkthroughSettingsFingerprint(walkthroughSettings);
   try {
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
       const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string> };
-      if (cached.version === 7 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {} };
+      if (cached.version === 10 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {} };
     }
     const structure = extractStructure(currentFolder);
-    const parsed = extractJson(await runCapture(buildRepositoryImplementationPrompt(repositoryImplementationContext(currentFolder, structure)), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string> } | null;
+    const parsed = extractJson(await runCapture(buildRepositoryImplementationPrompt(repositoryImplementationContext(currentFolder, structure), walkthroughSettings), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string> } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
-    const result = { version: 7, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {} };
+    const result = { version: 10, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {} };
     saveCodeFlow(currentFolder, cacheKey, JSON.stringify(result));
     return { ok: true, mermaid: result.mermaid, descriptions: result.descriptions };
   } catch (err: unknown) { return { error: err instanceof Error ? err.message : String(err) }; }
@@ -1917,36 +2085,38 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
   const name = rawName.trim();
   if (!currentFolder || !name) return { error: 'no component' };
   try {
-    const cached = loadCache(currentFolder);
-    const cacheKey = `depth-${analysisDepth}:${name}`;
-    const cachedValue = cached?.codeflows?.[cacheKey];
-    if (typeof cachedValue === 'string') {
-      try {
-        const p = JSON.parse(cachedValue) as { version?: number; mermaid: string; descriptions?: Record<string, string>; dataFlow?: Record<string, DataFlowSnapshot>; happyPath: string[] };
-        // Version 16 makes Code Story an independent internal explanation while grounding
-        // the story in the locally extracted AST hierarchy and Graphify slice.
-        // as well as source text, preventing inferred function relationships.
-        // behaviour (inputs, decisions, effects, and results), rather than a
-        // broad feature or user-flow map.
-        if (p?.version === 19 && p.mermaid) return { ok: true, mermaid: p.mermaid, descriptions: p.descriptions ?? {}, dataFlow: p.dataFlow ?? {}, happyPath: p.happyPath ?? [], fromCache: true };
-      } catch {
-        // Older raw-Mermaid entries were generated as user journeys, not code stories.
-        // Ignore them so they are recreated with the current Code Story rules.
-      }
-    }
-
     const structure = extractStructure(currentFolder);
     if (name === '__whole_repo__') {
+      const cacheKey = `v20:depth-${analysisDepth}:${name}:${hashStructure(groundedStructureJson(currentFolder, structure).json)}`;
+      const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
+      if (typeof cachedValue === 'string') {
+        try {
+          const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] };
+          if (cached.version === 20 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, happyPath: cached.happyPath ?? [], fromCache: true };
+        } catch {
+          // Regenerate malformed cache data.
+        }
+      }
       const raw = await runCapture(buildRepositoryCodeStoryPrompt(groundedStructureJson(currentFolder, structure).json), currentFolder);
       const parsed = extractJson(raw) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
       if (!parsed?.mermaid) return { error: 'no mermaid in response' };
       const happyPath = parsed.happyPath ?? [];
       const descriptions = parsed.descriptions ?? {};
-      saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 3, mermaid: parsed.mermaid, descriptions, happyPath }));
+      saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 20, mermaid: parsed.mermaid, descriptions, happyPath }));
       return { ok: true, mermaid: parsed.mermaid, descriptions, happyPath };
     }
 
     const sourceFiles = findSourceFiles(name, structure.nodePaths, currentFolder, 3);
+    const cacheKey = `v21:depth-${analysisDepth}:focus-${walkthroughSettingsFingerprint(walkthroughSettings)}:${name}:${componentEvidenceFingerprint(name, sourceFiles)}`;
+    const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
+    if (typeof cachedValue === 'string') {
+      try {
+        const p = JSON.parse(cachedValue) as { version?: number; mermaid: string; descriptions?: Record<string, string>; dataFlow?: Record<string, DataFlowSnapshot>; happyPath: string[] };
+        if (p?.version === 21 && p.mermaid) return { ok: true, mermaid: p.mermaid, descriptions: p.descriptions ?? {}, dataFlow: p.dataFlow ?? {}, happyPath: p.happyPath ?? [], fromCache: true };
+      } catch {
+        // Ignore malformed or legacy entries and regenerate from current source.
+      }
+    }
 
     let sourceCode = '';
     let budget = 9000;
@@ -1967,6 +2137,7 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
       name,
       sourceCode,
       hierarchyContext,
+      walkthroughSettings,
     ), currentFolder);
     let parsed = extractJson(raw) as { mermaid?: string; descriptions?: Record<string, string>; dataFlow?: Record<string, DataFlowSnapshot>; happyPath?: string[] } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
@@ -1994,7 +2165,7 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
     const happyPath = parsed.happyPath ?? [];
     const descriptions = parsed.descriptions ?? {};
     const dataFlow = parsed.dataFlow ?? {};
-    saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 19, mermaid: parsed.mermaid, descriptions, dataFlow, happyPath }));
+    saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 21, mermaid: parsed.mermaid, descriptions, dataFlow, happyPath }));
     return { ok: true, mermaid: parsed.mermaid, descriptions, dataFlow, happyPath };
   } catch (err: unknown) {
     return { error: err instanceof Error ? err.message : String(err) };
@@ -2127,14 +2298,14 @@ async function runComponentImplementation(rawName: string, drillMermaid = ''): P
   const name = rawName.trim();
   if (!currentFolder || !name) return { error: 'no component' };
   try {
-    const cacheKey = '__implementation__:depth-' + analysisDepth + ':' + name;
+    const structure = extractStructure(currentFolder);
+    const sourceFiles = findSourceFiles(name, structure.nodePaths, currentFolder, 6);
+    const cacheKey = '__implementation__:v36:depth-' + analysisDepth + ':focus-' + walkthroughSettingsFingerprint(walkthroughSettings) + ':' + name + ':' + componentEvidenceFingerprint(name, sourceFiles);
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
       const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] };
-      if (!drillMermaid && cached.version === 21 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, happyPath: cached.happyPath ?? [] };
+      if (!drillMermaid && cached.version === 36 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, happyPath: cached.happyPath ?? [] };
     }
-    const structure = extractStructure(currentFolder);
-    const sourceFiles = findSourceFiles(name, structure.nodePaths, currentFolder, 6);
     let sourceCode = '';
     let budget = 16000;
     for (const { filePath, content } of sourceFiles) {
@@ -2148,9 +2319,9 @@ async function runComponentImplementation(rawName: string, drillMermaid = ''): P
       ? '\n\nFEATURE SCOPE ONLY — this is a user-facing flow. Use it only to identify the feature and its outcomes. Do NOT repeat, paraphrase, or draw its user steps. Explain the source-proven component contracts that make those outcomes happen instead:\n' + drillMermaid
       : '';
     const hierarchyContext = [buildHierarchyContext(sourceFiles), graphifyPromptContext(currentFolder, name).evidence].filter(Boolean).join('\n\n');
-    const parsed = extractJson(await runCapture(buildImplementationPrompt(name, sourceCode + scope, hierarchyContext), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
+    const parsed = extractJson(await runCapture(buildImplementationPrompt(name, sourceCode + scope, hierarchyContext, walkthroughSettings), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
-    const result = { version: 21, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {}, happyPath: parsed.happyPath ?? [] };
+    const result = { version: 36, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {}, happyPath: parsed.happyPath ?? [] };
     saveCodeFlow(currentFolder, cacheKey, JSON.stringify(result));
     return { ok: true, mermaid: result.mermaid, descriptions: result.descriptions, happyPath: result.happyPath };
   } catch (err: unknown) { return { error: err instanceof Error ? err.message : String(err) }; }
@@ -2453,9 +2624,11 @@ ipcMain.handle('canvas:command', async (_e, req: { command: string; canvasContex
 });
 
 ipcMain.handle('selection:ask', async (_e, req: { question: string; components: string[]; canvasContext: string; folder: string }) => {
-  if (!currentFolder || !req.question.trim() || req.components.length === 0) return { ok: false, error: 'Select at least one component and enter a question' };
+  if (!currentFolder || !req.question.trim()) return { ok: false, error: 'Open a project and enter a question' };
   try {
     const question = req.question.trim();
+    const components = req.components ?? [];
+    const asksAboutSelection = components.length > 0;
     const normalizedQuestion = question.toLowerCase();
     const asksHow = /\bhow\b/.test(normalizedQuestion);
     const asksWhy = /\bwhy\b|\bpurpose\b|\breason\b/.test(normalizedQuestion);
@@ -2468,19 +2641,52 @@ ipcMain.handle('selection:ask', async (_e, req: { question: string; components: 
           : 'Choose the explanation style that directly answers the question.';
     const structure = extractStructure(currentFolder);
     const sourceChunks: string[] = [];
-    let remaining = 9000;
-    for (const component of req.components.slice(0, 8)) {
-      for (const { filePath, content } of findSourceFiles(component, structure.nodePaths, currentFolder)) {
-        if (remaining <= 0) break;
-        const chunk = content.slice(0, remaining);
-        sourceChunks.push('// ' + path.relative(currentFolder, filePath) + '\n' + chunk);
-        remaining -= chunk.length;
+    if (asksAboutSelection) {
+      let remaining = 9000;
+      for (const component of components.slice(0, 8)) {
+        for (const { filePath, content } of findSourceFiles(component, structure.nodePaths, currentFolder)) {
+          if (remaining <= 0) break;
+          const chunk = content.slice(0, remaining);
+          sourceChunks.push('// ' + path.relative(currentFolder, filePath) + '\n' + chunk);
+          remaining -= chunk.length;
+        }
+      }
+    } else {
+      sourceChunks.push(architectureStoryContext(currentFolder, structure).slice(0, 16000));
+    }
+    // Questions are read-only, so identical questions with the same selected
+    // evidence and canvas state should be served without another AI call.
+    const questionCacheKey = '__selection_answer__:v1:' + hashStructure([
+      question,
+      components.join('\n'),
+      req.canvasContext.slice(0, 5000),
+      sourceChunks.join('\n\0\n'),
+      `depth:${analysisDepth}`,
+      `provider:${getAiProvider()}`,
+    ].join('\n---\n'));
+    const cachedValue = loadCache(currentFolder)?.codeflows?.[questionCacheKey];
+    if (typeof cachedValue === 'string') {
+      try {
+        const cached = JSON.parse(cachedValue) as { version?: number; diagram?: unknown };
+        if (cached.version === 1 && cached.diagram) return { ok: true, diagram: cached.diagram };
+      } catch {
+        // Regenerate malformed cache data.
       }
     }
+    // Questions run with the opened project's cwd, so that project's instructions
+    // do not necessarily include this app's CLAUDE.md. Make the canvas read an
+    // explicit, per-request requirement instead. The final response remains JSON;
+    // the MCP call happens before it is composed.
+    const canvasMcpRequirement = getAiProvider() === 'claude'
+      ? 'Before doing any analysis, you MUST call mcp__rex-canvas__get_canvas_mermaid exactly once to read the live canvas. This is mandatory even though a canvas-context snapshot is supplied below. Treat the tool result as the authoritative canvas state. Do not delegate this call. After the tool result, return only the JSON requested below.'
+      : '';
     const prompt = [
-      'Answer a developer question about selected components as a clear Mermaid flowchart.',
+      asksAboutSelection
+        ? 'Answer a developer question about selected components as a clear Mermaid flowchart.'
+        : 'Answer a developer question about the whole project as a clear Mermaid flowchart.',
+      canvasMcpRequirement,
       'Output ONLY JSON. Do not edit files. Do not give prose outside JSON.',
-      '', 'QUESTION:', question, 'SELECTED COMPONENTS:', req.components.join(', '), '',
+      '', 'QUESTION:', question, asksAboutSelection ? 'SELECTED COMPONENTS: ' + components.join(', ') : 'SCOPE: whole project (no components selected)', '',
       'ANSWER MODE:', answerMode, '',
       'RULES:', '- Make the diagram directly answer the question. Do not replace it with a generic request lifecycle.',
       '- First node must state the direct answer in plain English.',
@@ -2490,7 +2696,9 @@ ipcMain.handle('selection:ask', async (_e, req: { question: string; components: 
       '- If it asks both how and why, every description must use this format: "How: … Why: … (source reference)".',
       '- Use only facts supported by the provided source/context. Say "not defined here" rather than inventing fields.',
       '- Use 4–10 short plain-English nodes. Explain behavior before implementation details.',
-      '- Include only the selected components and directly relevant connections.',
+      asksAboutSelection
+        ? '- Include only the selected components and directly relevant connections.'
+        : '- Include only the project areas and connections needed to answer the question. Start from the project-level architecture when useful.',
       '- Put real function/file references in descriptions, not node labels. For a How or Why answer, descriptions must contain the requested explanation, not only the reference.',
       '- Start Mermaid with flowchart TD.', '', 'Schema:',
       '{"pattern":"short answer title","diagrams":{"structure":"flowchart TD string"},"descriptions":{"Node Label":"How: concrete implementation. Why: purpose (function in file.ts)"}}',
@@ -2499,7 +2707,9 @@ ipcMain.handle('selection:ask', async (_e, req: { question: string; components: 
     ].join('\n');
     const parsed = extractJson(await runCapture(prompt, currentFolder)) as { pattern?: string; diagrams?: { structure?: string }; descriptions?: Record<string, string> } | null;
     if (!parsed?.diagrams?.structure) return { ok: false, error: 'Could not create an answer flowchart' };
-    return { ok: true, diagram: { pattern: parsed.pattern || 'Selected components', diagrams: { structure: parsed.diagrams.structure }, descriptions: parsed.descriptions ?? {} } };
+    const diagram = { pattern: parsed.pattern || (asksAboutSelection ? 'Selected components' : 'Project question'), diagrams: { structure: parsed.diagrams.structure }, descriptions: parsed.descriptions ?? {} };
+    saveCodeFlow(currentFolder, questionCacheKey, JSON.stringify({ version: 1, diagram }));
+    return { ok: true, diagram };
   } catch (err: unknown) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }

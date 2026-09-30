@@ -57,9 +57,55 @@ export interface PRReviewResult {
   error?: string;
 }
 
+export interface WalkthroughSettings {
+  // Execution Flow
+  entryPoints: boolean;
+  callChain: boolean;
+  asyncPatterns: boolean;
+  branchingLogic: boolean;
+  // Data
+  dataFlow: boolean;
+  dataTypes: boolean;
+  stateManagement: boolean;
+  // Persistence
+  dbInteractions: boolean;
+  dbSchema: boolean;
+  // Network & APIs
+  restCalls: boolean;
+  graphqlOps: boolean;
+  externalIntegrations: boolean;
+  // Access Control
+  authChecks: boolean;
+  permissions: boolean;
+  // Security
+  inputValidation: boolean;
+  sensitiveData: boolean;
+  // Error Handling
+  errorHandling: boolean;
+  fallbacks: boolean;
+  // Performance
+  caching: boolean;
+  concurrency: boolean;
+  // Observability
+  logging: boolean;
+  // Events
+  events: boolean;
+  // Testing
+  testCoverage: boolean;
+  // Architecture
+  designPatterns: boolean;
+  businessLogic: boolean;
+  frameworkUnderstanding: boolean;
+}
+
 declare global {
   interface Window {
     electronAPI: {
+      isDebugMode: () => Promise<boolean>;
+      getAccountState: () => Promise<{ configured: boolean; user: { email: string; name: string; picture?: string } | null; subscription: { plan: 'monthly' | 'yearly'; status: string; id: string; renewsAt?: string } | null }> ;
+      signInWithGoogle: () => Promise<{ configured: boolean; user: { email: string; name: string; picture?: string } | null; subscription: { plan: 'monthly' | 'yearly'; status: string; id: string; renewsAt?: string } | null }> ;
+      startSubscription: (plan: 'monthly' | 'yearly') => Promise<{ configured: boolean; user: { email: string; name: string; picture?: string } | null; subscription: { plan: 'monthly' | 'yearly'; status: string; id: string; renewsAt?: string } | null }> ;
+      signOut: () => Promise<{ configured: boolean; user: null; subscription: null }> ;
       openFolder: () => Promise<{ folder: string; hasCachedDiagram: boolean } | null>;
       clearProjectCache: () => Promise<{ ok: boolean; error?: string }>;
       getAiProvider: () => Promise<{ provider: string; providers: { id: string; label: string }[] }>;
@@ -103,7 +149,9 @@ declare global {
       onRestoreSession: (cb: (panels: { name: string; mode: string }[]) => void) => void;
       // Change context
       onChangeContext: (cb: (nodes: ChangeContextNode[]) => void) => void;
-      // Build/test error annotations
+      // Walkthrough settings
+      getWalkthroughSettings: () => Promise<WalkthroughSettings>;
+      setWalkthroughSettings: (settings: WalkthroughSettings) => Promise<WalkthroughSettings>;
       // MCP
       onMcpGetCanvasState: (cb: (data: { replyChannel: string }) => void) => void;
       answerMcpGetCanvasState: (replyChannel: string, state: string) => void;

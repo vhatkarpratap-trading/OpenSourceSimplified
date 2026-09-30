@@ -1,6 +1,15 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
+  isDebugMode: (): Promise<boolean> => ipcRenderer.invoke('app:isDebugMode'),
+  // Account and Pro billing. Provider credentials remain in the main process.
+  getAccountState: (): Promise<{ configured: boolean; user: { email: string; name: string; picture?: string } | null; subscription: { plan: 'monthly' | 'yearly'; status: string; id: string; renewsAt?: string } | null }> =>
+    ipcRenderer.invoke('account:getState'),
+  signInWithGoogle: (): Promise<{ configured: boolean; user: { email: string; name: string; picture?: string } | null; subscription: { plan: 'monthly' | 'yearly'; status: string; id: string; renewsAt?: string } | null }> =>
+    ipcRenderer.invoke('account:signInGoogle'),
+  startSubscription: (plan: 'monthly' | 'yearly'): Promise<{ configured: boolean; user: { email: string; name: string; picture?: string } | null; subscription: { plan: 'monthly' | 'yearly'; status: string; id: string; renewsAt?: string } | null }> =>
+    ipcRenderer.invoke('billing:startSubscription', plan),
+  signOut: (): Promise<{ configured: boolean; user: null; subscription: null }> => ipcRenderer.invoke('account:signOut'),
   // Folder
   openFolder: (): Promise<{ folder: string; hasCachedDiagram: boolean } | null> =>
     ipcRenderer.invoke('folder:open'),
@@ -15,6 +24,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getAnalysisDepth: (): Promise<1 | 2 | 3> => ipcRenderer.invoke('analysis:getDepth'),
   setAnalysisDepth: (depth: 1 | 2 | 3): Promise<1 | 2 | 3> =>
     ipcRenderer.invoke('analysis:setDepth', depth),
+  getWalkthroughSettings: (): Promise<unknown> => ipcRenderer.invoke('walkthrough:getSettings'),
+  setWalkthroughSettings: (settings: unknown): Promise<unknown> => ipcRenderer.invoke('walkthrough:setSettings', settings),
   getRelationships: (): Promise<{ ok: boolean; mermaid?: string; error?: string }> =>
     ipcRenderer.invoke('project:relationships'),
 

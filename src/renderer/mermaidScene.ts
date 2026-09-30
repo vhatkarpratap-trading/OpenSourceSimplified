@@ -65,20 +65,27 @@ function sanitizeMermaid(src: string): string {
     return safeId + bracket;
   });
 
-  // Step 2: clean content inside bracket node labels [ ] ( ) { }
-  // SKIP double-quoted labels like ["text"] — Mermaid supports these natively
-  // and they may contain intentional newlines and special chars.
-  out = out.replace(/([\[\(\{])([^\]\)\}]*)([\]\)\}])/g, (_m, open, inner, close) => {
-    // If the inner content starts with a double-quote, leave it untouched
-    if (String(inner).trimStart().startsWith('"')) return `${open}${inner}${close}`;
-    const safe = String(inner)
+  // Step 2: clean node labels. Match each shape with its own closing
+  // delimiter, so a parenthesis inside a square-bracket label is not treated
+  // as the label's closing delimiter.
+  const cleanNodeLabel = (inner: string) => {
+    // Code walkthroughs contain source snippets. Mermaid labels only support
+    // one outer pair of quotes, so remove unsafe nested syntax before parsing.
+    const trimmed = inner.trim();
+    const quoted = trimmed.startsWith('"') && trimmed.endsWith('"');
+    const content = quoted ? trimmed.slice(1, -1) : trimmed;
+    const safe = content
       .replace(/<br\s*\/?>/gi, ' ')
       .replace(/["'`]/g, '')
-      .replace(/[\/():;<>|]/g, ' ')
-      .replace(/\s+/g, ' ')
+      .replace(/[\[\]{}|<>]/g, ' ')
+      .replace(/\\/g, '')
+      .replace(/[ \t]+/g, ' ')
       .trim();
-    return `${open}${safe}${close}`;
-  });
+    return quoted ? '"' + safe + '"' : safe;
+  };
+  out = out
+    .replace(/\[([^\]]*)\]/g, (_m, inner) => '[' + cleanNodeLabel(String(inner)) + ']')
+    .replace(/\{([^}]*)\}/g, (_m, inner) => '{' + cleanNodeLabel(String(inner)) + '}');
 
   // Step 3: clean edge labels inside pipes -->|label| or ---|label|
   out = out.replace(/\|([^|]*)\|/g, (_m, label) => {
@@ -309,11 +316,9 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
         } as ExcalidrawElement;
       }
       const isChanged = CHANGED_FILLS.has((el.backgroundColor || '').toLowerCase());
-
-      // Mermaid owns the layout. Keep explanatory descriptions out of the
-      // canvas scene: adding them after the Mermaid layout pass expands nodes
-      // without moving connected nodes or arrows, causing overlaps.
       const label = containerLabel.get(el.id);
+      // Mermaid owns layout. Keep supporting descriptions out of this scene:
+      // enlarging a node after its edges are laid out makes the flow overlap.
       const desc = null;
       const isRequestContract = /^REQ\s*(?:—|-|:)/i.test(label || '');
       const isResponseContract = /^RES\s*(?:—|-|:)/i.test(label || '');

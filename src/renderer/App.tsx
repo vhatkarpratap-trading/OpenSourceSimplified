@@ -2,7 +2,7 @@ import React, { useState, useCallback, useRef, useEffect } from 'react';
 import type { ExcalidrawImperativeAPI } from '@excalidraw/excalidraw/types/types';
 import Canvas from './Canvas';
 import { DiagramData, DiagramKind } from './diagramBuilder';
-import type { CommitInfo, CommitDiffResult, PRInfo, PRReviewResult, ChangeContextNode } from './global';
+import type { CommitInfo, CommitDiffResult, PRInfo, PRReviewResult, ChangeContextNode, WalkthroughSettings } from './global';
 
 const DIAGRAM_TYPES: { id: string; label: string; emoji: string; description: string; template: string }[] = [
   { id: 'flowchart', label: 'Flow Chart', emoji: '⬡', description: 'Steps, decisions, processes',
@@ -52,6 +52,11 @@ function restoreSelectionLabel(name: string, diagram: DiagramData | null): strin
 }
 
 type AnalysisStatus = 'idle' | 'running' | 'patching' | 'done' | 'error';
+type AccountState = {
+  configured: boolean;
+  user: { email: string; name: string; picture?: string } | null;
+  subscription: { plan: 'monthly' | 'yearly'; status: string; id: string; renewsAt?: string } | null;
+};
 
 const DIAGRAM_TABS: { kind: DiagramKind; label: string }[] = [
   { kind: 'structure', label: 'User Flow' },
@@ -76,6 +81,11 @@ const STATUS_LABEL: Record<AnalysisStatus, string> = {
 };
 
 export default function App() {
+  const [account, setAccount] = useState<AccountState | null>(null);
+  const [debugMode, setDebugMode] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
+  const [accountBusy, setAccountBusy] = useState(false);
+  const [accountError, setAccountError] = useState<string | null>(null);
   const [folder, setFolder]           = useState<string | null>(null);
   const [diagram, setDiagram]         = useState<DiagramData | null>(null);
   const [status, setStatus]           = useState<AnalysisStatus>('idle');
@@ -98,7 +108,6 @@ export default function App() {
   const [drilling, setDrilling]               = useState(false);
   const [storyLoading, setStoryLoading]       = useState(false);
   const [implLoading, setImplLoading]         = useState(false);
-  const [bulkPlot, setBulkPlot] = useState<{ mode: 'drill' | 'story' | 'implementation'; current: number; total: number } | null>(null);
   const codeFlowLoading = storyLoading || implLoading;
   const [sourcePanelOpen, setSourcePanelOpen] = useState(false);
   const [sourceView, setSourceView] = useState<{ files?: Array<{ path: string; content: string; highlight?: string }>; error?: string } | null>(null);
@@ -109,6 +118,23 @@ export default function App() {
   const [aiProviders, setAiProviders] = useState<{ id: string; label: string }[]>([
     { id: 'claude', label: 'Claude' }, { id: 'codex', label: 'OpenAI Codex' }, { id: 'gemini', label: 'Google Gemini' },
   ]);
+
+  const DEFAULT_WALKTHROUGH_SETTINGS: WalkthroughSettings = {
+    entryPoints: false, callChain: false, asyncPatterns: false, branchingLogic: false,
+    dataFlow: false, dataTypes: false, stateManagement: false,
+    dbInteractions: false, dbSchema: false,
+    restCalls: false, graphqlOps: false, externalIntegrations: false,
+    authChecks: false, permissions: false,
+    inputValidation: false, sensitiveData: false,
+    errorHandling: false, fallbacks: false,
+    caching: false, concurrency: false,
+    logging: false, events: false, testCoverage: false,
+    designPatterns: false, businessLogic: false, frameworkUnderstanding: false,
+  };
+  const [walkthroughSettings, setWalkthroughSettings] = useState<WalkthroughSettings>(DEFAULT_WALKTHROUGH_SETTINGS);
+  const [walkthroughSettingsOpen, setWalkthroughSettingsOpen] = useState(false);
+  const walkthroughSettingsRef = useRef<HTMLDivElement>(null);
+  const activeWalkthroughFocusCount = Object.values(walkthroughSettings).filter(Boolean).length;
 
   // Canvas history — every diagram Claude draws gets appended here
   const [canvasHistory, setCanvasHistory] = useState<{ diagram: DiagramData; timestamp: number; index: number }[]>([]);
@@ -171,12 +197,47 @@ export default function App() {
     return () => document.removeEventListener('mousedown', handler);
   }, [typePickerOpen]);
 
+  // Close walkthrough settings when clicking outside
+  useEffect(() => {
+    if (!walkthroughSettingsOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (walkthroughSettingsRef.current && !walkthroughSettingsRef.current.contains(e.target as Node)) {
+        setWalkthroughSettingsOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [walkthroughSettingsOpen]);
+
   useEffect(() => {
     window.electronAPI.getAiProvider().then(({ provider, providers }) => {
       setAiProvider(provider);
       setAiProviders(providers);
     }).catch(() => undefined);
     window.electronAPI.getAnalysisDepth().then(setAnalysisDepth).catch(() => undefined);
+    window.electronAPI.getAccountState().then(setAccount).catch(() => undefined);
+    window.electronAPI.isDebugMode().then(setDebugMode).catch(() => undefined);
+    window.electronAPI.getWalkthroughSettings().then(s => setWalkthroughSettings(s as WalkthroughSettings)).catch(() => undefined);
+  }, []);
+
+  const handleGoogleSignIn = useCallback(async () => {
+    setAccountBusy(true); setAccountError(null);
+    try { setAccount(await window.electronAPI.signInWithGoogle()); }
+    catch (error) { setAccountError(error instanceof Error ? error.message : 'Google sign-in failed.'); }
+    finally { setAccountBusy(false); }
+  }, []);
+
+  const handleSubscribe = useCallback(async (plan: 'monthly' | 'yearly') => {
+    setAccountBusy(true); setAccountError(null);
+    try { setAccount(await window.electronAPI.startSubscription(plan)); }
+    catch (error) { setAccountError(error instanceof Error ? error.message : 'PayPal checkout failed.'); }
+    finally { setAccountBusy(false); }
+  }, []);
+
+  const handleSignOut = useCallback(async () => {
+    setAccountBusy(true); setAccountError(null);
+    try { setAccount(await window.electronAPI.signOut()); }
+    finally { setAccountBusy(false); }
   }, []);
 
   const excalidrawAPIRef   = useRef<ExcalidrawImperativeAPI | null>(null);
@@ -185,7 +246,6 @@ export default function App() {
   const clearAllCodeFlowsRef = useRef<(() => void) | null>(null);
   const renderDrilldownRef = useRef<((name: string) => void) | null>(null);
   const renderCodeFlowRef  = useRef<((name: string, mode?: 'story' | 'implementation' | 'actual', drillMermaid?: string) => Promise<void>) | null>(null);
-  const componentNamesRef  = useRef<(() => string[]) | null>(null);
   const flowInFlightRef    = useRef(false);
   const canvasContextRef   = useRef<(() => string) | null>(null);
   const rawElementsRef     = useRef<(() => unknown[]) | null>(null);
@@ -289,13 +349,12 @@ export default function App() {
       setChangeContextOpen(true);
     });
 
-    // Restore last session's panels from cache — re-render them onto the canvas
+    // Restore non-drill panels from cache. Drills are intentional, temporary
+    // navigation and must only happen after the user explicitly requests one.
     window.electronAPI.onRestoreSession(async (panels) => {
       for (const panel of panels) {
         if (panel.mode === 'drill') {
-          await renderDrilldownRef.current?.(panel.name);
-          setDrillDepth(d => d + 1);
-          setDrilldownActive(true);
+          continue;
         } else {
           await renderCodeFlowRef.current?.(panel.name, panel.mode as 'story' | 'implementation' | 'actual');
           setCodeFlowDepth(d => d + 1);
@@ -373,7 +432,7 @@ export default function App() {
   }, [folder, diagram]);
 
   const askAboutSelection = useCallback(async () => {
-    if (!selectionQuestion.trim() || selectedComponents.length === 0) return;
+    if (!selectionQuestion.trim() || !folder) return;
     setSelectionAnswering(true);
     try {
       const canvasContext = canvasContextRef.current?.() ?? '';
@@ -399,15 +458,12 @@ export default function App() {
     const restoredNames = names.map(name => restoreSelectionLabel(name, diagram));
     setSelectedComponents(restoredNames);
     setSelectedComponent(restoredNames[0] ?? null);
-    if (names.length === 0) setSelectionQuestionOpen(false);
     const selected = restoredNames[0];
     if (!selected) return;
   }, [diagram]);
 
   const folderName = folder ? folder.split('/').filter(Boolean).pop() : null;
   const busy = status === 'running' || status === 'patching';
-  const bulkPlotting = !!bulkPlot;
-  const canBulkPlot = !!folder && !!diagram && !bulkPlotting && !drilling && !codeFlowLoading;
   const canvasLabel = (drilldownActive || codeFlowActive)
     ? [drilldownActive && `Drill: ${selectedComponent ?? ''}`, codeFlowActive && `Flow: ${selectedComponent ?? ''}`].filter(Boolean).join(' · ')
     : prActive && activePR
@@ -481,43 +537,6 @@ export default function App() {
       flowInFlightRef.current = false;
     }
   }, [selectedComponent]);
-
-  const handlePlotAll = useCallback(async (mode: 'drill' | 'story' | 'implementation') => {
-    if (bulkPlot || flowInFlightRef.current) return;
-    const names = Array.from(new Set((componentNamesRef.current?.() ?? [])
-      .map(name => name.trim())
-      .filter(Boolean)));
-    if (names.length === 0) {
-      setRenderError('There are no components on the current diagram to plot.');
-      return;
-    }
-
-    setBulkPlot({ mode, current: 0, total: names.length });
-    if (mode === 'drill') setDrilling(true);
-    else {
-      flowInFlightRef.current = true;
-      mode === 'story' ? setStoryLoading(true) : setImplLoading(true);
-    }
-
-    try {
-      for (let index = 0; index < names.length; index += 1) {
-        const name = names[index];
-        setBulkPlot({ mode, current: index + 1, total: names.length });
-        if (mode === 'drill') await renderDrilldownRef.current?.(name);
-        else await renderCodeFlowRef.current?.(name, mode);
-        sessionPanelsRef.current = [...sessionPanelsRef.current, { name, mode }];
-      }
-      if (mode === 'drill') setDrillDepth(depth => depth + names.length);
-      else setCodeFlowDepth(depth => depth + names.length);
-      window.electronAPI.saveSessionPanels(sessionPanelsRef.current);
-    } finally {
-      setBulkPlot(null);
-      setDrilling(false);
-      setStoryLoading(false);
-      setImplLoading(false);
-      flowInFlightRef.current = false;
-    }
-  }, [bulkPlot]);
 
   const handleRepositoryCodeStory = useCallback(async () => {
     if (!folder || codeFlowLoading || flowInFlightRef.current) return;
@@ -720,23 +739,82 @@ export default function App() {
     }
   }, [showPRView]);
 
+  const hasPro = debugMode || account?.subscription?.status === 'ACTIVE' || account?.subscription?.status === 'APPROVED';
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', width: '100vw', height: '100vh', background: '#0f0f1a' }}>
+    <div
+      onClickCapture={(event) => {
+        if (hasPro) return;
+        const target = event.target as HTMLElement;
+        if (target.closest('[data-account-dialog], [data-account-action]')) return;
+        event.preventDefault();
+        event.stopPropagation();
+        setAccountError(null);
+        setAccountOpen(true);
+      }}
+      style={{ display: 'flex', flexDirection: 'column', width: '100vw', height: '100vh', background: '#0f0f1a' }}
+    >
       <style>{`
         @keyframes slideUpIn { from { opacity: 0; transform: translateX(-50%) translateY(8px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
         @keyframes slideIn { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: translateX(0); } }
       `}</style>
+
+      {accountOpen && (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 1000, display: 'grid', placeItems: 'center', background: 'rgba(5, 6, 12, 0.78)', fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+          <div data-account-dialog role="dialog" aria-modal="true" aria-label="Account and Pro plans" style={{ width: 520, maxWidth: 'calc(100vw - 32px)', background: '#171721', border: '1px solid #45455a', borderRadius: 14, padding: 24, boxShadow: '0 24px 80px rgba(0,0,0,.55)' }}>
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
+              <div><div style={{ color: '#fff', fontSize: 21, fontWeight: 700 }}>Rex Canvas Pro</div><div style={{ color: '#a9a9bb', fontSize: 13, marginTop: 5 }}>Every canvas feature is included with Pro.</div></div>
+              <button onClick={() => setAccountOpen(false)} aria-label="Close" style={{ color: '#a9a9bb', background: 'transparent', border: 0, fontSize: 20, cursor: 'pointer' }}>×</button>
+            </div>
+            {account?.subscription ? (
+              <div style={{ marginTop: 20, padding: 14, borderRadius: 9, background: '#10251d', border: '1px solid #2d8a5d', color: '#d7fbe8' }}>
+                <div style={{ fontWeight: 700 }}>Pro is active</div>
+                <div style={{ fontSize: 12, marginTop: 4, color: '#a9ddbf' }}>{account.subscription.plan === 'monthly' ? '$19 / month' : '$120 / year'} · {account.subscription.status.toLowerCase()}{account.subscription.renewsAt ? ` · renews ${new Date(account.subscription.renewsAt).toLocaleDateString()}` : ''}</div>
+              </div>
+            ) : (
+              <>
+                {!account?.user ? (
+                  <div style={{ marginTop: 20 }}>
+                    <div style={{ fontSize: 13, color: '#d4d4df', marginBottom: 10 }}>Sign in to securely connect your subscription.</div>
+                    <button onClick={() => void handleGoogleSignIn()} disabled={accountBusy} style={{ width: '100%', padding: '11px 14px', borderRadius: 7, border: '1px solid #e5e7eb', background: '#fff', color: '#252530', fontWeight: 600, cursor: accountBusy ? 'wait' : 'pointer' }}>{accountBusy ? 'Opening Google…' : 'Continue with Google'}</button>
+                  </div>
+                ) : (
+                  <div style={{ marginTop: 20 }}>
+                    <div style={{ color: '#d4d4df', fontSize: 13, marginBottom: 12 }}>Signed in as {account.user.email}</div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                      <button onClick={() => void handleSubscribe('monthly')} disabled={accountBusy} style={{ textAlign: 'left', padding: 15, borderRadius: 9, border: '1px solid #55556c', background: '#22222e', color: '#fff', cursor: accountBusy ? 'wait' : 'pointer' }}><div style={{ fontWeight: 700 }}>Monthly</div><div style={{ fontSize: 20, fontWeight: 700, marginTop: 7 }}>$19 <span style={{ fontSize: 12, fontWeight: 400 }}>/ month</span></div></button>
+                      <button onClick={() => void handleSubscribe('yearly')} disabled={accountBusy} style={{ textAlign: 'left', padding: 15, borderRadius: 9, border: '1px solid #8070e9', background: '#292447', color: '#fff', cursor: accountBusy ? 'wait' : 'pointer' }}><div style={{ fontWeight: 700 }}>Yearly · Save $108</div><div style={{ fontSize: 20, fontWeight: 700, marginTop: 7 }}>$120 <span style={{ fontSize: 12, fontWeight: 400 }}>/ year</span></div></button>
+                    </div>
+                    {accountBusy && <div style={{ fontSize: 12, color: '#bcb3ff', marginTop: 12 }}>Complete approval in PayPal. This screen will update automatically.</div>}
+                  </div>
+                )}
+              </>
+            )}
+            {accountError && <div style={{ marginTop: 14, padding: 10, background: '#351923', border: '1px solid #8f3b50', borderRadius: 7, color: '#ffc2ce', fontSize: 12 }}>{accountError}</div>}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 20 }}>
+              <span style={{ color: '#77778c', fontSize: 11 }}>Payments are securely handled by PayPal.</span>
+              {account?.user && <button onClick={() => void handleSignOut()} disabled={accountBusy} style={{ color: '#b7b7c6', background: 'transparent', border: 0, fontSize: 12, cursor: 'pointer' }}>Sign out</button>}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Toolbar ── */}
       <div style={{
         display: 'flex', alignItems: 'center', alignContent: 'center', flexWrap: 'wrap', gap: 8,
         padding: '8px 16px', minHeight: 76, boxSizing: 'border-box',
         background: '#15151d', borderBottom: '1px solid #30303b',
-        flexShrink: 0, overflowX: 'auto',
+        // The Focus menu is an absolutely positioned child of this toolbar.
+        // Keeping overflow visible prevents the menu from being clipped below it.
+        flexShrink: 0, overflow: 'visible', position: 'relative', zIndex: 10,
         // @ts-ignore
         WebkitAppRegion: 'drag',
       }}>
         <div style={{ width: 80, flexShrink: 0 }} />
+
+        <button data-account-action onClick={() => { setAccountError(null); setAccountOpen(true); }} style={{ padding: '6px 11px', background: (debugMode || account?.subscription) ? '#173a2b' : '#322855', border: `1px solid ${(debugMode || account?.subscription) ? '#31855c' : '#7767d9'}`, borderRadius: 6, color: '#f5f3ff', fontSize: 12, fontWeight: 600, cursor: 'pointer', flexShrink: 0, WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+          {debugMode ? 'Debug · Free' : account?.subscription ? '✓ Pro' : 'Upgrade to Pro'}
+        </button>
 
         {/* Open Project */}
         <button onClick={handleOpenFolder} style={{
@@ -869,31 +947,6 @@ export default function App() {
           {drilling ? 'Drilling…' : selectedComponent ? `Drill: ${selectedComponent}` : 'Drill'}
         </button>
 
-        {(['drill', 'story', 'implementation'] as const).map(mode => {
-          const label = mode === 'drill' ? 'Plot all drills' : mode === 'story' ? 'Plot all stories' : 'Plot all builds';
-          const active = bulkPlot?.mode === mode;
-          return (
-            <button
-              key={mode}
-              onClick={() => void handlePlotAll(mode)}
-              disabled={!canBulkPlot}
-              title={`${label} for every component in the current diagram`}
-              style={{
-                display: 'flex', alignItems: 'center', gap: 5, padding: '6px 9px',
-                background: canBulkPlot || active ? '#263449' : '#1b1b24',
-                border: `1px solid ${canBulkPlot || active ? '#4b6b91' : '#3b3b47'}`, borderRadius: 6,
-                color: canBulkPlot || active ? '#dbeafe' : '#777782', fontSize: 11,
-                fontFamily: 'system-ui, -apple-system, sans-serif', cursor: canBulkPlot ? 'pointer' : 'not-allowed',
-                opacity: canBulkPlot || active ? 1 : 0.45, flexShrink: 0,
-                // @ts-ignore
-                WebkitAppRegion: 'no-drag',
-              }}
-            >
-              {active ? `${bulkPlot!.current}/${bulkPlot!.total}` : label}
-            </button>
-          );
-        })}
-
         {/* Code Story button */}
         <button
           onClick={() => { if (flowInFlightRef.current) return; if (selectedComponent) void handleCodeFlow(); else void handleRepositoryCodeStory(); }}
@@ -935,9 +988,25 @@ export default function App() {
         </button>
 
         <button
-          onClick={() => { if (flowInFlightRef.current) return; if (selectedComponent) void handleImplementation(); else void handleRepositoryImplementation(); }}
+          onClick={() => { if (!flowInFlightRef.current) void handleImplementation(); }}
+          disabled={!selectedComponent || implLoading}
+          title={selectedComponent ? `Walk through how ${selectedComponent} works in simple English` : 'Select a component first'}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
+            background: selectedComponent && !implLoading ? '#2b2b36' : '#1b1b24', border: `1px solid ${selectedComponent && !implLoading ? '#51515e' : '#3b3b47'}`, borderRadius: 6,
+            color: selectedComponent && !implLoading ? '#ededf2' : '#777782', fontSize: 12, fontFamily: 'system-ui, -apple-system, sans-serif',
+            cursor: selectedComponent && !implLoading ? 'pointer' : 'not-allowed', opacity: selectedComponent && !implLoading ? 1 : 0.45, flexShrink: 0,
+            // @ts-ignore
+            WebkitAppRegion: 'no-drag',
+          }}
+        >
+          <FlowIcon /> {implLoading ? 'Explaining…' : 'Code walkthrough'}
+        </button>
+
+        <button
+          onClick={() => { if (!flowInFlightRef.current) void handleRepositoryImplementation(); }}
           disabled={!canFlow}
-          title={selectedComponent ? `Show a clear guide to how ${selectedComponent} is built` : 'Show a clear guide to how the whole project is built'}
+          title="Generate a code walkthrough for the whole project in simple English"
           style={{
             display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
             background: canFlow ? '#2b2b36' : '#1b1b24', border: `1px solid ${canFlow ? '#51515e' : '#3b3b47'}`, borderRadius: 6,
@@ -947,8 +1016,148 @@ export default function App() {
             WebkitAppRegion: 'no-drag',
           }}
         >
-          <FlowIcon /> {implLoading ? 'Explaining…' : selectedComponent ? 'How it builds' : 'How the project builds'}
+          <FlowIcon /> {implLoading ? 'Explaining…' : 'Project code walkthrough'}
         </button>
+
+        {/* Walkthrough settings gear button */}
+        <div style={{ position: 'relative', flexShrink: 0 }} ref={walkthroughSettingsRef}>
+          <button
+            onClick={() => setWalkthroughSettingsOpen(o => !o)}
+            title="Configure what to focus on in code walkthroughs"
+            style={{
+              display: 'flex', alignItems: 'center', gap: 5, padding: '6px 10px',
+              background: walkthroughSettingsOpen ? '#2a2a42' : '#20202a',
+              border: `1px solid ${walkthroughSettingsOpen ? '#7c6aed' : activeWalkthroughFocusCount > 0 ? '#7c6aed' : '#484854'}`,
+              borderRadius: 6, color: walkthroughSettingsOpen || activeWalkthroughFocusCount > 0 ? '#c4b5fd' : '#c8c8d0',
+              fontSize: 11, fontFamily: 'system-ui, -apple-system, sans-serif',
+              cursor: 'pointer',
+              // @ts-ignore
+              WebkitAppRegion: 'no-drag',
+            }}
+            >
+            <GearIcon />
+            Focus
+            {activeWalkthroughFocusCount > 0 && (
+              <span aria-label={`${activeWalkthroughFocusCount} focus areas active`} style={{
+                minWidth: 16, height: 16, padding: '0 4px', borderRadius: 8,
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                background: '#7c6aed', color: '#fff', fontSize: 10, fontWeight: 700, lineHeight: 1,
+              }}>{activeWalkthroughFocusCount}</span>
+            )}
+          </button>
+
+          {walkthroughSettingsOpen && (
+            <div style={{
+              position: 'absolute', top: '100%', left: 0, marginTop: 4,
+              width: 340, maxHeight: 540, overflowY: 'auto',
+              background: '#1a1a26', border: '1px solid #3a3a58',
+              borderRadius: 10, boxShadow: '0 12px 40px rgba(0,0,0,0.5)',
+              zIndex: 300, padding: '12px 0',
+              fontFamily: 'system-ui, -apple-system, sans-serif',
+            }}>
+              <div style={{ padding: '0 14px 8px', borderBottom: '1px solid #2a2a3e', marginBottom: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: '#ededf2' }}>Walkthrough Focus</div>
+                  <div style={{ fontSize: 10, color: '#7777a0', marginTop: 2 }}>Tick what you want the AI to give extra attention to</div>
+                </div>
+                {Object.values(walkthroughSettings).some(v => v) && (
+                  <button
+                    onClick={() => {
+                      const cleared = Object.fromEntries(Object.keys(walkthroughSettings).map(k => [k, false])) as unknown as WalkthroughSettings;
+                      setWalkthroughSettings(cleared);
+                      window.electronAPI.setWalkthroughSettings(cleared).catch(() => undefined);
+                    }}
+                    style={{ fontSize: 10, color: '#9999bb', background: 'transparent', border: '1px solid #3a3a58', borderRadius: 4, padding: '2px 7px', cursor: 'pointer' }}
+                  >Clear all</button>
+                )}
+              </div>
+
+              {[
+                { label: 'EXECUTION FLOW', keys: [
+                  { key: 'entryPoints', label: 'Entry points and triggers' },
+                  { key: 'callChain', label: 'Function call chain' },
+                  { key: 'asyncPatterns', label: 'Async and await patterns' },
+                  { key: 'branchingLogic', label: 'Branching logic and conditionals' },
+                ] as { key: keyof WalkthroughSettings; label: string }[] },
+                { label: 'DATA', keys: [
+                  { key: 'dataFlow', label: 'Data flow and transformations' },
+                  { key: 'dataTypes', label: 'Data types and schemas' },
+                  { key: 'stateManagement', label: 'State management' },
+                ] as { key: keyof WalkthroughSettings; label: string }[] },
+                { label: 'DATABASE', keys: [
+                  { key: 'dbInteractions', label: 'DB reads and writes' },
+                  { key: 'dbSchema', label: 'Schema and table structure' },
+                ] as { key: keyof WalkthroughSettings; label: string }[] },
+                { label: 'NETWORK & APIs', keys: [
+                  { key: 'restCalls', label: 'REST calls and payloads' },
+                  { key: 'graphqlOps', label: 'GraphQL operations' },
+                  { key: 'externalIntegrations', label: 'External integrations and SDKs' },
+                ] as { key: keyof WalkthroughSettings; label: string }[] },
+                { label: 'ACCESS CONTROL', keys: [
+                  { key: 'authChecks', label: 'Authentication checks' },
+                  { key: 'permissions', label: 'Permissions and roles' },
+                ] as { key: keyof WalkthroughSettings; label: string }[] },
+                { label: 'SECURITY', keys: [
+                  { key: 'inputValidation', label: 'Input validation and injection risks' },
+                  { key: 'sensitiveData', label: 'Sensitive data and PII handling' },
+                ] as { key: keyof WalkthroughSettings; label: string }[] },
+                { label: 'ERROR HANDLING', keys: [
+                  { key: 'errorHandling', label: 'Error flows and propagation' },
+                  { key: 'fallbacks', label: 'Fallbacks, retries, and timeouts' },
+                ] as { key: keyof WalkthroughSettings; label: string }[] },
+                { label: 'PERFORMANCE', keys: [
+                  { key: 'caching', label: 'Caching layers and memoisation' },
+                  { key: 'concurrency', label: 'Concurrency and parallelism' },
+                ] as { key: keyof WalkthroughSettings; label: string }[] },
+                { label: 'OBSERVABILITY', keys: [
+                  { key: 'logging', label: 'Logging, metrics, and tracing' },
+                  { key: 'events', label: 'Events and messaging' },
+                ] as { key: keyof WalkthroughSettings; label: string }[] },
+                { label: 'QUALITY', keys: [
+                  { key: 'testCoverage', label: 'Test coverage and mock boundaries' },
+                ] as { key: keyof WalkthroughSettings; label: string }[] },
+                { label: 'ARCHITECTURE', keys: [
+                  { key: 'designPatterns', label: 'Design patterns and layer boundaries' },
+                  { key: 'businessLogic', label: 'Business logic and domain rules' },
+                  { key: 'frameworkUnderstanding', label: 'Framework understanding in plain English' },
+                ] as { key: keyof WalkthroughSettings; label: string }[] },
+              ].map(group => (
+                <div key={group.label} style={{ padding: '0 14px 10px' }}>
+                  <div style={{ fontSize: 9, color: '#6666a0', fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 6, marginTop: 4 }}>
+                    {group.label}
+                  </div>
+                  {group.keys.map(({ key, label }) => {
+                    const checked = walkthroughSettings[key];
+                    return (
+                      <label
+                        key={key}
+                        style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 6px', borderRadius: 5, cursor: 'pointer', background: checked ? '#23233a' : 'transparent', marginBottom: 2 }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => {
+                            const next = { ...walkthroughSettings, [key]: !checked };
+                            setWalkthroughSettings(next);
+                            window.electronAPI.setWalkthroughSettings(next).catch(() => undefined);
+                          }}
+                          style={{ accentColor: '#7c6aed', width: 13, height: 13, cursor: 'pointer', flexShrink: 0 }}
+                        />
+                        <span style={{ fontSize: 12, color: checked ? '#c4b5fd' : '#9999bb', userSelect: 'none' }}>{label}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              ))}
+
+              <div style={{ padding: '8px 14px 0', borderTop: '1px solid #2a2a3e', marginTop: 4 }}>
+                <div style={{ fontSize: 10, color: '#5555a0', lineHeight: 1.4 }}>
+                  These settings inject specific focus instructions into the next walkthrough prompt. Cached results are bypassed when focus changes.
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
 
         <button
           onClick={handleClearProjectCache}
@@ -967,20 +1176,20 @@ export default function App() {
 
         <button
           onClick={() => setSelectionQuestionOpen(true)}
-          disabled={!selectedComponent}
-          title={selectedComponent ? 'Ask a question about the selected component or components' : 'Select a component first'}
+          disabled={!folder || busy}
+          title={selectedComponent ? 'Ask a question about the selected component or components' : 'Ask a question about this project'}
           style={{
             display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
-            background: selectedComponent ? '#2b2b36' : '#1b1b24',
-            border: `1px solid ${selectedComponent ? '#51515e' : '#3b3b47'}`, borderRadius: 6,
-            color: selectedComponent ? '#ededf2' : '#777782', fontSize: 12,
+            background: (!folder || busy) ? '#1b1b24' : '#2b2b36',
+            border: `1px solid ${(!folder || busy) ? '#3b3b47' : '#51515e'}`, borderRadius: 6,
+            color: (!folder || busy) ? '#777782' : '#ededf2', fontSize: 12,
             fontFamily: 'system-ui, -apple-system, sans-serif',
-            cursor: selectedComponent ? 'pointer' : 'not-allowed', opacity: selectedComponent ? 1 : 0.45, flexShrink: 0,
+            cursor: (!folder || busy) ? 'not-allowed' : 'pointer', opacity: (!folder || busy) ? 0.45 : 1, flexShrink: 0,
             // @ts-ignore
             WebkitAppRegion: 'no-drag',
           }}
         >
-          Ask selected
+          {selectedComponent ? 'Ask selected' : 'Ask project'}
         </button>
 
         <button onClick={handleRelationships} disabled={!folder || busy} title="View the locally built file and import relationship graph" style={{
@@ -1467,7 +1676,7 @@ export default function App() {
                 </button>
               </div>
             )}
-            {selectionQuestionOpen && selectedComponents.length > 0 && (
+            {selectionQuestionOpen && (
               <div style={{
                 position: 'absolute', bottom: 68, left: '50%', transform: 'translateX(-50%)',
                 width: 460, display: 'flex', gap: 8, alignItems: 'center',
@@ -1479,7 +1688,9 @@ export default function App() {
                   value={selectionQuestion}
                   onChange={(e) => setSelectionQuestion(e.target.value)}
                   onKeyDown={(e) => { if (e.key === 'Enter') void askAboutSelection(); if (e.key === 'Escape') setSelectionQuestionOpen(false); }}
-                  placeholder={`Ask about ${selectedComponents.length === 1 ? selectedComponents[0] : `${selectedComponents.length} selected components`}…`}
+                  placeholder={selectedComponents.length === 0
+                    ? 'Ask about this project…'
+                    : `Ask about ${selectedComponents.length === 1 ? selectedComponents[0] : `${selectedComponents.length} selected components`}…`}
                   style={{ flex: 1, border: 'none', outline: 'none', fontSize: 12, fontFamily: 'system-ui, sans-serif', color: '#1e293b' }}
                 />
                 <button
@@ -1504,7 +1715,6 @@ export default function App() {
               clearAllCodeFlowsRef={clearAllCodeFlowsRef}
               renderDrilldownRef={renderDrilldownRef}
               renderCodeFlowRef={renderCodeFlowRef}
-              componentNamesRef={componentNamesRef}
               canvasContextRef={canvasContextRef}
               rawElementsRef={rawElementsRef}
               renderCommitDiffRef={renderCommitDiffRef}
@@ -1838,6 +2048,15 @@ function PRIcon() {
       <circle cx="6" cy="6" r="3" />
       <path d="M13 6h3a2 2 0 0 1 2 2v7" />
       <line x1="6" y1="9" x2="6" y2="21" />
+    </svg>
+  );
+}
+
+function GearIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
     </svg>
   );
 }
