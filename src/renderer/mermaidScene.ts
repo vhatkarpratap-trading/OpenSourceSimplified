@@ -21,7 +21,6 @@ export function cleanMermaid(src: string, keepSubgraphs = false): string {
   let s = src
     .replace(/^\s*```(?:mermaid)?\s*/i, '')
     .replace(/```\s*$/i, '')
-    .replace(/\\n/g, '\n')
     .trim();
   s = s.replace(/^graph\b/im, 'flowchart');
   if (keepSubgraphs) return s;
@@ -98,6 +97,52 @@ function sanitizeMermaid(src: string): string {
   });
 
   return out;
+}
+
+/** Build a tiny safe diagram when malformed AI Mermaid cannot be parsed. */
+function buildSafeFallbackMermaid(src: string): string {
+  const labels = new Map<string, string>();
+  const edges: Array<[string, string]> = [];
+  let next = 1;
+  const safeLabel = (value: string) => value
+    .replace(/\\n|[\r\n]+/g, ' ')
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/[\[\]{}()"'\x60|<>;]/g, ' ')
+    .replace(/[^\p{L}\p{N}\s.,:_\-]/gu, ' ')
+    .replace(/\s+/g, ' ').trim().slice(0, 88);
+  const nodeFor = (raw: string): string | null => {
+    const bracket = raw.match(/[\[{(]\s*(.*)$/s);
+    const text = safeLabel(bracket?.[1] ?? raw.replace(/^[A-Za-z_][\w.-]*/, ''));
+    if (!text) return null;
+    const existing = [...labels.entries()].find(([, label]) => label === text)?.[0];
+    if (existing) return existing;
+    const id = 'N' + next++;
+    labels.set(id, text);
+    return id;
+  };
+  for (const originalLine of src.split('\n')) {
+    const line = originalLine.trim();
+    if (!line || /^(?:flowchart|graph|subgraph|end|classDef|style|click)\b/i.test(line)) continue;
+    const parts = line.split(/(?:-->|==>|-\.->|---)/);
+    if (parts.length >= 2) {
+      const from = nodeFor(parts[0]);
+      const to = nodeFor(parts[parts.length - 1].replace(/^\|[^|]*\|/, ''));
+      if (from && to && from !== to) edges.push([from, to]);
+    } else nodeFor(line);
+  }
+  if (labels.size === 0) labels.set('N1', 'Diagram content could not be parsed');
+  const lines = ['flowchart TD'];
+  for (const [id, label] of labels) lines.push('  ' + id + '[' + label + ']');
+  const seen = new Set<string>();
+  for (const [from, to] of edges) {
+    const key = from + '|' + to;
+    if (!seen.has(key)) { lines.push('  ' + from + ' --> ' + to); seen.add(key); }
+  }
+  if (edges.length === 0 && labels.size > 1) {
+    const ids = [...labels.keys()];
+    for (let i = 1; i < ids.length; i++) lines.push('  ' + ids[i - 1] + ' --> ' + ids[i]);
+  }
+  return lines.join('\n');
 }
 
 /**
@@ -249,6 +294,12 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
     await tryParse(cleaned) ??
     await tryParse(sanitizeMermaid(cleanedNoStrip)) ??
     await tryParse(sanitizeMermaid(cleaned));
+
+  if (!skeletons) {
+    const fallback = buildSafeFallbackMermaid(cleaned);
+    console.warn('[mermaidScene] using simplified recovery diagram:\n' + fallback);
+    skeletons = await tryParse(fallback);
+  }
 
   if (!skeletons) {
     console.error('[mermaidScene] FAILED to render. Raw input was:\n' + mermaid +

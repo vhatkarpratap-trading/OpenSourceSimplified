@@ -7,7 +7,7 @@ import * as crypto from 'crypto';
 import { execSync } from 'child_process';
 import { createPty, writeToPty, resizePty, killPty, restartPty, runCapture as runProviderCapture, setPtyDataCallback, getPtyCwd, getAiProvider, setAiProvider, AI_PROVIDERS, AiProvider } from './ptyManager';
 import { startFileWatcher, stopFileWatcher } from './fileWatcher';
-import { extractStructure, toClaudePromptJSON, ExtractedStructure } from './codeExtractor';
+import { extractStructure, toClaudePromptJSON, ExtractedStructure, CodeNode } from './codeExtractor';
 import { buildGraphifyIndex, graphifyPromptContext, graphifySourceFiles } from './graphifyContext';
 import { startMcpServer, stopMcpServer, recordPtyOutput, updateClaudeJsonMcpConfig } from './mcpServer';
 import { listPRs, listLocalBranches, reviewPR, PRInfo } from './prReviewer';
@@ -165,6 +165,30 @@ function groundedStructureJson(folder: string, structure: ExtractedStructure, fo
       ? `${toClaudePromptJSON(structure)}\n\n${graphify.evidence}`
       : toClaudePromptJSON(structure),
   };
+}
+
+/**
+ * After Graphify has indexed a project, avoid immediately parsing the entire
+ * repository again. This lightweight structure is built from graph-selected
+ * source paths; source excerpts are then read only for those evidence paths.
+ */
+function structureFromGraphify(folder: string): ExtractedStructure | null {
+  const graphify = graphifyPromptContext(folder);
+  const files = graphify.resolution?.sourceFiles ?? [];
+  if (!graphify.available || files.length === 0) return null;
+  const root: CodeNode = { name: path.basename(folder), type: 'folder', path: folder, imports: [], children: [] };
+  const nodePaths: Record<string, string> = {};
+  const languages = new Set<string>();
+  files.forEach((relPath, index) => {
+    const absolute = path.resolve(folder, relPath);
+    if (!absolute.startsWith(path.resolve(folder) + path.sep)) return;
+    const base = path.basename(relPath);
+    const key = nodePaths[base] ? `${base} #${index + 1}` : base;
+    nodePaths[key] = absolute;
+    const ext = path.extname(relPath).slice(1); if (ext) languages.add(ext);
+    root.children.push({ name: base, type: 'file', path: absolute, imports: [], children: [] });
+  });
+  return { root, totalFiles: Object.keys(nodePaths).length, languages: [...languages], nodePaths, relationships: [] };
 }
 
 /** Keep every analysis entry point on the same cache-key format. */
@@ -1051,14 +1075,14 @@ ipcMain.handle('cache:clearProject', () => {
   return ok ? { ok: true } : { ok: false, error: 'Could not clear the project cache' };
 });
 
-async function runAnalysisInternal(): Promise<{ ok?: boolean; error?: string; fromCache?: boolean }> {
+async function runAnalysisInternal(preferGraphify = false): Promise<{ ok?: boolean; error?: string; fromCache?: boolean }> {
   if (!mainWindow || !currentFolder) return { error: 'No folder selected' };
 
   mainWindow.webContents.send('analysis:status', 'running');
 
   try {
-    mainWindow.webContents.send('analysis:statusDetail', 'Extracting code structure…');
-    const structure = extractStructure(currentFolder);
+    mainWindow.webContents.send('analysis:statusDetail', preferGraphify ? 'Selecting Graphify evidence paths…' : 'Extracting code structure…');
+    const structure = preferGraphify ? (structureFromGraphify(currentFolder) ?? extractStructure(currentFolder)) : extractStructure(currentFolder);
 
     if (structure.totalFiles === 0) {
       mainWindow.webContents.send('analysis:statusDetail', 'No source files found in this folder.');
@@ -1085,7 +1109,10 @@ async function runAnalysisInternal(): Promise<{ ok?: boolean; error?: string; fr
     const graphNote = graphify.available
       ? ` using ${graphify.nodeCount} Graphify nodes`
       : '';
-    mainWindow.webContents.send('analysis:statusDetail', `Analysing ${structure.totalFiles} files${graphNote} with ${providerLabel()}…`);
+    const graphProvenance = graphify.resolution?.reasons[0]
+      ? ` ${graphify.resolution.reasons[0]}`
+      : '';
+    mainWindow.webContents.send('analysis:statusDetail', `Analysing ${structure.totalFiles} files${graphNote} with ${providerLabel()}…${graphProvenance}`);
     const prompt = buildClaudePrompt(structureJson, buildAnalysisSourceContext(structure));
     const raw = await runCapture(prompt, currentFolder);
     let diagram = extractJson(raw) as AnalysisDiagram | null;
@@ -1146,7 +1173,7 @@ ipcMain.handle('graphify:buildAndAnalyse', async () => {
       mainWindow.webContents.send('analysis:status', 'error');
       return result;
     }
-    return { ...result, analysis: await runAnalysisInternal() };
+    return { ...result, analysis: await runAnalysisInternal(true) };
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
     mainWindow.webContents.send('analysis:statusDetail', error);
@@ -1208,7 +1235,8 @@ ipcMain.handle('component:detail', async (_e, name: string) => runComponentDetai
 
 /**
  * Find source files relevant to a component name.
- * Scores every source file by name-match + occurrence count, returns top 3.
+ * Scores every source file by name-match + occurrence count. This is the
+ * fallback when Graphify cannot provide a source-proven evidence path.
  * Searches the full project tree (not just the 80-file index) so concept-level
  * labels like "SimEngine" that span multiple files are handled correctly.
  * Never returns empty — if nothing scores > 0 returns [] and caller uses
@@ -1218,7 +1246,7 @@ function findSourceFiles(
   name: string,
   nodePaths: Record<string, string>,
   projectRoot: string,
-  maxResults = 3,
+  maxResults?: number,
 ): { filePath: string; content: string }[] {
   const lc = name.toLowerCase();
   // Graphify's artifacts are prompt evidence, never application source. In
@@ -1311,7 +1339,34 @@ function findSourceFiles(
   const callCount = (content: string) => (buildLocalCallHierarchy(content).match(/\|calls\|/g) || []).length;
   candidates.sort((a, b) => (b.score + Math.min(callCount(b.content), 6) * 6) - (a.score + Math.min(callCount(a.content), 6) * 6));
   const ranked = [...candidates, ...results.slice(14)];
-  return ranked.slice(0, maxResults).filter(r => r.score > 0).map(r => ({ filePath: r.filePath, content: r.content }));
+  const selected = maxResults === undefined ? ranked : ranked.slice(0, maxResults);
+  return selected.filter(r => r.score > 0).map(r => ({ filePath: r.filePath, content: r.content }));
+}
+
+/**
+ * Source loading follows Graphify's proven relationship path first. There is no
+ * arbitrary file limit: every graph-selected, readable source file is returned.
+ * Name matching remains a zero-setup fallback when Graphify is unavailable or
+ * cannot resolve the selected canvas label.
+ */
+function graphFirstSourceFiles(
+  name: string,
+  nodePaths: Record<string, string>,
+  projectRoot: string,
+): { filePath: string; content: string }[] {
+  const root = path.resolve(projectRoot);
+  const seen = new Set<string>();
+  const fromGraph = graphifySourceFiles(projectRoot, name).flatMap(relPath => {
+    const absolute = path.resolve(projectRoot, relPath);
+    if (!absolute.startsWith(root + path.sep) || seen.has(absolute)) return [];
+    seen.add(absolute);
+    try {
+      if (!fs.statSync(absolute).isFile() || fs.statSync(absolute).size > 2 * 1024 * 1024) return [];
+      const content = fs.readFileSync(absolute, 'utf8');
+      return content.includes('\0') ? [] : [{ filePath: absolute, content }];
+    } catch { return []; }
+  });
+  return fromGraph.length ? fromGraph : findSourceFiles(name, nodePaths, projectRoot);
 }
 
 /** Cache results against the exact source evidence, not just a canvas label. */
@@ -1543,7 +1598,7 @@ async function runComponentDrilldown(rawName: string): Promise<{ ok?: boolean; e
   if (!currentFolder || !name) return { error: 'no component' };
   try {
     const structure = extractStructure(currentFolder);
-    const sourceFiles = findSourceFiles(name, structure.nodePaths, currentFolder);
+    const sourceFiles = graphFirstSourceFiles(name, structure.nodePaths, currentFolder);
     const cacheKey = 'canonical-v5:depth-' + analysisDepth + ':' + name + ':' + componentEvidenceFingerprint(name, sourceFiles);
     const cached = loadCache(currentFolder);
     if (cached?.drilldowns?.[cacheKey]) {
@@ -2106,7 +2161,7 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
       return { ok: true, mermaid: parsed.mermaid, descriptions, happyPath };
     }
 
-    const sourceFiles = findSourceFiles(name, structure.nodePaths, currentFolder, 3);
+    const sourceFiles = graphFirstSourceFiles(name, structure.nodePaths, currentFolder);
     const cacheKey = `v21:depth-${analysisDepth}:focus-${walkthroughSettingsFingerprint(walkthroughSettings)}:${name}:${componentEvidenceFingerprint(name, sourceFiles)}`;
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
@@ -2175,14 +2230,14 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
 ipcMain.handle('component:codeflow', (_e, rawName: string, drillMermaid?: string) => runComponentCodeFlow(rawName, drillMermaid));
 
 /** Have the selected AI resolve a product-facing node to real local source files. */
-async function runComponentSource(rawName: string): Promise<{ ok: boolean; error?: string; files?: Array<{ path: string; content: string; highlight?: string }> }> {
+async function runComponentSource(rawName: string): Promise<{ ok: boolean; error?: string; files?: Array<{ path: string; content: string; highlight?: string }>; graphify?: { available: boolean; confidence?: string; matchKind?: string; reasons?: string[] } }> {
   const name = rawName.trim();
   if (!currentFolder || !name) return { ok: false, error: 'No component selected' };
   try {
     const structure = extractStructure(currentFolder);
     const graphify = graphifyPromptContext(currentFolder, name);
     const sourceHash = hashStructure(toClaudePromptJSON(structure) + ':graphify:' + graphify.fingerprint);
-    const cacheKey = `__source_browser__:v4:${name}:${sourceHash}`;
+    const cacheKey = `__source_browser__:v5:${name}:${sourceHash}`;
     const isImplementationPath = (relPath: string) => {
       const normalized = relPath.replace(/\\/g, '/');
       return /\.(?:kt|kts|java|swift|m|mm|ts|tsx|js|jsx|dart|py|go|rs|cs|cpp|c|h)$/i.test(normalized)
@@ -2199,22 +2254,21 @@ async function runComponentSource(rawName: string): Promise<{ ok: boolean; error
             + queryTerms.filter(term => lower.includes(term)).length * 20;
         };
         return score(b) - score(a) || a.localeCompare(b);
-      })
-      .slice(0, 180);
+      });
     const availableSet = new Set(availableFiles);
     let paths: string[] = [];
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
       try {
         const cached = JSON.parse(cachedValue) as { version?: number; files?: string[] };
-        if (cached.version === 4 && Array.isArray(cached.files)) paths = cached.files.filter(isImplementationPath);
+        if (cached.version === 5 && Array.isArray(cached.files)) paths = cached.files.filter(isImplementationPath);
       } catch { /* resolve again */ }
     }
 
     if (paths.length === 0) {
       // Graphify is a local, source-proven index. Prefer it before spending an
       // AI request on a filename inference.
-      paths = graphifySourceFiles(currentFolder, name, 4).filter(candidate => availableSet.has(candidate));
+      paths = graphifySourceFiles(currentFolder, name).filter(candidate => availableSet.has(candidate));
     }
 
     if (paths.length === 0) {
@@ -2223,7 +2277,7 @@ async function runComponentSource(rawName: string): Promise<{ ok: boolean; error
         'Identify the real source files that implement the selected product component. Do not edit anything.',
         `Selected canvas component: ${name}`,
         description ? `Canvas description: ${description}` : '',
-        'Inspect the repository if needed. Return 1 to 4 implementation files only, ordered most relevant first.',
+        'Inspect the repository if needed. Return every implementation file required to establish the feature behaviour, ordered by graph relevance. Do not omit a required file merely to meet a count.',
         'Choose only application implementation code: screens, navigation, view models, repositories, or domain logic. Never choose JSON, XML/resources, Gradle/build logic, generated code, tests, documentation, or dependency metadata.',
         graphify.available
           ? 'Use the supplied Graphify JSON as the strongest source-relationship evidence. Prefer its source_file values and follow EXTRACTED edges from the selected feature into its implementation.'
@@ -2235,16 +2289,15 @@ async function runComponentSource(rawName: string): Promise<{ ok: boolean; error
       ].filter(Boolean).join('\n\n');
       const parsed = extractJson(await runCapture(prompt, currentFolder)) as { files?: unknown } | null;
       if (Array.isArray(parsed?.files)) paths = parsed.files.filter((value): value is string => typeof value === 'string' && availableSet.has(value));
-      if (paths.length === 0) paths = findSourceFiles(name, structure.nodePaths, currentFolder, 12)
+      if (paths.length === 0) paths = graphFirstSourceFiles(name, structure.nodePaths, currentFolder)
         .map(source => path.relative(currentFolder!, source.filePath))
-        .filter(isImplementationPath)
-        .slice(0, 4);
+        .filter(isImplementationPath);
     }
     // Persist both local Graphify resolutions and AI fallbacks.
-    if (paths.length > 0) saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 4, files: paths }));
+    if (paths.length > 0) saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 5, files: paths }));
 
     const root = path.resolve(currentFolder);
-    const files = paths.slice(0, 4).flatMap(relPath => {
+    const files = paths.flatMap(relPath => {
       const absolute = path.resolve(currentFolder!, relPath);
       if (!absolute.startsWith(root + path.sep) || !fs.existsSync(absolute) || !fs.statSync(absolute).isFile()) return [];
       try {
@@ -2253,7 +2306,16 @@ async function runComponentSource(rawName: string): Promise<{ ok: boolean; error
       } catch { return []; }
     });
     if (files.length === 0) return { ok: false, error: `No readable source files were identified for "${name}".` };
-    return { ok: true, files };
+    return {
+      ok: true,
+      files,
+      graphify: graphify.available ? {
+        available: true,
+        confidence: graphify.resolution?.confidence,
+        matchKind: graphify.resolution?.matchKind,
+        reasons: graphify.resolution?.reasons,
+      } : { available: false },
+    };
   } catch (err: unknown) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
@@ -2299,7 +2361,7 @@ async function runComponentImplementation(rawName: string, drillMermaid = ''): P
   if (!currentFolder || !name) return { error: 'no component' };
   try {
     const structure = extractStructure(currentFolder);
-    const sourceFiles = findSourceFiles(name, structure.nodePaths, currentFolder, 6);
+    const sourceFiles = graphFirstSourceFiles(name, structure.nodePaths, currentFolder);
     const cacheKey = '__implementation__:v36:depth-' + analysisDepth + ':focus-' + walkthroughSettingsFingerprint(walkthroughSettings) + ':' + name + ':' + componentEvidenceFingerprint(name, sourceFiles);
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
@@ -2644,7 +2706,7 @@ ipcMain.handle('selection:ask', async (_e, req: { question: string; components: 
     if (asksAboutSelection) {
       let remaining = 9000;
       for (const component of components.slice(0, 8)) {
-        for (const { filePath, content } of findSourceFiles(component, structure.nodePaths, currentFolder)) {
+        for (const { filePath, content } of graphFirstSourceFiles(component, structure.nodePaths, currentFolder)) {
           if (remaining <= 0) break;
           const chunk = content.slice(0, remaining);
           sourceChunks.push('// ' + path.relative(currentFolder, filePath) + '\n' + chunk);

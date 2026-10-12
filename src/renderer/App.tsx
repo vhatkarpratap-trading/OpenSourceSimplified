@@ -110,7 +110,7 @@ export default function App() {
   const [implLoading, setImplLoading]         = useState(false);
   const codeFlowLoading = storyLoading || implLoading;
   const [sourcePanelOpen, setSourcePanelOpen] = useState(false);
-  const [sourceView, setSourceView] = useState<{ files?: Array<{ path: string; content: string; highlight?: string }>; error?: string } | null>(null);
+  const [sourceView, setSourceView] = useState<{ files?: Array<{ path: string; content: string; highlight?: string }>; error?: string; graphify?: { available: boolean; confidence?: string; matchKind?: string; reasons?: string[] } } | null>(null);
   const [sourceFileIndex, setSourceFileIndex] = useState(0);
   const [graphBuilding, setGraphBuilding] = useState(false);
   const [aiProvider, setAiProvider] = useState('claude');
@@ -519,7 +519,7 @@ export default function App() {
     setSourceView({});
     const result = await window.electronAPI.getComponentSource(selectedComponent);
     setSourceView(result.ok
-      ? { files: result.files }
+      ? { files: result.files, graphify: result.graphify }
       : { error: result.error ?? 'No matching source file was found.' });
   }, [selectedComponent]);
 
@@ -923,7 +923,16 @@ export default function App() {
         </div>
 
         {/* Keep project settings separate from the workflow actions below. */}
-        <div style={{ flexBasis: '100%', height: 0 }} />
+        <div
+          role="toolbar"
+          aria-label="Project workflow actions"
+          style={{
+            flexBasis: '100%', display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8,
+            paddingTop: 8, marginTop: 1, borderTop: '1px solid #30303b',
+            // @ts-ignore
+            WebkitAppRegion: 'drag',
+          }}
+        >
 
         {/* Drill button */}
         <button
@@ -1218,6 +1227,7 @@ export default function App() {
           <SparkleIcon />
           {status === 'running' ? 'Finding user flows…' : status === 'patching' ? 'Updating…' : 'Analyse user flow'}
         </button>
+        </div>
       </div>
 
       {/* ── Impact Panel ── */}
@@ -1750,6 +1760,13 @@ export default function App() {
                         fontSize: 10, fontFamily: 'ui-monospace, monospace', cursor: 'pointer',
                       }}>{file.path.split('/').pop()}</button>
                     ))}
+                  </div>
+                )}
+                {sourceView?.graphify && (
+                  <div style={{ padding: '6px 10px', borderBottom: '1px solid #303642', color: sourceView.graphify.available ? '#86efac' : '#fbbf24', fontSize: 10, fontFamily: 'system-ui, sans-serif', lineHeight: 1.35 }}>
+                    {sourceView.graphify.available
+                      ? `Graphify ${sourceView.graphify.confidence ?? 'graph'} match: ${sourceView.graphify.reasons?.[0] ?? 'selected source-proven evidence.'}`
+                      : 'Graphify evidence unavailable — files were resolved by source-name matching.'}
                   </div>
                 )}
                 <div style={{ overflow: 'auto', flex: 1, padding: '10px 0', color: '#d1d5db', fontSize: 12, lineHeight: 1.55 }}>

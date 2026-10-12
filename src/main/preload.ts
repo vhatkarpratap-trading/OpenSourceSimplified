@@ -46,7 +46,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Code flow: structured class/function/data trace rendered onto the canvas
   getComponentCodeFlow: (name: string, drillMermaid?: string): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; dataFlow?: Record<string, { input: string; output: string; change: string }>; happyPath?: string[] }> =>
     ipcRenderer.invoke('component:codeflow', name, drillMermaid),
-  getComponentSource: (name: string): Promise<{ ok: boolean; error?: string; files?: Array<{ path: string; content: string; highlight?: string }> }> =>
+  getComponentSource: (name: string): Promise<{ ok: boolean; error?: string; files?: Array<{ path: string; content: string; highlight?: string }>; graphify?: { available: boolean; confidence?: string; matchKind?: string; reasons?: string[] } }> =>
     ipcRenderer.invoke('component:source', name),
   getActualCodeFlow: (name: string): Promise<{ ok: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] }> =>
     ipcRenderer.invoke('component:actualCodeFlow', name),
