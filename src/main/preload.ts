@@ -11,7 +11,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('billing:startSubscription', plan),
   signOut: (): Promise<{ configured: boolean; user: null; subscription: null }> => ipcRenderer.invoke('account:signOut'),
   // Folder
-  openFolder: (): Promise<{ folder: string; hasCachedDiagram: boolean } | null> =>
+  openFolder: (): Promise<{ opened: boolean; folder: string; hasCachedDiagram?: boolean; access: { kind: 'open-source' | 'private'; source: string; detail: string; remoteUrl?: string } } | null> =>
     ipcRenderer.invoke('folder:open'),
   clearProjectCache: (): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('cache:clearProject'),

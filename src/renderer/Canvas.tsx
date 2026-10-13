@@ -177,6 +177,64 @@ function applyZoomAndGit(
   });
 }
 
+/** Add a quiet visual boundary around the generated diagram without making it a component. */
+function withGeneratedDesignBoundary(scene: FlatScene): FlatScene {
+  const content = scene.elements.filter(el => !el.isDeleted && !el.customData?.isGeneratedDesignBoundary);
+  if (content.length === 0) return scene;
+
+  const left = Math.min(...content.map(el => el.x));
+  const top = Math.min(...content.map(el => el.y));
+  const right = Math.max(...content.map(el => el.x + el.width));
+  const bottom = Math.max(...content.map(el => el.y + el.height));
+  const padding = 48;
+
+  const boundary = {
+    type: 'rectangle',
+    id: '__generated-design-boundary__',
+    x: left - padding,
+    y: top - padding,
+    width: right - left + padding * 2,
+    height: bottom - top + padding * 2,
+    strokeColor: '#64748b',
+    backgroundColor: 'transparent',
+    fillStyle: 'solid',
+    strokeWidth: 2,
+    strokeStyle: 'dashed',
+    angle: 0,
+    roughness: 0.5,
+    opacity: 100,
+    roundness: { type: 3 },
+    groupIds: [],
+    frameId: null,
+    seed: 246813,
+    version: 1,
+    versionNonce: 246814,
+    isDeleted: false,
+    updated: Date.now(),
+    link: null,
+    locked: true,
+    boundElements: [],
+    customData: { isGeneratedDesignBoundary: true },
+  } as unknown as ExcalidrawElement;
+
+  return {
+    ...scene,
+    elements: [boundary, ...scene.elements],
+    normalIds: [boundary.id, ...scene.normalIds],
+  };
+}
+
+/** Mermaid scenes can start left of their nominal origin. Account for their
+ * actual bounds when placing a new panel beside an existing diagram. */
+function horizontalBounds(elements: ExcalidrawElement[]): { left: number; right: number } {
+  const visible = elements.filter(el => !el.isDeleted);
+  if (visible.length === 0) return { left: 0, right: 0 };
+  return {
+    left: Math.min(...visible.map(el => el.x)),
+    right: Math.max(...visible.map(el => el.x + el.width)),
+  };
+}
+
 export default function Canvas({ diagramData, activeKind = 'structure', onAPIReady, onRenderError, onDrilldownChange, onCodeFlowChange, onSelectionChange, clearDrilldownRef, clearCodeFlowRef, clearAllCodeFlowsRef, renderDrilldownRef, renderCodeFlowRef, componentNamesRef, canvasContextRef, rawElementsRef, renderCommitDiffRef, clearCommitDiffRef, addNoteRef, selectionAnswerRef, errorAnnotations }: CanvasProps) {
   const [apiReady, setApiReady] = useState(false);
   const apiRef          = useRef<ExcalidrawImperativeAPI | null>(null);
@@ -230,7 +288,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     (async () => {
       let flat: FlatScene;
       try {
-        flat = await buildMermaidScene(mermaid, diagramData.descriptions);
+        flat = withGeneratedDesignBoundary(await buildMermaidScene(mermaid, diagramData.descriptions));
         onRenderError?.(null);
       } catch (err) {
         // Invalid Mermaid from the LLM — keep the last good scene, surface error
@@ -652,10 +710,11 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     const mermaid = answer.diagrams?.structure;
     if (!api || !mermaid) return;
 
-    const scene = await buildMermaidScene(mermaid, answer.descriptions);
+    const scene = withGeneratedDesignBoundary(await buildMermaidScene(mermaid, answer.descriptions));
     const existing = api.getSceneElements() as unknown as ExcalidrawElement[];
     const existingRects = existing.filter(e => e.type === 'rectangle') as (ExcalidrawElement & { x: number; y: number; width: number; height: number })[];
-    const offsetX = existingRects.reduce((max, e) => Math.max(max, e.x + e.width), 0) + 140;
+    const existingRight = existingRects.reduce((max, e) => Math.max(max, e.x + e.width), 0);
+    const offsetX = existingRight + 140 - horizontalBounds(scene.elements).left;
     const offsetY = existingRects.reduce((min, e) => Math.min(min, e.y), Infinity);
     const panelY = isFinite(offsetY) ? offsetY : 0;
     const seedBase = 9200000 + existing.length;
@@ -863,14 +922,15 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       if (!res?.ok || !res.mermaid) throw new Error('no mermaid');
 
       const { buildMermaidScene: bms } = await import('./mermaidScene');
-      const drillScene = await bms(res.mermaid);
+      const drillScene = withGeneratedDesignBoundary(await bms(res.mermaid));
 
       // Place new drill panel to the right of everything currently on canvas
       const freshEls = api.getSceneElements() as unknown as ExcalidrawElement[];
       const freshRects = freshEls.filter(e =>
         e.type === 'rectangle' && !e.id.startsWith('drill-loading')
       ) as (ExcalidrawElement & { x: number; y: number; width: number; height: number })[];
-      const panelOffsetX = freshRects.reduce((m, e) => Math.max(m, e.x + e.width), 0) + 100;
+      const existingRight = freshRects.reduce((m, e) => Math.max(m, e.x + e.width), 0);
+      const panelOffsetX = existingRight + 100 - horizontalBounds(drillScene.elements).left;
       const panelOffsetY = freshRects.reduce((m, e) => Math.min(m, e.y), Infinity);
       const panelY = isFinite(panelOffsetY) ? panelOffsetY : 0;
 
@@ -1050,7 +1110,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       console.log('[codeflow] ok:', res?.ok, 'error:', res?.error);
       if (!res?.ok || !res.mermaid) throw new Error(res?.error || 'no mermaid');
       const { buildMermaidScene: bms } = await import('./mermaidScene');
-      const flowScene = await bms(res.mermaid, res.descriptions);
+      let flowScene = await bms(res.mermaid, res.descriptions);
 
       // Excalidraw styles text per element rather than per line. A Code
       // Walkthrough node contains an exact source snippet, so use its native
@@ -1059,12 +1119,14 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       if (mode === 'implementation') {
         flowScene.elements = applyImplementationCodeCards(flowScene.elements, res.descriptions);
       }
+      flowScene = withGeneratedDesignBoundary(flowScene);
 
       const freshEls = api.getSceneElements() as unknown as ExcalidrawElement[];
       const freshRects = freshEls.filter(e =>
         e.type === 'rectangle' && !e.id.startsWith('flow-loading')
       ) as (ExcalidrawElement & { x: number; y: number; width: number; height: number })[];
-      const panelOffsetX = freshRects.reduce((m, e) => Math.max(m, e.x + e.width), 0) + 100;
+      const existingRight = freshRects.reduce((m, e) => Math.max(m, e.x + e.width), 0);
+      const panelOffsetX = existingRight + 100 - horizontalBounds(flowScene.elements).left;
       const panelOffsetY = freshRects.reduce((m, e) => Math.min(m, e.y), Infinity);
       const panelY = isFinite(panelOffsetY) ? panelOffsetY : 0;
 

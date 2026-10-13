@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { BrowserWindow } from 'electron';
 
-const IGNORE_DIRS = new Set(['node_modules', 'dist', '.git', 'build', '.dart_tool', '.idea', 'coverage', '__pycache__']);
+const IGNORE_DIRS = new Set(['node_modules', 'dist', '.git', 'build', '.dart_tool', '.idea', 'coverage', '__pycache__', 'graphify-out']);
 const IGNORE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.eot', '.map', '.lock']);
 const CACHE_FILE = '.rex-canvas.json';
 

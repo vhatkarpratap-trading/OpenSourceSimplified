@@ -57,6 +57,12 @@ type AccountState = {
   user: { email: string; name: string; picture?: string } | null;
   subscription: { plan: 'monthly' | 'yearly'; status: string; id: string; renewsAt?: string } | null;
 };
+type RepositoryAccess = {
+  kind: 'open-source' | 'private';
+  source: string;
+  detail: string;
+  remoteUrl?: string;
+};
 
 const DIAGRAM_TABS: { kind: DiagramKind; label: string }[] = [
   { kind: 'structure', label: 'User Flow' },
@@ -86,6 +92,7 @@ export default function App() {
   const [accountOpen, setAccountOpen] = useState(false);
   const [accountBusy, setAccountBusy] = useState(false);
   const [accountError, setAccountError] = useState<string | null>(null);
+  const [repositoryAccess, setRepositoryAccess] = useState<RepositoryAccess | null>(null);
   const [folder, setFolder]           = useState<string | null>(null);
   const [diagram, setDiagram]         = useState<DiagramData | null>(null);
   const [status, setStatus]           = useState<AnalysisStatus>('idle');
@@ -368,6 +375,7 @@ export default function App() {
   const handleOpenFolder = useCallback(async () => {
     const result = await window.electronAPI.openFolder();
     if (result) {
+      setRepositoryAccess(result.access);
       setFolder(result.folder);
       sessionPanelsRef.current = [];
       if (!result.hasCachedDiagram) { setStatus('idle'); setDiagram(null); }
@@ -739,21 +747,8 @@ export default function App() {
     }
   }, [showPRView]);
 
-  const hasPro = debugMode || account?.subscription?.status === 'ACTIVE' || account?.subscription?.status === 'APPROVED';
-
   return (
-    <div
-      onClickCapture={(event) => {
-        if (hasPro) return;
-        const target = event.target as HTMLElement;
-        if (target.closest('[data-account-dialog], [data-account-action]')) return;
-        event.preventDefault();
-        event.stopPropagation();
-        setAccountError(null);
-        setAccountOpen(true);
-      }}
-      style={{ display: 'flex', flexDirection: 'column', width: '100vw', height: '100vh', background: '#0f0f1a' }}
-    >
+    <div style={{ display: 'flex', flexDirection: 'column', width: '100vw', height: '100vh', background: '#0f0f1a' }}>
       <style>{`
         @keyframes slideUpIn { from { opacity: 0; transform: translateX(-50%) translateY(8px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
         @keyframes slideIn { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: translateX(0); } }
@@ -763,9 +758,10 @@ export default function App() {
         <div style={{ position: 'fixed', inset: 0, zIndex: 1000, display: 'grid', placeItems: 'center', background: 'rgba(5, 6, 12, 0.78)', fontFamily: 'system-ui, -apple-system, sans-serif' }}>
           <div data-account-dialog role="dialog" aria-modal="true" aria-label="Account and Pro plans" style={{ width: 520, maxWidth: 'calc(100vw - 32px)', background: '#171721', border: '1px solid #45455a', borderRadius: 14, padding: 24, boxShadow: '0 24px 80px rgba(0,0,0,.55)' }}>
             <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
-              <div><div style={{ color: '#fff', fontSize: 21, fontWeight: 700 }}>Rex Canvas Pro</div><div style={{ color: '#a9a9bb', fontSize: 13, marginTop: 5 }}>Every canvas feature is included with Pro.</div></div>
-              <button onClick={() => setAccountOpen(false)} aria-label="Close" style={{ color: '#a9a9bb', background: 'transparent', border: 0, fontSize: 20, cursor: 'pointer' }}>×</button>
+              <div><div style={{ color: '#fff', fontSize: 21, fontWeight: 700 }}>Rex Canvas Pro</div><div style={{ color: '#a9a9bb', fontSize: 13, marginTop: 5 }}>Analysis runs locally for every repository, including private ones.</div></div>
+              <button autoFocus onClick={() => setAccountOpen(false)} aria-label="Close" style={{ color: '#a9a9bb', background: 'transparent', border: 0, fontSize: 20, cursor: 'pointer' }}>×</button>
             </div>
+            {repositoryAccess?.kind === 'private' && <div style={{ marginTop: 14, padding: 10, background: '#1d2939', border: '1px solid #3b82a8', borderRadius: 7, color: '#ccecff', fontSize: 12 }}>{repositoryAccess.detail}</div>}
             {account?.subscription ? (
               <div style={{ marginTop: 20, padding: 14, borderRadius: 9, background: '#10251d', border: '1px solid #2d8a5d', color: '#d7fbe8' }}>
                 <div style={{ fontWeight: 700 }}>Pro is active</div>
@@ -792,7 +788,7 @@ export default function App() {
             )}
             {accountError && <div style={{ marginTop: 14, padding: 10, background: '#351923', border: '1px solid #8f3b50', borderRadius: 7, color: '#ffc2ce', fontSize: 12 }}>{accountError}</div>}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 20 }}>
-              <span style={{ color: '#77778c', fontSize: 11 }}>Payments are securely handled by PayPal.</span>
+              <span style={{ color: '#77778c', fontSize: 11 }}>Repository access stays local. Payments are handled by PayPal.</span>
               {account?.user && <button onClick={() => void handleSignOut()} disabled={accountBusy} style={{ color: '#b7b7c6', background: 'transparent', border: 0, fontSize: 12, cursor: 'pointer' }}>Sign out</button>}
             </div>
           </div>
@@ -813,7 +809,7 @@ export default function App() {
         <div style={{ width: 80, flexShrink: 0 }} />
 
         <button data-account-action onClick={() => { setAccountError(null); setAccountOpen(true); }} style={{ padding: '6px 11px', background: (debugMode || account?.subscription) ? '#173a2b' : '#322855', border: `1px solid ${(debugMode || account?.subscription) ? '#31855c' : '#7767d9'}`, borderRadius: 6, color: '#f5f3ff', fontSize: 12, fontWeight: 600, cursor: 'pointer', flexShrink: 0, WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
-          {debugMode ? 'Debug · Free' : account?.subscription ? '✓ Pro' : 'Upgrade to Pro'}
+          {debugMode ? 'Debug · Free' : account?.subscription ? '✓ Pro' : repositoryAccess?.kind === 'private' ? 'Private · Local' : 'Rex Canvas Pro'}
         </button>
 
         {/* Open Project */}

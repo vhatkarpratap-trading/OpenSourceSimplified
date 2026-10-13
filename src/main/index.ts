@@ -12,6 +12,7 @@ import { buildGraphifyIndex, graphifyPromptContext, graphifySourceFiles } from '
 import { startMcpServer, stopMcpServer, recordPtyOutput, updateClaudeJsonMcpConfig } from './mcpServer';
 import { listPRs, listLocalBranches, reviewPR, PRInfo } from './prReviewer';
 import { AccountService, PlanId } from './accountService';
+import { getRepositoryAccess, RepositoryAccess } from './repositoryAccess';
 
 let mainWindow: BrowserWindow | null = null;
 let currentFolder: string | null = null;
@@ -21,11 +22,12 @@ let patchInProgress = false;
 let preferredDiagramType = 'flowchart'; // updated by renderer type picker
 let analysisDepth: 1 | 2 | 3 = 2; // overview, balanced, deep — set by the user
 let accountService: AccountService | null = null;
+let currentRepositoryAccess: RepositoryAccess | null = null;
 
 function analysisDepthGuidance(): string {
-  if (analysisDepth === 1) return 'DEPTH: Overview. Show only the 4–6 essential steps, the main success path, and at most one important choice. Prefer a short explanation over completeness.';
+  if (analysisDepth === 1) return 'DEPTH: Overview. Prioritize the essential steps and main success path. Prefer a short explanation over completeness.';
   if (analysisDepth === 3) return 'DEPTH: Deep. Show the complete meaningful path, important alternatives/errors, and every proven component or boundary handoff. Explain unfamiliar terms and why each step exists.';
-  return 'DEPTH: Balanced. Show 6–10 important steps, the main path, and only the choices or communications needed to understand how it works.';
+  return 'DEPTH: Balanced. Show the important steps, the main path, and the choices or communications needed to understand how it works.';
 }
 
 // All main-process AI actions inherit the user's selected detail level,
@@ -54,8 +56,8 @@ function providerLabel() {
 }
 
 // ── Diagram cache ─────────────────────────────────────────────────────────────
-// One JSON file per project, keyed by a hash of the extracted structure.
-// Drilldown results are cached inside the same file under `drilldowns[name]`.
+// The cache belongs to Rex Canvas, never to the opened project. A local SQLite
+// database in Electron's user-data directory keeps one record per project path.
 
 interface CodeFlowStep { fn: string; what: string; data: string }
 interface DataFlowSnapshot { input: string; output: string; change: string }
@@ -130,6 +132,7 @@ interface CacheFile {
   structureHash: string;
   provider?: AiProvider;
   diagram: object;
+  analysisDiagrams?: Record<string, { diagram: object; savedAt: number }>;
   drilldowns: Record<string, string>;
   codeflows: Record<string, string>;
   commitDiagrams?: Record<string, CommitDiagram>;
@@ -137,19 +140,60 @@ interface CacheFile {
   savedAt: number;
 }
 
-function cacheDir(): string {
-  const dir = path.join(app.getPath('userData'), 'diagram-cache');
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  return dir;
+interface CacheDatabase {
+  exec(sql: string): void;
+  prepare(sql: string): { get(...parameters: unknown[]): unknown; run(...parameters: unknown[]): unknown };
 }
 
-function cacheFile(folder: string): string {
+type CacheDatabaseConstructor = new (filename: string) => CacheDatabase;
+
+interface CacheDatabaseRow { cache_json?: string | null; canvas_json?: string | null }
+
+let cacheDatabaseInstance: CacheDatabase | null = null;
+
+function cacheDatabase(): CacheDatabase {
+  if (cacheDatabaseInstance) return cacheDatabaseInstance;
+  const { DatabaseSync } = require('node:sqlite') as { DatabaseSync: CacheDatabaseConstructor };
+  const db = new DatabaseSync(path.join(app.getPath('userData'), 'rex-canvas-cache.sqlite'));
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE IF NOT EXISTS project_cache (
+      project_path TEXT PRIMARY KEY,
+      cache_json TEXT,
+      canvas_json TEXT,
+      updated_at INTEGER NOT NULL DEFAULT 0
+    );
+  `);
+  cacheDatabaseInstance = db;
+  return db;
+}
+
+function cacheProjectPath(folder: string): string {
+  return path.resolve(folder);
+}
+
+/** Location used by releases before the cache moved into SQLite. */
+function legacyCacheFile(folder: string): string {
   const key = crypto.createHash('sha256').update(folder).digest('hex').slice(0, 16);
-  return path.join(cacheDir(), `${key}.json`);
+  return path.join(app.getPath('userData'), 'diagram-cache', `${key}.json`);
 }
 
 function hashStructure(structureJson: string): string {
   return crypto.createHash('sha256').update(structureJson).digest('hex').slice(0, 32);
+}
+
+function mainAnalysisCacheKey(structureHash: string): string {
+  return getAiProvider() + ':' + structureHash;
+}
+
+function cachedAnalysis(cache: CacheFile | null, structureHash: string): object | null {
+  if (!cache) return null;
+  const keyed = cache.analysisDiagrams?.[mainAnalysisCacheKey(structureHash)]?.diagram;
+  if (keyed) return keyed;
+  // Backward compatibility for caches written before variants were retained.
+  return cache.structureHash === structureHash && cache.diagram && (cache.provider ?? 'claude') === getAiProvider()
+    ? cache.diagram
+    : null;
 }
 
 /**
@@ -206,27 +250,100 @@ function analysisCacheHash(structure: ExtractedStructure, folder: string): { str
   };
 }
 
-function loadCache(folder: string): CacheFile | null {
+function cacheRow(folder: string): CacheDatabaseRow | null {
+  return cacheDatabase()
+    .prepare('SELECT cache_json, canvas_json FROM project_cache WHERE project_path = ?')
+    .get(cacheProjectPath(folder)) as CacheDatabaseRow | null;
+}
+
+function writeCache(folder: string, cache: CacheFile) {
+  cacheDatabase().prepare(`
+    INSERT INTO project_cache (project_path, cache_json, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(project_path) DO UPDATE SET cache_json = excluded.cache_json, updated_at = excluded.updated_at
+  `).run(cacheProjectPath(folder), JSON.stringify(cache), cache.savedAt);
+}
+
+function saveCanvasDiagram(folder: string, diagram: object) {
+  cacheDatabase().prepare(`
+    INSERT INTO project_cache (project_path, canvas_json, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(project_path) DO UPDATE SET canvas_json = excluded.canvas_json, updated_at = excluded.updated_at
+  `).run(cacheProjectPath(folder), JSON.stringify(diagram), Date.now());
+}
+
+function migrateLegacyCache(folder: string): CacheFile | null {
   try {
-    const raw = fs.readFileSync(cacheFile(folder), 'utf8');
-    return JSON.parse(raw) as CacheFile;
+    const legacyPath = legacyCacheFile(folder);
+    const legacy = JSON.parse(fs.readFileSync(legacyPath, 'utf8')) as CacheFile;
+    writeCache(folder, legacy);
+    saveCanvasDiagram(folder, legacy.diagram);
+    fs.unlinkSync(legacyPath);
+    return legacy;
   } catch { return null; }
 }
 
-function saveCache(folder: string, data: Partial<CacheFile> & { diagram: object; structureHash: string }) {
+function readCache(folder: string): CacheFile | null {
+  const row = cacheRow(folder);
+  if (row?.cache_json) return JSON.parse(row.cache_json) as CacheFile;
+  return migrateLegacyCache(folder);
+}
+
+function cacheError(action: string, error: unknown): Error {
+  const detail = error instanceof Error ? error.message : String(error);
+  const message = 'Cache ' + action + ' failed: ' + detail;
+  console.error('[cache]', message);
+  return new Error(message);
+}
+
+function loadCache(folder: string): CacheFile | null {
+  try { return readCache(folder); }
+  catch (error) { cacheError('read', error); return null; }
+}
+
+function loadCacheForAnalysis(folder: string): CacheFile | null {
+  try { return readCache(folder); }
+  catch (error) { throw cacheError('read', error); }
+}
+
+function loadCanvasDiagram(folder: string): object | null {
+  try {
+    let row = cacheRow(folder);
+    if (!row) { migrateLegacyCache(folder); row = cacheRow(folder); }
+    return row?.canvas_json ? JSON.parse(row.canvas_json) as object : null;
+  } catch { return null; }
+}
+
+function saveCache(folder: string, data: Partial<CacheFile> & { diagram: object; structureHash: string }): boolean {
   try {
     const existing = loadCache(folder);
+    const now = Date.now();
+    const variants = {
+      ...(existing?.analysisDiagrams ?? {}),
+      [mainAnalysisCacheKey(data.structureHash)]: { diagram: data.diagram, savedAt: now },
+    };
+    // Keep several variants (for example, native and Graphify analyses) without
+    // letting a project cache grow indefinitely.
+    const analysisDiagrams = Object.fromEntries(
+      Object.entries(variants)
+        .sort(([, a], [, b]) => b.savedAt - a.savedAt)
+        .slice(0, 12),
+    );
     const merged: CacheFile = {
       structureHash: data.structureHash,
       provider: getAiProvider(),
       diagram: data.diagram,
+      analysisDiagrams,
       drilldowns: { ...(existing?.drilldowns ?? {}), ...(data.drilldowns ?? {}) },
       codeflows: { ...(existing?.codeflows ?? {}), ...(data.codeflows ?? {}) },
       commitDiagrams: { ...(existing?.commitDiagrams ?? {}), ...(data.commitDiagrams ?? {}) },
-      savedAt: Date.now(),
+      savedAt: now,
     };
-    fs.writeFileSync(cacheFile(folder), JSON.stringify(merged, null, 2), 'utf8');
-  } catch { /* ignore — cache is best-effort */ }
+    writeCache(folder, merged);
+    saveCanvasDiagram(folder, merged.diagram);
+    return true;
+  } catch (error) {
+    cacheError('write', error);
+    return false;
+  }
 }
 
 function saveDrilldown(folder: string, componentName: string, mermaid: string) {
@@ -235,7 +352,7 @@ function saveDrilldown(folder: string, componentName: string, mermaid: string) {
     if (!existing) return;
     existing.drilldowns[componentName] = mermaid;
     existing.savedAt = Date.now();
-    fs.writeFileSync(cacheFile(folder), JSON.stringify(existing, null, 2), 'utf8');
+    writeCache(folder, existing);
   } catch { /* ignore */ }
 }
 
@@ -246,7 +363,7 @@ function invalidateDrilldowns(folder: string) {
     existing.drilldowns = {};
     existing.codeflows = {};
     existing.savedAt = Date.now();
-    fs.writeFileSync(cacheFile(folder), JSON.stringify(existing, null, 2), 'utf8');
+    writeCache(folder, existing);
   } catch { /* ignore */ }
 }
 
@@ -257,7 +374,7 @@ function saveCodeFlow(folder: string, componentName: string, mermaid: string) {
     existing.codeflows = existing.codeflows ?? {};
     existing.codeflows[componentName] = mermaid;
     existing.savedAt = Date.now();
-    fs.writeFileSync(cacheFile(folder), JSON.stringify(existing, null, 2), 'utf8');
+    writeCache(folder, existing);
   } catch { /* ignore */ }
 }
 
@@ -267,14 +384,15 @@ function saveSessionPanels(folder: string, panels: SessionPanel[]) {
     if (!existing) return;
     existing.lastSession = panels;
     existing.savedAt = Date.now();
-    fs.writeFileSync(cacheFile(folder), JSON.stringify(existing, null, 2), 'utf8');
+    writeCache(folder, existing);
   } catch { /* ignore */ }
 }
 
 function clearProjectCache(folder: string): boolean {
   try {
-    const target = cacheFile(folder);
-    if (fs.existsSync(target)) fs.unlinkSync(target);
+    cacheDatabase().prepare('DELETE FROM project_cache WHERE project_path = ?').run(cacheProjectPath(folder));
+    const legacyPath = legacyCacheFile(folder);
+    if (fs.existsSync(legacyPath)) fs.unlinkSync(legacyPath);
     return true;
   } catch { return false; }
 }
@@ -286,15 +404,18 @@ function saveCommitDiagram(folder: string, hash: string, diagram: CommitDiagram)
     existing.commitDiagrams = existing.commitDiagrams ?? {};
     existing.commitDiagrams[hash] = diagram;
     existing.savedAt = Date.now();
-    fs.writeFileSync(cacheFile(folder), JSON.stringify(existing, null, 2), 'utf8');
+    writeCache(folder, existing);
   } catch { /* ignore */ }
 }
 
 function persistDiagram(diagram: object) {
   currentDiagram = diagram;
-  // Terminal auto-visualisations are not analysis results.  Storing one in the
-  // analysis cache overwrites the valid project map with a hash that can never
-  // match, turning the next Analyse into a guaranteed cache miss.
+  // Store the currently visible canvas independently of analysis results. This
+  // lets terminal/MCP diagrams reopen for the same project without making them
+  // look like a fresh source analysis.
+  if (currentFolder) {
+    try { saveCanvasDiagram(currentFolder, diagram); } catch { /* best-effort */ }
+  }
 }
 
 // ── Last project persistence ──────────────────────────────────────────────────
@@ -367,7 +488,7 @@ function buildRelationshipGraphMermaid(structure: ExtractedStructure): string {
 
 // Analysis starts with the product experience. Technical detail is deliberately
 // deferred to Code Story and Implementation, which are progressive disclosures.
-const ANALYSIS_SCHEMA_VERSION = 'user-interaction-map-v5';
+const ANALYSIS_SCHEMA_VERSION = 'user-interaction-map-v7';
 
 /** File and symbol names are insufficient to infer product behaviour. */
 function buildAnalysisSourceContext(structure: ExtractedStructure): string {
@@ -436,7 +557,7 @@ function buildClaudePrompt(structureJson: string, sourceContext: string): string
     'COMPACT USER MAP RULES for diagrams.structure:',
     '- This is a readable navigation overview, NOT a full interaction trace. Start at opening the app, then show every independently reachable user area as one clear branch.',
     '- Cover all evidenced areas, but group closely related actions under one user-facing hub. For example, “Tap an article” can cover reading, related links, saving, and sharing; “Tap Search” can cover entering a query and choosing a result.',
-    '- Use 6 to 10 nodes at Overview or Balanced depth, and 10 to 14 at Deep. Keep a strict tree: one opening node, 4 to 7 first-level action branches, and at most one result node per branch.',
+    '- Include every evidenced user area. Keep a strict tree with one opening node, meaningful action branches, and result nodes where they clarify an outcome.',
     '- Never draw return arrows, cross-links, repeated nodes, or more than two levels below the opening node. Each node must have one parent so the map remains readable.',
     '- Every branch must answer “what can the user do?” Use action-led labels such as “Tap Search”, “Tap Explore”, “Tap Saved articles”, “Open Nearby map”, “Open Games”, or “Open Settings”. Do not use destination-only labels.',
     '- Put detailed sequences, typing, scrolling, save/share choices, loading states, and error branches in diagrams.sequence—not in this overview.',
@@ -444,8 +565,8 @@ function buildClaudePrompt(structureJson: string, sourceContext: string): string
     '- Use "Person" or "User" only as the starting point when it makes the journey clearer.',
     '',
     'DETAIL USER FLOW RULES for diagrams.sequence:',
-    '- Show 2 or 3 short, disconnected, tap-by-tap flows for the most important exploration routes. These belong in the “More User Flows” tab, not the main overview.',
-    '- Each flow may have 4 to 7 nodes, for example: “Tap Search” → “Type a topic” → “See matching results” → “Tap an article” → “Read and explore links”.',
+    '- Show disconnected, tap-by-tap flows for every important exploration route. These belong in the “More User Flows” tab, not the main overview.',
+    '- Include every evidenced step needed to explain each flow, for example: “Tap Search” → “Type a topic” → “See matching results” → “Tap an article” → “Read and explore links”.',
     '- Use the same person-first language. Do not expose implementation details as intermediate steps.',
     '',
     'MERMAID RULES:',
@@ -468,31 +589,6 @@ interface AnalysisDiagram {
   pattern?: string;
   diagrams?: { structure?: string; sequence?: string; gitDiff?: string };
   descriptions?: Record<string, string>;
-}
-
-function mainMapNodeCount(mermaid: string): number {
-  const ids = new Set<string>();
-  const matches = mermaid.matchAll(/([A-Za-z][A-Za-z0-9_]*)\s*[\[\(\{]/g);
-  for (const match of matches) ids.add(match[1]);
-  return ids.size;
-}
-
-/** Enforce progressive disclosure when an otherwise useful AI map is too dense. */
-async function compactMainUserMap(diagram: AnalysisDiagram, folder: string): Promise<AnalysisDiagram> {
-  const structure = diagram.diagrams?.structure;
-  if (!structure || mainMapNodeCount(structure) <= 10) return diagram;
-  const prompt = [
-    'Rewrite the supplied Mermaid user navigation map for a small canvas.',
-    'Output ONLY JSON: {"mermaid":"flowchart TD string"}.',
-    'Keep EVERY distinct user area, but merge its internal steps into one action-led branch.',
-    'The result MUST contain exactly 8 to 10 nodes, have a strict tree layout, no return arrows, no cross-links, no subgraphs, and every edge must have a short tap/action label.',
-    'Use detailed interactions only in the branch label; do not list cards, tabs, or secondary options separately.',
-    'CURRENT MAP:',
-    structure,
-  ].join('\n\n');
-  const result = extractJson(await runCapture(prompt, folder)) as { mermaid?: string } | null;
-  if (!result?.mermaid || mainMapNodeCount(result.mermaid) > 10) return diagram;
-  return { ...diagram, diagrams: { ...diagram.diagrams, structure: result.mermaid } };
 }
 
 // ── Change context prompt ─────────────────────────────────────────────────────
@@ -520,7 +616,7 @@ function buildChangeContextPrompt(diff: string, nodeNames: string[]): string {
     '- "dataOut": what leaves this part. Real name from the code if possible.',
     '- "neighbours": which other parts in the architecture directly call into this or directly receive its output.',
     `  Use EXACT names from this list: ${nodeNames.length ? nodeNames.join(', ') : '(none)'}`,
-    '- Only include nodes that were actually changed in the diff. 1–4 nodes max.',
+    '- Include every node that was actually changed in the diff.',
     '',
     'Schema:',
     schema,
@@ -773,7 +869,7 @@ function matchNode(claudeNode: string, known: string[]): string {
   return partial || claudeNode;
 }
 
-async function runIncrementalPatch(changedFiles: string) {
+async function runIncrementalPatch(_changedFiles: string) {
   if (!mainWindow || !currentFolder || patchInProgress) return;
   patchInProgress = true;
 
@@ -786,41 +882,11 @@ async function runIncrementalPatch(changedFiles: string) {
 
     const changedPaths = getGitChangedFiles(folder);
     const annotations = computeGitAnnotations(folder, changedPaths, currentNodePaths);
-    const gitDiffSummary = gitAnnotationsToText(annotations);
 
-    // ── Case 1: no base diagram yet → build the base structure once ──
+    // Never let file watching create an AI request. If there is no map yet,
+    // leave generation to the explicit Analyse action.
     if (!currentDiagram) {
-      win.webContents.send('analysis:status', 'running');
-      win.webContents.send('analysis:statusDetail', 'Drawing the project map…');
-
-      const { structureJson, hash: structureHash } = analysisCacheHash(structure, folder);
-
-      // Check cache before asking Claude
-      const cached = loadCache(folder);
-      let base: object | null = null;
-      if (cached && cached.structureHash === structureHash && cached.diagram && (cached.provider ?? 'claude') === getAiProvider()) {
-        base = cached.diagram;
-      } else {
-        const raw = await runCapture(buildClaudePrompt(structureJson, buildAnalysisSourceContext(structure)), folder);
-        base = extractJson(raw) as AnalysisDiagram | null;
-        if (base) base = await compactMainUserMap(base, folder);
-        if (base) {
-          // New diagram = stale drilldowns; wipe them
-          saveCache(folder, { structureHash, diagram: base });
-          invalidateDrilldowns(folder);
-        }
-      }
-
-      try {
-        fs.writeFileSync(path.join(os.tmpdir(), 'rex-last-analysis.json'), (JSON.stringify(base, null, 2) || ''), 'utf8');
-        const d = (base as { diagrams?: { structure?: string } } | null)?.diagrams?.structure || '';
-        console.log('\n===== STRUCTURE MERMAID (auto) =====\n' + d + '\n====================================\n');
-      } catch { /* ignore */ }
-      if (base && !win.isDestroyed()) {
-        normalizeDiagramPattern(base as Record<string, unknown>, structure);
-        currentDiagram = base;
-        win.webContents.send('canvas:diagram', base);
-      }
+      win.webContents.send('analysis:statusDetail', 'Source changes detected — run Analyse when you want a map.');
       win.webContents.send('analysis:status', 'done');
       return;
     }
@@ -829,64 +895,21 @@ async function runIncrementalPatch(changedFiles: string) {
     // The base diagram is NOT regenerated; we keep it stable and color the changes.
     if (changedPaths.length === 0) { win.webContents.send('analysis:status', 'done'); return; }
 
+    // Watching source files must never create a surprise AI request. Keep the
+    // live canvas annotated from git facts; the user can explicitly Analyse
+    // when they want an AI-generated map or explanation.
     win.webContents.send('analysis:status', 'patching');
-    win.webContents.send('analysis:statusDetail', 'Explaining what changed…');
-
-    const nodeNames = extractNodeNames(currentDiagram);
-
-    // Build the full diff text for the change-context prompt
-    let fullDiff = '';
-    try {
-      fullDiff = execSync('git --no-pager diff HEAD', { cwd: folder, encoding: 'utf8', timeout: 8000, env: GIT_ENV }).slice(0, 6000);
-    } catch { /* ignore */ }
-
-    // Run explain + change-context in parallel
-    const [raw, ctxRaw] = await Promise.all([
-      runCapture(buildExplainPrompt(changedFiles, gitDiffSummary, nodeNames), folder),
-      runCapture(buildChangeContextPrompt(fullDiff || gitDiffSummary, nodeNames), folder),
-    ]);
-
-    const parsed = extractJson(raw) as { changes?: ChangeExplanation[] } | null;
-    const changes = parsed?.changes || [];
-    const ctxParsed = extractJson(ctxRaw) as { nodes?: ChangeContextNode[] } | null;
-
-    if (win.isDestroyed()) return;
-
-    if (changes.length > 0) {
-      const changedNames = changes.map(c => matchNode(c.node, nodeNames));
-      // Human-readable impact summary (kid-friendly sentences from Claude)
-      const summary: ImpactSummary = {
-        changed: changes.map((c, i) => ({
-          name: changedNames[i],
-          type: 'file',
-          description: c.explanation,
-          oldDescription: '',
-        })),
-        impacted: [],
-      };
-      // On-canvas badges use the same simple sentences
-      const badges = changes.map((c, i) => ({
-        name: changedNames[i],
-        summary: c.explanation,
-        added: 0,
-        removed: 0,
-      }));
-      win.webContents.send('canvas:claudeChanges', { changedNames, impactedNames: [] });
-      win.webContents.send('analysis:impactSummary', summary);
-      win.webContents.send('canvas:gitAnnotations', badges);
-      if (ctxParsed?.nodes?.length) {
-        win.webContents.send('canvas:changeContext', ctxParsed.nodes);
-      }
-    } else if (annotations.length > 0) {
-      // Fallback: no explanation parsed, still highlight from git facts
-      const changedNames = annotations.map(a => a.name);
-      win.webContents.send('canvas:claudeChanges', { changedNames, impactedNames: [] });
-      win.webContents.send('analysis:impactSummary', impactSummaryFromAnnotations(annotations));
-      win.webContents.send('canvas:gitAnnotations', annotations);
-    }
+    win.webContents.send('analysis:statusDetail', 'Source changes detected — updated local annotations.');
+    const changedNames = annotations.map(a => a.name);
+    win.webContents.send('canvas:claudeChanges', { changedNames, impactedNames: [] });
+    win.webContents.send('analysis:impactSummary', impactSummaryFromAnnotations(annotations));
+    win.webContents.send('canvas:gitAnnotations', annotations);
     win.webContents.send('analysis:status', 'done');
-  } catch {
-    if (!win.isDestroyed()) win.webContents.send('analysis:status', 'done');
+  } catch (error) {
+    if (!win.isDestroyed()) {
+      win.webContents.send('analysis:statusDetail', error instanceof Error ? error.message : String(error));
+      win.webContents.send('analysis:status', 'error');
+    }
   } finally {
     patchInProgress = false;
   }
@@ -952,28 +975,35 @@ function createWindow() {
 
     const last = loadLastProject();
     if (last) {
-      currentFolder = last;
-      restartPty(mainWindow, last);
+      void getRepositoryAccess(last).then(access => {
+        if (!mainWindow) return;
+        currentRepositoryAccess = access;
+        currentFolder = last;
+        restartPty(mainWindow, last);
 
-      // Restore cached diagram immediately — canvas is populated before any analysis
-      const cached = loadCache(last);
-      if (cached?.diagram && (cached.provider ?? 'claude') === getAiProvider()) {
-        currentDiagram = cached.diagram;
-        mainWindow.webContents.send('canvas:diagram', cached.diagram);
-        mainWindow.webContents.send('folder:restored', { folder: last, hasCachedDiagram: true });
+        // Restore the latest canvas for this exact project immediately. The
+        // analysis cache is kept separately, so switching providers or changing
+        // source files does not make a saved canvas disappear.
+        const cached = loadCache(last);
+        const restoredDiagram = loadCanvasDiagram(last) ?? cached?.diagram ?? null;
+        if (restoredDiagram) {
+          currentDiagram = restoredDiagram;
+          mainWindow.webContents.send('canvas:diagram', restoredDiagram);
+          mainWindow.webContents.send('folder:restored', { folder: last, hasCachedDiagram: true });
         // Drilldowns are intentionally ephemeral: reopening a project should
         // show its base map, not begin an AI drill automatically.
-        const restorablePanels = cached.lastSession?.filter((panel) => panel.mode !== 'drill') ?? [];
+        const restorablePanels = cached?.lastSession?.filter((panel) => panel.mode !== 'drill') ?? [];
         if (restorablePanels.length) {
           mainWindow.webContents.send('canvas:restoreSession', restorablePanels);
         }
-      } else {
-        mainWindow.webContents.send('folder:restored', { folder: last, hasCachedDiagram: false });
-      }
+        } else {
+          mainWindow.webContents.send('folder:restored', { folder: last, hasCachedDiagram: false });
+        }
 
-      startFileWatcher(last, (changedFiles) => {
-        if (mainWindow) sendGitStatus(mainWindow);
-        runIncrementalPatch(changedFiles);
+        startFileWatcher(last, (changedFiles) => {
+          if (mainWindow) sendGitStatus(mainWindow);
+          runIncrementalPatch(changedFiles);
+        });
       });
     }
   });
@@ -1021,17 +1051,10 @@ ipcMain.handle('project:relationships', () => {
   return { ok: true, relationships: structure.relationships, mermaid: buildRelationshipGraphMermaid(structure) };
 });
 
-ipcMain.handle('folder:open', async () => {
+async function openProject(folder: string, access: RepositoryAccess) {
   if (!mainWindow) return null;
-
-  const result = await dialog.showOpenDialog(mainWindow, {
-    properties: ['openDirectory'],
-    title: 'Open Project Folder',
-  });
-  if (result.canceled || !result.filePaths.length) return null;
-
-  const folder = result.filePaths[0];
   currentFolder = folder;
+  currentRepositoryAccess = access;
   currentDiagram = null;
   currentNodePaths = {};
   saveLastProject(folder);
@@ -1039,18 +1062,16 @@ ipcMain.handle('folder:open', async () => {
 
   restartPty(mainWindow, folder);
 
-  // Restore only a diagram created with the current analysis prompt/schema.
+  // Restore the most recently saved canvas for this project. Analysis will
+  // still validate its own source-hash cache when the user runs it again.
   const cached = loadCache(folder);
-  const restoreStructure = extractStructure(folder);
-  const { hash: restoreHash } = analysisCacheHash(restoreStructure, folder);
-  const hasCurrentCachedDiagram = !!cached?.diagram
-    && cached.structureHash === restoreHash
-    && (cached.provider ?? 'claude') === getAiProvider();
-  if (hasCurrentCachedDiagram && cached?.diagram) {
-    currentDiagram = cached.diagram;
-    mainWindow.webContents.send('canvas:diagram', cached.diagram);
+  const restoredDiagram = loadCanvasDiagram(folder) ?? cached?.diagram ?? null;
+  const hasCurrentCachedDiagram = !!restoredDiagram;
+  if (restoredDiagram) {
+    currentDiagram = restoredDiagram;
+    mainWindow.webContents.send('canvas:diagram', restoredDiagram);
     // A drill is an explicit navigation action, never an opening action.
-    const restorablePanels = cached.lastSession?.filter((panel) => panel.mode !== 'drill') ?? [];
+    const restorablePanels = cached?.lastSession?.filter((panel) => panel.mode !== 'drill') ?? [];
     if (restorablePanels.length) {
       mainWindow.webContents.send('canvas:restoreSession', restorablePanels);
     }
@@ -1061,7 +1082,21 @@ ipcMain.handle('folder:open', async () => {
     runIncrementalPatch(changedFiles);
   });
 
-  return { folder, hasCachedDiagram: hasCurrentCachedDiagram };
+  return { opened: true, folder, hasCachedDiagram: hasCurrentCachedDiagram, access };
+}
+
+ipcMain.handle('folder:open', async () => {
+  if (!mainWindow) return null;
+
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openDirectory'],
+    title: 'Open Project Folder',
+  });
+  if (result.canceled || !result.filePaths.length) return null;
+
+  const folder = result.filePaths[0];
+  const access = await getRepositoryAccess(folder);
+  return openProject(folder, access);
 });
 
 ipcMain.on('session:savePanels', (_e, panels: SessionPanel[]) => {
@@ -1075,14 +1110,16 @@ ipcMain.handle('cache:clearProject', () => {
   return ok ? { ok: true } : { ok: false, error: 'Could not clear the project cache' };
 });
 
-async function runAnalysisInternal(preferGraphify = false): Promise<{ ok?: boolean; error?: string; fromCache?: boolean }> {
+async function runAnalysisInternal(): Promise<{ ok?: boolean; error?: string; fromCache?: boolean }> {
   if (!mainWindow || !currentFolder) return { error: 'No folder selected' };
 
   mainWindow.webContents.send('analysis:status', 'running');
 
   try {
-    mainWindow.webContents.send('analysis:statusDetail', preferGraphify ? 'Selecting Graphify evidence paths…' : 'Extracting code structure…');
-    const structure = preferGraphify ? (structureFromGraphify(currentFolder) ?? extractStructure(currentFolder)) : extractStructure(currentFolder);
+    mainWindow.webContents.send('analysis:statusDetail', 'Extracting code structure…');
+    // Graphify enriches the prompt and its content fingerprint participates in
+    // the key, while the native structure stays stable across both Analyse paths.
+    const structure = extractStructure(currentFolder);
 
     if (structure.totalFiles === 0) {
       mainWindow.webContents.send('analysis:statusDetail', 'No source files found in this folder.');
@@ -1093,12 +1130,13 @@ async function runAnalysisInternal(preferGraphify = false): Promise<{ ok?: boole
     const { structureJson, hash: structureHash, graphify } = analysisCacheHash(structure, currentFolder);
 
     // ── Cache hit: structure unchanged since last analysis ──
-    const cached = loadCache(currentFolder);
-    if (cached && cached.structureHash === structureHash && cached.diagram && (cached.provider ?? 'claude') === getAiProvider()) {
-      currentDiagram = cached.diagram;
+    const cached = loadCacheForAnalysis(currentFolder);
+    const cachedDiagram = cachedAnalysis(cached, structureHash);
+    if (cachedDiagram) {
+      currentDiagram = cachedDiagram;
       currentNodePaths = structure.nodePaths;
-      normalizeDiagramPattern(cached.diagram as Record<string, unknown>, structure);
-      mainWindow.webContents.send('canvas:diagram', cached.diagram);
+      normalizeDiagramPattern(cachedDiagram as Record<string, unknown>, structure);
+      mainWindow.webContents.send('canvas:diagram', cachedDiagram);
       mainWindow.webContents.send('analysis:statusDetail', 'Loaded from cache');
       mainWindow.webContents.send('analysis:status', 'done');
       sendGitStatus(mainWindow);
@@ -1115,8 +1153,7 @@ async function runAnalysisInternal(preferGraphify = false): Promise<{ ok?: boole
     mainWindow.webContents.send('analysis:statusDetail', `Analysing ${structure.totalFiles} files${graphNote} with ${providerLabel()}…${graphProvenance}`);
     const prompt = buildClaudePrompt(structureJson, buildAnalysisSourceContext(structure));
     const raw = await runCapture(prompt, currentFolder);
-    let diagram = extractJson(raw) as AnalysisDiagram | null;
-    if (diagram) diagram = await compactMainUserMap(diagram, currentFolder);
+    const diagram = extractJson(raw) as AnalysisDiagram | null;
 
     try {
       fs.writeFileSync(path.join(os.tmpdir(), 'rex-last-analysis.json'),
@@ -1138,16 +1175,18 @@ async function runAnalysisInternal(preferGraphify = false): Promise<{ ok?: boole
     currentNodePaths = structure.nodePaths;
 
     // Persist to cache; structure changed so drilldowns and Code Stories are stale.
-    saveCache(currentFolder, { structureHash, diagram });
+    const cacheSaved = saveCache(currentFolder, { structureHash, diagram });
     invalidateDrilldowns(currentFolder);
 
     mainWindow.webContents.send('canvas:diagram', diagram);
+    if (!cacheSaved) mainWindow.webContents.send('analysis:statusDetail', 'Diagram generated, but it could not be saved to cache.');
     mainWindow.webContents.send('analysis:status', 'done');
     sendGitStatus(mainWindow);
 
     return { ok: true };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
+    mainWindow.webContents.send('analysis:statusDetail', message);
     mainWindow.webContents.send('analysis:status', 'error');
     return { error: message };
   }
@@ -1173,7 +1212,7 @@ ipcMain.handle('graphify:buildAndAnalyse', async () => {
       mainWindow.webContents.send('analysis:status', 'error');
       return result;
     }
-    return { ...result, analysis: await runAnalysisInternal(true) };
+    return { ...result, analysis: await runAnalysisInternal() };
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
     mainWindow.webContents.send('analysis:statusDetail', error);
@@ -1435,9 +1474,9 @@ function buildRegexCallHierarchy(source: string): string {
     const [from, to] = value.split('|');
     edges.push({ from, to, kind: 'calls' });
   }
-  for (const edge of edges.slice(0, 36)) output.push(`  ${nodeId(edge.from)}[${label(edge.from)}] -->|${edge.kind}| ${nodeId(edge.to)}[${label(edge.to)}]`);
+  for (const edge of edges) output.push(`  ${nodeId(edge.from)}[${label(edge.from)}] -->|${edge.kind}| ${nodeId(edge.to)}[${label(edge.to)}]`);
   if (edges.length === 0) {
-    for (const definition of definitions.slice(0, 12)) output.push(`  ${nodeId(definition.key)}[${label(definition.key)}]`);
+    for (const definition of definitions) output.push(`  ${nodeId(definition.key)}[${label(definition.key)}]`);
   }
   if (output.length === 1) output.push('  A[No locally declared classes or methods found]');
   return output.join('\n');
@@ -1502,18 +1541,18 @@ function buildLocalCallHierarchy(source: string): string {
   const nodeId = (key: string) => { if (!id.has(key)) id.set(key, `N${next++}`); return id.get(key)!; };
   const label = (key: string) => key.replace(/[^A-Za-z0-9_. ]/g, ' ').slice(0, 48);
   const lines = ['flowchart LR'];
-  const edges = [...owns].map(value => ({ value, kind: 'contains' })).concat([...calls].map(value => ({ value, kind: 'calls' }))).slice(0, 36);
+  const edges = [...owns].map(value => ({ value, kind: 'contains' })).concat([...calls].map(value => ({ value, kind: 'calls' })));
   for (const edge of edges) {
     const [from, to] = edge.value.split('|');
     lines.push(`  ${nodeId(from)}[${label(from)}] -->|${edge.kind}| ${nodeId(to)}[${label(to)}]`);
   }
   if (edges.length === 0) {
-    const fallbackDefs = [...definitions.values()].slice(0, 12);
+    const fallbackDefs = [...definitions.values()];
     if (fallbackDefs.length) {
       for (const def of fallbackDefs) lines.push(`  ${nodeId(def.key)}[${label(def.label)}]`);
     } else if (imports.size) {
       const module = 'Selected module';
-      for (const imported of [...imports].slice(0, 12)) {
+      for (const imported of imports) {
         lines.push(`  ${nodeId(module)}[${module}] -->|imports| ${nodeId(imported)}[${label(imported)}]`);
       }
     } else {
@@ -1579,7 +1618,7 @@ function buildDrilldownPrompt(name: string, sourceCode: string, imports: string[
     '- Label: letters, digits, spaces only. NO special chars inside [ ].',
     '- Edge with label: `A -->|taps submit| B`.',
     '- NO subgraph, NO classDiagram, NO sequenceDiagram.',
-    '- 8–16 nodes. Every node must be connected.',
+    '- Include every source-proven step. Every node must be connected.',
     '',
     'Schema:',
     '{"mermaid":"flowchart TD string — use \\n for newlines"}',
@@ -1599,7 +1638,7 @@ async function runComponentDrilldown(rawName: string): Promise<{ ok?: boolean; e
   try {
     const structure = extractStructure(currentFolder);
     const sourceFiles = graphFirstSourceFiles(name, structure.nodePaths, currentFolder);
-    const cacheKey = 'canonical-v5:depth-' + analysisDepth + ':' + name + ':' + componentEvidenceFingerprint(name, sourceFiles);
+    const cacheKey = 'canonical-v6:depth-' + analysisDepth + ':' + name + ':' + componentEvidenceFingerprint(name, sourceFiles);
     const cached = loadCache(currentFolder);
     if (cached?.drilldowns?.[cacheKey]) {
       return { ok: true, mermaid: cached.drilldowns[cacheKey], fromCache: true };
@@ -1693,7 +1732,7 @@ function buildCodeFlowPrompt(name: string, sourceCode: string): string {
     '- Description node: `IdDesc(["plain sentence"])`  — stadium shape with double quotes',
     '- Node ids: letters/digits/underscore only, unique across all subgraphs',
     '- Cross-class edges go between the description node of one class and the function node of another',
-    '- 5–12 function nodes total. Every node connected.',
+    '- Include every relevant source-proven function. Every node connected.',
     '',
     'Also return "happyPath": ordered list of node IDs that form the optimistic success path (no errors, no retries).',
     '  - Include ONLY function node IDs (not description node IDs)',
@@ -1803,7 +1842,7 @@ function buildCodeStoryNewbieReviewPrompt(
     '- Node labels remain short and readable. Put the detailed contract explanation in `descriptions`, one per node.',
     '- Each description must teach a newcomer: Meaning (before → after), Contract (when a boundary exists), and Why (why this step is necessary).',
     '- Ensure every main-path node has a dataFlow entry with compact, source-proven input/output snapshots and a precise transformation. Use "unknown (not exposed by source)" instead of invented fields or values.',
-    '- Keep 6–14 connected Mermaid nodes. Start with `flowchart TD`; use plain IDs and no subgraphs, styles, or code snippets.',
+    '- Keep Mermaid nodes connected. Start with `flowchart TD`; use plain IDs and no subgraphs, styles, or code snippets.',
     '',
     'Schema:',
     '{"mermaid":"flowchart TD string","descriptions":{"Node label":"Meaning: ... Contract: ... Why: ..."},"dataFlow":{"Node label":{"input":"{...}","output":"{...}","change":"..."}},"happyPath":["nodeId"]}',
@@ -1903,7 +1942,7 @@ function buildImplementationPrompt(name: string, sourceCode: string, hierarchyCo
     '- Use a diamond node for every real conditional branch (if/else, try/catch, guard that changes the path).',
     '- Represent an external service, storage area, or platform API with a normal plain-English action; do not name its implementation class or provider.',
     '- Edge labels must say the meaning of the information or decision, not its code name or type.',
-    '- Use 5–12 nodes. Favor one obvious top-to-bottom numbered chain over exhaustive coverage. Return happyPath as every main-chain node ID in Step order.',
+    '- Include every important source-proven function or boundary in one obvious top-to-bottom numbered chain. Return happyPath as every main-chain node ID in Step order.',
     '',
     'DESCRIPTIONS:',
     '- Every description MUST use this exact layout: Code:\n[one to five exact, consecutive source lines; each line at most 72 characters]\n\nExplanation: [one or two concise sentences explaining the inputs, result/state change, and why this function runs after the preceding step].\nNext: [Step N and its function name, plus why this call happens; or final result].',
@@ -1954,7 +1993,7 @@ function buildRepositoryCodeStoryPrompt(projectStructure: string): string {
     'MERMAID:',
     '- Start with flowchart TD.',
     '- Use Id[Plain English Step] nodes and labelled A -->|data or decision| B edges.',
-    '- 6–12 connected nodes total. No subgraphs, no code snippets, and no technical boilerplate.',
+    '- Include every important connected responsibility. No subgraphs, no code snippets, and no technical boilerplate.',
     '',
     'Schema:',
     '{"mermaid":"flowchart TD string","descriptions":{"Node Label":"How: implementation. Contract: caller → receiver; transport; input → result/error. Why: purpose (path/file.ts)"},"happyPath":["nodeId1","nodeId2"]}',
@@ -1986,7 +2025,7 @@ function buildArchitectureStoryPrompt(projectContext: string): string {
     '',
     'MERMAID:',
     '- Start with flowchart TD.',
-    '- Use 5–8 connected Id[Label] nodes. Include nodes for Runtime and architecture, then state and data when relevant.',
+    '- Use connected Id[Label] nodes. Include nodes for Runtime and architecture, then state and data when relevant.',
     '- Use short technical labels; framework and pattern names are welcome.',
     '- Every edge must explain the responsibility or data passed between the layers.',
     '- No subgraphs, code snippets, or guesses.',
@@ -2013,7 +2052,7 @@ function buildRepositoryImplementationPrompt(projectContext: string, settings: W
     '- First show the shared startup/entry point. Then create one clearly labelled branch for EACH meaningful, independent feature or workflow found in the source. A feature is a cohesive user or domain capability, not an individual file or helper.',
     '- Treat build scripts, dependency manifests, plugin setup, and generated configuration as infrastructure—not features. Do not devote a feature branch to them unless the repository contains no application or domain feature code.',
     '- For every feature, show its actual implementation path and every meaningful component contract: trigger or entry → important logic/decision → state, data, or API work → result. Use as many contract nodes as needed; do not hide a component-to-component handoff to stay compact.',
-    '- Cover all meaningful features the supplied source proves, up to 8 feature branches and 24 nodes total. If there are more, combine closely related minor features and state that in the description.',
+    '- Cover every meaningful feature the supplied source proves. Keep closely related minor features together only when that makes their implementation easier to understand.',
     '- Node labels must be plain English operations, not raw class, function, variable, or file names.',
     '- Every description appears directly below its chart node. Use one or two short, plain-English sentences (under 260 characters) that explain the input, the work, the result, and why it matters. Do not include raw function, class, variable, type, or file names in it.',
     '- For EVERY communication between components, describe a contract as: caller → receiver → operation/event and source-proven input → source-proven result/error. State its transport: direct call, event/callback, IPC, HTTP/REST, repository, storage, or other proven mechanism.',
@@ -2098,12 +2137,12 @@ function repositoryImplementationContext(folder: string, structure: ExtractedStr
 
 async function runArchitectureStory(): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string> }> {
   if (!currentFolder) return { error: 'no project folder' };
-  const cacheKey = '__architecture_story__';
+  const cacheKey = '__architecture_story__:node-unlimited-v2';
   try {
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
       const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string> };
-      if (cached.version === 1 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {} };
+      if (cached.version === 2 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {} };
     }
 
     const structure = extractStructure(currentFolder);
@@ -2111,7 +2150,7 @@ async function runArchitectureStory(): Promise<{ ok?: boolean; error?: string; m
     const parsed = extractJson(raw) as { mermaid?: string; descriptions?: Record<string, string> } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
     const descriptions = parsed.descriptions ?? {};
-    saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 1, mermaid: parsed.mermaid, descriptions }));
+    saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 2, mermaid: parsed.mermaid, descriptions }));
     return { ok: true, mermaid: parsed.mermaid, descriptions };
   } catch (err: unknown) {
     return { error: err instanceof Error ? err.message : String(err) };
@@ -2120,17 +2159,17 @@ async function runArchitectureStory(): Promise<{ ok?: boolean; error?: string; m
 
 async function runRepositoryImplementation(): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string> }> {
   if (!currentFolder) return { error: 'no project folder' };
-    const cacheKey = '__repository_implementation__:depth-' + analysisDepth + ':focus-' + walkthroughSettingsFingerprint(walkthroughSettings);
+    const cacheKey = '__repository_implementation__:node-unlimited-v11:depth-' + analysisDepth + ':focus-' + walkthroughSettingsFingerprint(walkthroughSettings);
   try {
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
       const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string> };
-      if (cached.version === 10 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {} };
+      if (cached.version === 11 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {} };
     }
     const structure = extractStructure(currentFolder);
     const parsed = extractJson(await runCapture(buildRepositoryImplementationPrompt(repositoryImplementationContext(currentFolder, structure), walkthroughSettings), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string> } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
-    const result = { version: 10, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {} };
+    const result = { version: 11, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {} };
     saveCodeFlow(currentFolder, cacheKey, JSON.stringify(result));
     return { ok: true, mermaid: result.mermaid, descriptions: result.descriptions };
   } catch (err: unknown) { return { error: err instanceof Error ? err.message : String(err) }; }
@@ -2142,12 +2181,12 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
   try {
     const structure = extractStructure(currentFolder);
     if (name === '__whole_repo__') {
-      const cacheKey = `v20:depth-${analysisDepth}:${name}:${hashStructure(groundedStructureJson(currentFolder, structure).json)}`;
+      const cacheKey = `v22:depth-${analysisDepth}:${name}:${hashStructure(groundedStructureJson(currentFolder, structure).json)}`;
       const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
       if (typeof cachedValue === 'string') {
         try {
           const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] };
-          if (cached.version === 20 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, happyPath: cached.happyPath ?? [], fromCache: true };
+          if (cached.version === 22 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, happyPath: cached.happyPath ?? [], fromCache: true };
         } catch {
           // Regenerate malformed cache data.
         }
@@ -2157,17 +2196,17 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
       if (!parsed?.mermaid) return { error: 'no mermaid in response' };
       const happyPath = parsed.happyPath ?? [];
       const descriptions = parsed.descriptions ?? {};
-      saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 20, mermaid: parsed.mermaid, descriptions, happyPath }));
+      saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 22, mermaid: parsed.mermaid, descriptions, happyPath }));
       return { ok: true, mermaid: parsed.mermaid, descriptions, happyPath };
     }
 
     const sourceFiles = graphFirstSourceFiles(name, structure.nodePaths, currentFolder);
-    const cacheKey = `v21:depth-${analysisDepth}:focus-${walkthroughSettingsFingerprint(walkthroughSettings)}:${name}:${componentEvidenceFingerprint(name, sourceFiles)}`;
+    const cacheKey = `v22:depth-${analysisDepth}:focus-${walkthroughSettingsFingerprint(walkthroughSettings)}:${name}:${componentEvidenceFingerprint(name, sourceFiles)}`;
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
       try {
         const p = JSON.parse(cachedValue) as { version?: number; mermaid: string; descriptions?: Record<string, string>; dataFlow?: Record<string, DataFlowSnapshot>; happyPath: string[] };
-        if (p?.version === 21 && p.mermaid) return { ok: true, mermaid: p.mermaid, descriptions: p.descriptions ?? {}, dataFlow: p.dataFlow ?? {}, happyPath: p.happyPath ?? [], fromCache: true };
+        if (p?.version === 22 && p.mermaid) return { ok: true, mermaid: p.mermaid, descriptions: p.descriptions ?? {}, dataFlow: p.dataFlow ?? {}, happyPath: p.happyPath ?? [], fromCache: true };
       } catch {
         // Ignore malformed or legacy entries and regenerate from current source.
       }
@@ -2220,7 +2259,7 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
     const happyPath = parsed.happyPath ?? [];
     const descriptions = parsed.descriptions ?? {};
     const dataFlow = parsed.dataFlow ?? {};
-    saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 21, mermaid: parsed.mermaid, descriptions, dataFlow, happyPath }));
+    saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 22, mermaid: parsed.mermaid, descriptions, dataFlow, happyPath }));
     return { ok: true, mermaid: parsed.mermaid, descriptions, dataFlow, happyPath };
   } catch (err: unknown) {
     return { error: err instanceof Error ? err.message : String(err) };
@@ -2337,17 +2376,17 @@ async function runActualCodeFlow(rawName: string): Promise<{ ok: boolean; error?
     }
     // Cache against the source itself. A renamed/reselected component can reuse
     // the graph, while any source edit naturally produces a new entry.
-    const cacheKey = `__actual_codeflow__:v2:${name}:${hashStructure(source.content)}`;
+    const cacheKey = `__actual_codeflow__:v3:${name}:${hashStructure(source.content)}`;
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
       try {
         const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string };
-        if (cached.version === 2 && cached.mermaid) return { ok: true, mermaid: cached.mermaid };
+        if (cached.version === 3 && cached.mermaid) return { ok: true, mermaid: cached.mermaid };
       } catch { /* regenerate malformed legacy entry */ }
     }
 
     const mermaid = buildLocalCallHierarchy(source.content);
-    saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 2, mermaid }));
+    saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 3, mermaid }));
     return { ok: true, mermaid };
   } catch (err: unknown) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -2362,11 +2401,11 @@ async function runComponentImplementation(rawName: string, drillMermaid = ''): P
   try {
     const structure = extractStructure(currentFolder);
     const sourceFiles = graphFirstSourceFiles(name, structure.nodePaths, currentFolder);
-    const cacheKey = '__implementation__:v36:depth-' + analysisDepth + ':focus-' + walkthroughSettingsFingerprint(walkthroughSettings) + ':' + name + ':' + componentEvidenceFingerprint(name, sourceFiles);
+    const cacheKey = '__implementation__:v37:depth-' + analysisDepth + ':focus-' + walkthroughSettingsFingerprint(walkthroughSettings) + ':' + name + ':' + componentEvidenceFingerprint(name, sourceFiles);
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
       const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] };
-      if (!drillMermaid && cached.version === 36 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, happyPath: cached.happyPath ?? [] };
+      if (!drillMermaid && cached.version === 37 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, happyPath: cached.happyPath ?? [] };
     }
     let sourceCode = '';
     let budget = 16000;
@@ -2383,7 +2422,7 @@ async function runComponentImplementation(rawName: string, drillMermaid = ''): P
     const hierarchyContext = [buildHierarchyContext(sourceFiles), graphifyPromptContext(currentFolder, name).evidence].filter(Boolean).join('\n\n');
     const parsed = extractJson(await runCapture(buildImplementationPrompt(name, sourceCode + scope, hierarchyContext, walkthroughSettings), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
-    const result = { version: 36, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {}, happyPath: parsed.happyPath ?? [] };
+    const result = { version: 37, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {}, happyPath: parsed.happyPath ?? [] };
     saveCodeFlow(currentFolder, cacheKey, JSON.stringify(result));
     return { ok: true, mermaid: result.mermaid, descriptions: result.descriptions, happyPath: result.happyPath };
   } catch (err: unknown) { return { error: err instanceof Error ? err.message : String(err) }; }
@@ -2421,7 +2460,7 @@ function buildCommitFeatureFlowPrompt(commitMsg: string, diffSource: string): st
     '- Label: letters, digits, spaces only. NO special chars inside [ ].',
     '- Edge with label: `A -->|taps submit| B`.',
     '- NO subgraph, NO classDiagram, NO sequenceDiagram.',
-    '- 6–14 nodes. Every node must be connected.',
+    '- Include every changed user-facing step. Every node must be connected.',
     '',
     'Schema:',
     '{"mermaid":"flowchart TD string — use \\n for newlines","descriptions":{"NodeLabel":"1 sentence starting with Lets the user or Shows the user"}}',
@@ -2464,7 +2503,7 @@ function buildCommitCodeFlowPrompt(commitMsg: string, diffSource: string): strin
     '',
     'RULES:',
     '- ONLY functions that appear in the + lines of the diff',
-    '- 3–8 function nodes max — be selective, not exhaustive',
+    '- Include every directly added or modified function that contributes to the changed flow',
     '- No unchanged helper functions, no boilerplate',
     '',
     'MERMAID SYNTAX:',
@@ -2538,9 +2577,10 @@ ipcMain.handle('git:commitDiff', async (_e, hash: string) => {
     const commitMsg = message?.trim() ?? '';
 
     // ── 3. Cache check ──
+    const commitDiagramCacheKey = `node-unlimited-v1:${hash}`;
     const cached = loadCache(folder);
-    if (cached?.commitDiagrams?.[hash]) {
-      const cd = cached.commitDiagrams[hash];
+    if (cached?.commitDiagrams?.[commitDiagramCacheKey]) {
+      const cd = cached.commitDiagrams[commitDiagramCacheKey];
       const changedAbsPaths = changedRelPaths.map(r => path.join(folder, r));
       return {
         ok: true,
@@ -2592,7 +2632,7 @@ ipcMain.handle('git:commitDiff', async (_e, hash: string) => {
 
     // ── 6. Cache ──
     if (featureFlow && codeFlow) {
-      saveCommitDiagram(folder, hash, { featureFlow, codeFlow });
+      saveCommitDiagram(folder, commitDiagramCacheKey, { featureFlow, codeFlow });
     }
 
     const changedAbsPaths = changedRelPaths.map(r => path.join(folder, r));
@@ -2718,7 +2758,7 @@ ipcMain.handle('selection:ask', async (_e, req: { question: string; components: 
     }
     // Questions are read-only, so identical questions with the same selected
     // evidence and canvas state should be served without another AI call.
-    const questionCacheKey = '__selection_answer__:v1:' + hashStructure([
+    const questionCacheKey = '__selection_answer__:v2:' + hashStructure([
       question,
       components.join('\n'),
       req.canvasContext.slice(0, 5000),
@@ -2730,7 +2770,7 @@ ipcMain.handle('selection:ask', async (_e, req: { question: string; components: 
     if (typeof cachedValue === 'string') {
       try {
         const cached = JSON.parse(cachedValue) as { version?: number; diagram?: unknown };
-        if (cached.version === 1 && cached.diagram) return { ok: true, diagram: cached.diagram };
+        if (cached.version === 2 && cached.diagram) return { ok: true, diagram: cached.diagram };
       } catch {
         // Regenerate malformed cache data.
       }
@@ -2757,7 +2797,7 @@ ipcMain.handle('selection:ask', async (_e, req: { question: string; components: 
       '- If the question asks why (including just "Why?"): diagram the purpose and reasoning, not a generic process. Each description must say WHY that step or decision exists and what problem it prevents or solves.',
       '- If it asks both how and why, every description must use this format: "How: … Why: … (source reference)".',
       '- Use only facts supported by the provided source/context. Say "not defined here" rather than inventing fields.',
-      '- Use 4–10 short plain-English nodes. Explain behavior before implementation details.',
+      '- Include every short plain-English step needed to answer the question. Explain behavior before implementation details.',
       asksAboutSelection
         ? '- Include only the selected components and directly relevant connections.'
         : '- Include only the project areas and connections needed to answer the question. Start from the project-level architecture when useful.',
@@ -2770,7 +2810,7 @@ ipcMain.handle('selection:ask', async (_e, req: { question: string; components: 
     const parsed = extractJson(await runCapture(prompt, currentFolder)) as { pattern?: string; diagrams?: { structure?: string }; descriptions?: Record<string, string> } | null;
     if (!parsed?.diagrams?.structure) return { ok: false, error: 'Could not create an answer flowchart' };
     const diagram = { pattern: parsed.pattern || (asksAboutSelection ? 'Selected components' : 'Project question'), diagrams: { structure: parsed.diagrams.structure }, descriptions: parsed.descriptions ?? {} };
-    saveCodeFlow(currentFolder, questionCacheKey, JSON.stringify({ version: 1, diagram }));
+    saveCodeFlow(currentFolder, questionCacheKey, JSON.stringify({ version: 2, diagram }));
     return { ok: true, diagram };
   } catch (err: unknown) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -2886,7 +2926,7 @@ function buildFlowchart(lines: string[], title: string): string {
     }
   }
 
-  if (nodes.length < 3) return '';
+  if (nodes.length === 0) return '';
 
   const hasOptions = nodes.some(n => n.kind === 'option');
   const layout = hasOptions ? 'LR' : 'TD';
@@ -2978,10 +3018,10 @@ function buildMindmap(lines: string[], title: string): string {
     items.push({ text: clean, depth });
   }
 
-  if (items.length < 3) return '';
+  if (items.length === 0) return '';
 
   const out = [`mindmap`, `  root((${title.slice(0, 30)}))`];
-  for (const item of items.slice(0, 12)) {
+  for (const item of items) {
     const pad = '  '.repeat(item.depth + 2);
     out.push(`${pad}${item.text}`);
   }
