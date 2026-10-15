@@ -18,6 +18,12 @@ export interface SupabaseAnalysisSnapshot {
   publishedBy?: { name: string; email: string } | null;
 }
 
+export interface SupabaseCachedAnalysis {
+  structureHash: string;
+  cache: object;
+  analysis: object;
+}
+
 let localEnvironment: Record<string, string> | undefined;
 
 function envFileValues(): Record<string, string> {
@@ -44,18 +50,41 @@ function repositoryAuthor(folder: string): string | null {
   } catch { return null; }
 }
 
-/** Sync a completed analysis without making remote availability part of local analysis. */
-export async function syncAnalysisToSupabase(snapshot: SupabaseAnalysisSnapshot): Promise<void> {
+function supabaseClient() {
   const url = value('NEXT_PUBLIC_SUPABASE_URL') ?? value('SUPABASE_URL');
   const key = value('NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY') ?? value('SUPABASE_PUBLISHABLE_KEY');
-  if (!url || !key) return;
+  if (!url || !key) return null;
+  return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
+}
+
+/**
+ * Read a previously published analysis when this machine has no local cache.
+ * This never starts an AI request and follows the same privacy opt-in as sync.
+ */
+export async function loadAnalysisFromSupabase(snapshot: Pick<SupabaseAnalysisSnapshot, 'folder' | 'visibility' | 'remoteUrl'>): Promise<SupabaseCachedAnalysis | null> {
+  if (snapshot.visibility === 'private' && value('REX_SUPABASE_SYNC_PRIVATE') !== 'true') return null;
+  const supabase = supabaseClient();
+  if (!supabase) return null;
+  const repositoryKey = crypto.createHash('sha256').update(snapshot.remoteUrl || snapshot.folder).digest('hex');
+  const { data, error } = await supabase.from('repository_analysis_cache')
+    .select('structure_hash, cache_json, analysis_json')
+    .eq('repository_key', repositoryKey)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  if (!data || !data.cache_json || typeof data.cache_json !== 'object') return null;
+  return { structureHash: String(data.structure_hash ?? ''), cache: data.cache_json as object, analysis: data.analysis_json as object };
+}
+
+/** Sync a completed analysis without making remote availability part of local analysis. */
+export async function syncAnalysisToSupabase(snapshot: SupabaseAnalysisSnapshot): Promise<void> {
   if (snapshot.visibility === 'private' && value('REX_SUPABASE_SYNC_PRIVATE') !== 'true') {
     console.info('[supabase] private repository cache remains local');
     return;
   }
 
   const repositoryKey = crypto.createHash('sha256').update(snapshot.remoteUrl || snapshot.folder).digest('hex');
-  const supabase = createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
+  const supabase = supabaseClient();
+  if (!supabase) return;
   const { error } = await supabase.from('repository_analysis_cache').upsert({
     repository_key: repositoryKey,
     repository_name: snapshot.folder.split(/[\/]/).filter(Boolean).pop() || 'repository',
@@ -76,12 +105,10 @@ export async function syncAnalysisToSupabase(snapshot: SupabaseAnalysisSnapshot)
 
 /** Remove the remote snapshot when a user clears that same local project cache. */
 export async function deleteAnalysisFromSupabase(snapshot: Pick<SupabaseAnalysisSnapshot, 'folder' | 'visibility' | 'remoteUrl'>): Promise<void> {
-  const url = value('NEXT_PUBLIC_SUPABASE_URL') ?? value('SUPABASE_URL');
-  const key = value('NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY') ?? value('SUPABASE_PUBLISHABLE_KEY');
-  if (!url || !key) return;
   if (snapshot.visibility === 'private' && value('REX_SUPABASE_SYNC_PRIVATE') !== 'true') return;
   const repositoryKey = crypto.createHash('sha256').update(snapshot.remoteUrl || snapshot.folder).digest('hex');
-  const supabase = createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
+  const supabase = supabaseClient();
+  if (!supabase) return;
   const { error } = await supabase.from('repository_analysis_cache').delete().eq('repository_key', repositoryKey);
   if (error) throw new Error(error.message);
 }

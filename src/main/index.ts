@@ -13,7 +13,7 @@ import { startMcpServer, stopMcpServer, recordPtyOutput, updateClaudeJsonMcpConf
 import { listPRs, listLocalBranches, reviewPR, PRInfo } from './prReviewer';
 import { AccountService, PlanId } from './accountService';
 import { getRepositoryAccess, RepositoryAccess } from './repositoryAccess';
-import { deleteAnalysisFromSupabase, syncAnalysisToSupabase } from './supabaseSync';
+import { deleteAnalysisFromSupabase, loadAnalysisFromSupabase, syncAnalysisToSupabase } from './supabaseSync';
 
 let mainWindow: BrowserWindow | null = null;
 let currentFolder: string | null = null;
@@ -304,12 +304,12 @@ function queueCachedAnalysisSync(folder: string, cache: CacheFile) {
   void next.catch(error => console.warn('[supabase] cache sync failed:', error instanceof Error ? error.message : String(error)));
 }
 
-function writeCache(folder: string, cache: CacheFile) {
+function writeCache(folder: string, cache: CacheFile, syncRemote = true) {
   cacheDatabase().prepare(`
     INSERT INTO project_cache (project_path, cache_json, updated_at) VALUES (?, ?, ?)
     ON CONFLICT(project_path) DO UPDATE SET cache_json = excluded.cache_json, updated_at = excluded.updated_at
   `).run(cacheProjectPath(folder), JSON.stringify(cache), cache.savedAt);
-  queueCachedAnalysisSync(folder, cache);
+  if (syncRemote) queueCachedAnalysisSync(folder, cache);
 }
 
 function cacheAnalysisOptions() {
@@ -367,6 +367,43 @@ function loadCanvasDiagram(folder: string): object | null {
     if (!row) { migrateLegacyCache(folder); row = cacheRow(folder); }
     return row?.canvas_json ? JSON.parse(row.canvas_json) as object : null;
   } catch { return null; }
+}
+
+/**
+ * Local cache wins. If it is absent, hydrate the exact published snapshot once
+ * so opening a project on a second Mac is instant and never invokes AI.
+ */
+async function restoreProjectCache(folder: string, access: RepositoryAccess): Promise<{ cache: CacheFile | null; diagram: object | null }> {
+  let cache = loadCache(folder);
+  let diagram = loadCanvasDiagram(folder) ?? cache?.diagram ?? null;
+  if (diagram) return { cache, diagram };
+
+  try {
+    const remote = await loadAnalysisFromSupabase({ folder, visibility: access.kind, remoteUrl: access.remoteUrl });
+    if (!remote) return { cache: null, diagram: null };
+    const remoteCache = remote.cache as Partial<CacheFile>;
+    const remoteDiagram = remoteCache.diagram ?? remote.analysis;
+    if (!remoteDiagram || typeof remoteDiagram !== 'object') return { cache: null, diagram: null };
+    cache = {
+      structureHash: String(remoteCache.structureHash ?? remote.structureHash),
+      provider: remoteCache.provider,
+      diagram: remoteDiagram,
+      analysisDiagrams: remoteCache.analysisDiagrams,
+      drilldowns: remoteCache.drilldowns ?? {},
+      codeflows: remoteCache.codeflows ?? {},
+      commitDiagrams: remoteCache.commitDiagrams ?? {},
+      lastSession: remoteCache.lastSession ?? [],
+      analysisOptions: remoteCache.analysisOptions,
+      savedAt: typeof remoteCache.savedAt === 'number' ? remoteCache.savedAt : Date.now(),
+    };
+    // Avoid echoing the downloaded cache straight back to Supabase.
+    writeCache(folder, cache, false);
+    saveCanvasDiagram(folder, remoteDiagram);
+    return { cache, diagram: remoteDiagram };
+  } catch (error) {
+    console.warn('[supabase] cache load failed:', error instanceof Error ? error.message : String(error));
+    return { cache: null, diagram: null };
+  }
 }
 
 function saveCache(folder: string, data: Partial<CacheFile> & { diagram: object; structureHash: string }): boolean {
@@ -1076,7 +1113,7 @@ function createWindow() {
 
     const last = loadLastProject();
     if (last) {
-      void getRepositoryAccess(last).then(access => {
+      void getRepositoryAccess(last).then(async access => {
         if (!mainWindow) return;
         currentRepositoryAccess = access;
         currentFolder = last;
@@ -1085,8 +1122,9 @@ function createWindow() {
         // Restore the latest canvas for this exact project immediately. The
         // analysis cache is kept separately, so switching providers or changing
         // source files does not make a saved canvas disappear.
-        const cached = loadCache(last);
-        const restoredDiagram = loadCanvasDiagram(last) ?? cached?.diagram ?? null;
+        const restored = await restoreProjectCache(last, access);
+        const cached = restored.cache;
+        const restoredDiagram = restored.diagram;
         if (restoredDiagram) {
           currentDiagram = restoredDiagram;
           mainWindow.webContents.send('canvas:diagram', restoredDiagram);
@@ -1165,8 +1203,9 @@ async function openProject(folder: string, access: RepositoryAccess) {
 
   // Restore the most recently saved canvas for this project. Analysis will
   // still validate its own source-hash cache when the user runs it again.
-  const cached = loadCache(folder);
-  const restoredDiagram = loadCanvasDiagram(folder) ?? cached?.diagram ?? null;
+  const restored = await restoreProjectCache(folder, access);
+  const cached = restored.cache;
+  const restoredDiagram = restored.diagram;
   const hasCurrentCachedDiagram = !!restoredDiagram;
   if (restoredDiagram) {
     currentDiagram = restoredDiagram;
