@@ -32,6 +32,8 @@
   "dependencies": {
     "@excalidraw/excalidraw": "^0.17.0",
     "@excalidraw/mermaid-to-excalidraw": "^2.2.2",
+    "@supabase/ssr": "^0.12.7",
+    "@supabase/supabase-js": "^2.117.3",
     "@typescript-eslint/typescript-estree": "^8.63.0",
     "glob": "^13.0.6",
     "node-pty": "^1.0.0",

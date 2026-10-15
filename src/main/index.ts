@@ -13,6 +13,7 @@ import { startMcpServer, stopMcpServer, recordPtyOutput, updateClaudeJsonMcpConf
 import { listPRs, listLocalBranches, reviewPR, PRInfo } from './prReviewer';
 import { AccountService, PlanId } from './accountService';
 import { getRepositoryAccess, RepositoryAccess } from './repositoryAccess';
+import { deleteAnalysisFromSupabase, syncAnalysisToSupabase } from './supabaseSync';
 
 let mainWindow: BrowserWindow | null = null;
 let currentFolder: string | null = null;
@@ -23,6 +24,10 @@ let preferredDiagramType = 'flowchart'; // updated by renderer type picker
 let analysisDepth: 1 | 2 | 3 = 2; // overview, balanced, deep — set by the user
 let accountService: AccountService | null = null;
 let currentRepositoryAccess: RepositoryAccess | null = null;
+
+function diagramReadabilityGuidance(): string {
+  return 'DIAGRAM READABILITY: Choose the number of visible nodes from the source evidence. Include every independently important component, boundary, decision, and handoff needed to explain the behaviour. Group only trivial helpers or repeated mechanics; never omit a meaningful path merely to make the diagram smaller. Keep labels concise and put detailed contracts in descriptions.';
+}
 
 function analysisDepthGuidance(): string {
   if (analysisDepth === 1) return 'DEPTH: Overview. Prioritize the essential steps and main success path. Prefer a short explanation over completeness.';
@@ -73,7 +78,7 @@ interface WalkthroughSettings {
   entryPoints: boolean; callChain: boolean; asyncPatterns: boolean; branchingLogic: boolean;
   dataFlow: boolean; dataTypes: boolean; stateManagement: boolean;
   dbInteractions: boolean; dbSchema: boolean;
-  restCalls: boolean; graphqlOps: boolean; externalIntegrations: boolean;
+  restCalls: boolean; grpcCalls: boolean; graphqlOps: boolean; externalIntegrations: boolean;
   authChecks: boolean; permissions: boolean;
   inputValidation: boolean; sensitiveData: boolean;
   errorHandling: boolean; fallbacks: boolean;
@@ -86,7 +91,7 @@ const DEFAULT_WALKTHROUGH_SETTINGS: WalkthroughSettings = {
   entryPoints: false, callChain: false, asyncPatterns: false, branchingLogic: false,
   dataFlow: false, dataTypes: false, stateManagement: false,
   dbInteractions: false, dbSchema: false,
-  restCalls: false, graphqlOps: false, externalIntegrations: false,
+  restCalls: false, grpcCalls: false, graphqlOps: false, externalIntegrations: false,
   authChecks: false, permissions: false,
   inputValidation: false, sensitiveData: false,
   errorHandling: false, fallbacks: false,
@@ -137,7 +142,25 @@ interface CacheFile {
   codeflows: Record<string, string>;
   commitDiagrams?: Record<string, CommitDiagram>;
   lastSession?: SessionPanel[];
+  /** Options that shaped the cached result, so cache-only viewers can explain it. */
+  analysisOptions?: { depth: 1 | 2 | 3; walkthroughSettings: WalkthroughSettings; savedAt: number };
   savedAt: number;
+}
+
+interface ArchitectureDocument {
+  executiveSummary?: string;
+  technologyStack?: string[];
+  sections?: Array<{ title: string; content: string; evidence?: string[] }> ;
+  unresolved?: string[];
+}
+
+interface ArchitectureStoryResult {
+  ok?: boolean;
+  error?: string;
+  mermaid?: string;
+  descriptions?: Record<string, string>;
+  diagrams?: Record<string, string>;
+  document?: ArchitectureDocument;
 }
 
 interface CacheDatabase {
@@ -256,11 +279,45 @@ function cacheRow(folder: string): CacheDatabaseRow | null {
     .get(cacheProjectPath(folder)) as CacheDatabaseRow | null;
 }
 
+const cacheSyncQueue = new Map<string, Promise<void>>();
+
+/** Serialize remote writes per project so newer drilldowns cannot be overwritten
+ * by an older analysis request that happens to finish later. */
+function queueCachedAnalysisSync(folder: string, cache: CacheFile) {
+  const snapshot = JSON.parse(JSON.stringify(cache)) as CacheFile;
+  const previous = cacheSyncQueue.get(folder) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(async () => {
+    const account = accountService?.getState().user ?? null;
+    await syncAnalysisToSupabase({
+      folder,
+      structureHash: snapshot.structureHash,
+      cache: snapshot,
+      analysis: snapshot.diagram,
+      description: String((snapshot.diagram as { pattern?: unknown }).pattern ?? 'Repository analysis'),
+      provider: snapshot.provider ?? getAiProvider(),
+      visibility: currentRepositoryAccess?.kind ?? 'private',
+      remoteUrl: currentRepositoryAccess?.remoteUrl,
+      publishedBy: account,
+    });
+  });
+  cacheSyncQueue.set(folder, next);
+  void next.catch(error => console.warn('[supabase] cache sync failed:', error instanceof Error ? error.message : String(error)));
+}
+
 function writeCache(folder: string, cache: CacheFile) {
   cacheDatabase().prepare(`
     INSERT INTO project_cache (project_path, cache_json, updated_at) VALUES (?, ?, ?)
     ON CONFLICT(project_path) DO UPDATE SET cache_json = excluded.cache_json, updated_at = excluded.updated_at
   `).run(cacheProjectPath(folder), JSON.stringify(cache), cache.savedAt);
+  queueCachedAnalysisSync(folder, cache);
+}
+
+function cacheAnalysisOptions() {
+  return {
+    depth: analysisDepth,
+    walkthroughSettings: { ...walkthroughSettings },
+    savedAt: Date.now(),
+  };
 }
 
 function saveCanvasDiagram(folder: string, diagram: object) {
@@ -335,6 +392,7 @@ function saveCache(folder: string, data: Partial<CacheFile> & { diagram: object;
       drilldowns: { ...(existing?.drilldowns ?? {}), ...(data.drilldowns ?? {}) },
       codeflows: { ...(existing?.codeflows ?? {}), ...(data.codeflows ?? {}) },
       commitDiagrams: { ...(existing?.commitDiagrams ?? {}), ...(data.commitDiagrams ?? {}) },
+      analysisOptions: cacheAnalysisOptions(),
       savedAt: now,
     };
     writeCache(folder, merged);
@@ -351,6 +409,7 @@ function saveDrilldown(folder: string, componentName: string, mermaid: string) {
     const existing = loadCache(folder);
     if (!existing) return;
     existing.drilldowns[componentName] = mermaid;
+    existing.analysisOptions = cacheAnalysisOptions();
     existing.savedAt = Date.now();
     writeCache(folder, existing);
   } catch { /* ignore */ }
@@ -373,6 +432,7 @@ function saveCodeFlow(folder: string, componentName: string, mermaid: string) {
     if (!existing) return;
     existing.codeflows = existing.codeflows ?? {};
     existing.codeflows[componentName] = mermaid;
+    existing.analysisOptions = cacheAnalysisOptions();
     existing.savedAt = Date.now();
     writeCache(folder, existing);
   } catch { /* ignore */ }
@@ -393,6 +453,9 @@ function clearProjectCache(folder: string): boolean {
     cacheDatabase().prepare('DELETE FROM project_cache WHERE project_path = ?').run(cacheProjectPath(folder));
     const legacyPath = legacyCacheFile(folder);
     if (fs.existsSync(legacyPath)) fs.unlinkSync(legacyPath);
+    void deleteAnalysisFromSupabase({
+      folder, visibility: currentRepositoryAccess?.kind ?? 'private', remoteUrl: currentRepositoryAccess?.remoteUrl,
+    }).catch(error => console.warn('[supabase] cache delete sync failed:', error instanceof Error ? error.message : String(error)));
     return true;
   } catch { return false; }
 }
@@ -488,7 +551,7 @@ function buildRelationshipGraphMermaid(structure: ExtractedStructure): string {
 
 // Analysis starts with the product experience. Technical detail is deliberately
 // deferred to Code Story and Implementation, which are progressive disclosures.
-const ANALYSIS_SCHEMA_VERSION = 'user-interaction-map-v7';
+const ANALYSIS_SCHEMA_VERSION = 'user-interaction-map-v12';
 
 /** File and symbol names are insufficient to infer product behaviour. */
 function buildAnalysisSourceContext(structure: ExtractedStructure): string {
@@ -531,7 +594,7 @@ function buildAnalysisSourceContext(structure: ExtractedStructure): string {
   return chunks.join('');
 }
 
-function buildClaudePrompt(structureJson: string, sourceContext: string): string {
+function buildClaudePrompt(structure: ExtractedStructure, structureJson: string, sourceContext: string): string {
   const schema = `{
   "pattern": "short product navigation map name evidenced by the repository",
   "diagrams": {
@@ -546,6 +609,7 @@ function buildClaudePrompt(structureJson: string, sourceContext: string): string
     'Create a comprehensive map of every user-visible way a person can explore and use this app. The repository evidence below is the source of truth.',
     'Output ONLY the JSON below — no fences or prose.',
     analysisDepthGuidance(),
+    diagramReadabilityGuidance(),
     '',
     'EVIDENCE RULES:',
     '- Infer only user-visible features and outcomes supported by the supplied evidence.',
@@ -555,8 +619,9 @@ function buildClaudePrompt(structureJson: string, sourceContext: string): string
     '- This is the FIRST learning level. Do not explain code, architecture, files, classes, functions, APIs, databases, state, requests, or technical layers.',
     '',
     'COMPACT USER MAP RULES for diagrams.structure:',
-    '- This is a readable navigation overview, NOT a full interaction trace. Start at opening the app, then show every independently reachable user area as one clear branch.',
-    '- Cover all evidenced areas, but group closely related actions under one user-facing hub. For example, “Tap an article” can cover reading, related links, saving, and sharing; “Tap Search” can cover entering a query and choosing a result.',
+    '- This is a readable navigation overview, NOT a full interaction trace. It must be legible at a normal canvas zoom, not a wall of parallel boxes. Start at opening the app, then show every independently reachable user area as one clear branch.',
+    '- Preserve every evidenced user area, but represent it as an information hierarchy: use 3–6 plain-language journey hubs below the opening node, then place related actions below each hub. A hub can summarize a closely related set of actions. For example, “Find and read content” can cover search, opening a result, reading, saving, and sharing.',
+    '- Never put more than six direct branches below the opening node or more than four action boxes below a hub. When the evidence has more areas, choose a better grouping label instead of making another parallel branch. The detailed step-by-step paths belong in diagrams.sequence.',
     '- Include every evidenced user area. Keep a strict tree with one opening node, meaningful action branches, and result nodes where they clarify an outcome.',
     '- Never draw return arrows, cross-links, repeated nodes, or more than two levels below the opening node. Each node must have one parent so the map remains readable.',
     '- Every branch must answer “what can the user do?” Use action-led labels such as “Tap Search”, “Tap Explore”, “Tap Saved articles”, “Open Nearby map”, “Open Games”, or “Open Settings”. Do not use destination-only labels.',
@@ -827,7 +892,10 @@ function extractJson(raw: string): object | null {
         // and component detail returns { title, summary, ... }. Do not throw a
         // valid analysis response away merely because it is not a flow response.
         if (parsed && typeof parsed === 'object' && (
-          'mermaid' in parsed || 'diagrams' in parsed || 'title' in parsed || 'detail' in parsed || 'files' in parsed
+          'mermaid' in parsed || 'diagram' in parsed || 'diagrams' in parsed || 'title' in parsed || 'detail' in parsed || 'files' in parsed
+          // Some providers follow the requested diagram key directly instead
+          // of nesting it in diagrams. Keep that otherwise valid response.
+          || Object.values(parsed as Record<string, unknown>).some(value => typeof value === 'string' && /^(?:flowchart|graph)\s+/im.test(value.trim()))
         )) return parsed;
       } catch { /* try the next balanced object */ }
       break;
@@ -836,9 +904,42 @@ function extractJson(raw: string): object | null {
 
   // If a provider ignored the JSON-only instruction but returned valid Mermaid,
   // retain the map instead of leaving the canvas blank.
-  const mermaidStart = clean.search(/(?:^|\n)\s*(?:flowchart|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|pie|gitGraph|mindmap|timeline|kanban)\b/i);
+  const mermaidStart = clean.search(/(?:^|\n)\s*(?:flowchart|graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|gantt|pie|gitGraph|mindmap|timeline|kanban)\b/i);
   if (mermaidStart >= 0) return { mermaid: clean.slice(mermaidStart).trim() };
   return null;
+}
+
+/**
+ * Providers are not consistent about Mermaid wrapping: some return `graph TD`,
+ * while others use a fenced `flowchart TD` block. Normalize those harmless
+ * differences before deciding whether an architecture response is usable.
+ */
+function normalizeFlowchartMermaid(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  const fenced = trimmed.match(/^```(?:mermaid)?\s*\n?([\s\S]*?)\n?```\s*$/i);
+  const mermaid = (fenced?.[1] ?? trimmed).trim();
+  return /^(?:flowchart|graph)\s+(?:TD|TB|BT|RL|LR)\b/i.test(mermaid) ? mermaid : undefined;
+}
+
+function architectureFlowcharts(parsed: Record<string, unknown> | null): Record<string, string> {
+  const source = parsed?.diagrams;
+  const entries = source && typeof source === 'object' && !Array.isArray(source)
+    ? Object.entries(source as Record<string, unknown>)
+    : [];
+  const diagrams: Record<string, string> = {};
+  for (const [key, value] of entries) {
+    const mermaid = normalizeFlowchartMermaid(value);
+    if (mermaid) diagrams[key] = mermaid;
+  }
+
+  // Accept a valid direct key too. This makes the cache resilient to a model
+  // that returns { communicationFlow: "graph TD…" } instead of diagrams.
+  for (const key of ['communicationFlow', 'highLevel', 'components', 'diagram', 'mermaid']) {
+    const mermaid = normalizeFlowchartMermaid(parsed?.[key]);
+    if (mermaid) diagrams[key === 'diagram' || key === 'mermaid' ? 'highLevel' : key] ??= mermaid;
+  }
+  return diagrams;
 }
 
 // ── Auto-update on code change (file watcher) ──────────────────────────────────
@@ -1137,6 +1238,7 @@ async function runAnalysisInternal(): Promise<{ ok?: boolean; error?: string; fr
       currentNodePaths = structure.nodePaths;
       normalizeDiagramPattern(cachedDiagram as Record<string, unknown>, structure);
       mainWindow.webContents.send('canvas:diagram', cachedDiagram);
+      if (cached) queueCachedAnalysisSync(currentFolder, cached);
       mainWindow.webContents.send('analysis:statusDetail', 'Loaded from cache');
       mainWindow.webContents.send('analysis:status', 'done');
       sendGitStatus(mainWindow);
@@ -1151,7 +1253,7 @@ async function runAnalysisInternal(): Promise<{ ok?: boolean; error?: string; fr
       ? ` ${graphify.resolution.reasons[0]}`
       : '';
     mainWindow.webContents.send('analysis:statusDetail', `Analysing ${structure.totalFiles} files${graphNote} with ${providerLabel()}…${graphProvenance}`);
-    const prompt = buildClaudePrompt(structureJson, buildAnalysisSourceContext(structure));
+    const prompt = buildClaudePrompt(structure, structureJson, buildAnalysisSourceContext(structure));
     const raw = await runCapture(prompt, currentFolder);
     const diagram = extractJson(raw) as AnalysisDiagram | null;
 
@@ -1408,6 +1510,48 @@ function graphFirstSourceFiles(
   return fromGraph.length ? fromGraph : findSourceFiles(name, nodePaths, projectRoot);
 }
 
+interface SelectedHandoff { from: string; to: string; data: string }
+
+/** A selected arrow is encoded as “source → destination · data carried”. */
+function parseSelectedHandoff(selection: string): SelectedHandoff | null {
+  const [endpoints, ...dataParts] = selection.split(' · ');
+  const arrowAt = endpoints.indexOf(' → ');
+  if (arrowAt < 0) return null;
+  const from = endpoints.slice(0, arrowAt).trim();
+  const to = endpoints.slice(arrowAt + 3).trim();
+  if (!from || !to) return null;
+  return { from, to, data: dataParts.join(' · ').trim() || 'passes control or data' };
+}
+
+function sourceNameForHandoffEndpoint(label: string): string {
+  return label
+    .replace(/^(?:External|Internal):\s*/i, '')
+    .split(/\s+[—-]\s+/)[0]
+    .trim();
+}
+
+/** Resolve both ends of an arrow so a story can explain their real handoff. */
+function sourceFilesForSelection(
+  selection: string,
+  nodePaths: Record<string, string>,
+  projectRoot: string,
+): { filePath: string; content: string }[] {
+  const handoff = parseSelectedHandoff(selection);
+  if (!handoff) return graphFirstSourceFiles(selection, nodePaths, projectRoot);
+
+  const seen = new Set<string>();
+  const files: { filePath: string; content: string }[] = [];
+  for (const endpoint of [handoff.from, handoff.to]) {
+    const endpointName = sourceNameForHandoffEndpoint(endpoint);
+    for (const file of graphFirstSourceFiles(endpointName, nodePaths, projectRoot)) {
+      if (!seen.has(file.filePath)) { seen.add(file.filePath); files.push(file); }
+    }
+  }
+  // External systems often have no local file. The originating component is
+  // still the source of truth for the request and response contract.
+  return files.length ? files : graphFirstSourceFiles(sourceNameForHandoffEndpoint(handoff.from), nodePaths, projectRoot);
+}
+
 /** Cache results against the exact source evidence, not just a canvas label. */
 function componentEvidenceFingerprint(name: string, sourceFiles: { filePath: string; content: string }[]): string {
   const evidence = sourceFiles
@@ -1580,6 +1724,7 @@ function buildDrilldownPrompt(name: string, sourceCode: string, imports: string[
     `You are explaining the "${name}" feature to a smart non-engineer. Look at the source code and draw exactly what happens when a user uses this feature — step by step.`,
     'Output ONLY the JSON below — no fences, no prose.',
     analysisDepthGuidance(),
+    diagramReadabilityGuidance(),
     '',
     'WHAT TO SHOW:',
     `1. The steps a user goes through inside "${name}" — what they see, what they do, what happens next.`,
@@ -1637,7 +1782,7 @@ async function runComponentDrilldown(rawName: string): Promise<{ ok?: boolean; e
   if (!currentFolder || !name) return { error: 'no component' };
   try {
     const structure = extractStructure(currentFolder);
-    const sourceFiles = graphFirstSourceFiles(name, structure.nodePaths, currentFolder);
+    const sourceFiles = sourceFilesForSelection(name, structure.nodePaths, currentFolder);
     const cacheKey = 'canonical-v6:depth-' + analysisDepth + ':' + name + ':' + componentEvidenceFingerprint(name, sourceFiles);
     const cached = loadCache(currentFolder);
     if (cached?.drilldowns?.[cacheKey]) {
@@ -1701,6 +1846,7 @@ function buildCodeFlowPrompt(name: string, sourceCode: string): string {
   return [
     `Produce a Mermaid code flow diagram for the "${name}" feature. Use one connected flowchart; each function gets TWO nodes: a function node and a description note below it.`,
     'Output ONLY the JSON below — no fences, no prose.',
+    diagramReadabilityGuidance(),
     '',
     'FOR EACH FUNCTION, create two nodes:',
     '  1. A function node (rectangle):  Id["functionName()\\nkey code line"]',
@@ -1732,7 +1878,7 @@ function buildCodeFlowPrompt(name: string, sourceCode: string): string {
     '- Description node: `IdDesc(["plain sentence"])`  — stadium shape with double quotes',
     '- Node ids: letters/digits/underscore only, unique across all subgraphs',
     '- Cross-class edges go between the description node of one class and the function node of another',
-    '- Include every relevant source-proven function. Every node connected.',
+    '- Include the source-proven functions needed to explain the chain. Group only trivial helpers; every visible node must remain connected.',
     '',
     'Also return "happyPath": ordered list of node IDs that form the optimistic success path (no errors, no retries).',
     '  - Include ONLY function node IDs (not description node IDs)',
@@ -1756,6 +1902,7 @@ function buildCodeStoryPrompt(name: string, sourceCode: string, hierarchyContext
     'Explain how the selected component, "' + name + '", behaves when its code runs. Create a plain-English Code Story, not a feature map or a user journey.',
     'Output ONLY the JSON below — no fences, no prose.',
     analysisDepthGuidance(),
+    diagramReadabilityGuidance(),
     '',
     'HARD RULES:',
     '- Base every step on the supplied source code. Do not invent screens, user journeys, product features, missing-source handling, or hypothetical behaviour.',
@@ -1782,7 +1929,7 @@ function buildCodeStoryPrompt(name: string, sourceCode: string, hierarchyContext
     '- For each source-proven REST/HTTP call, show a request and response boundary. Name the method and path, then describe only the proved path/query/header/body fields and response fields, types, status, or errors. Use `unknown` where the source does not prove a detail; never turn “load data” into a vague substitute for an endpoint contract.',
     '- A provider name alone is NOT a contract. Never emit a node such as “Remote recognition API called” without its adjacent request and response details. If a library/SDK hides the HTTP request, state `Endpoint: unknown (provider SDK)` and name the proved SDK operation, input shape, and returned result shape; do not guess the provider endpoint.',
     '- When data is persisted, explain the storage contract: the proven record/entity shape or key, whether it is read, created, updated, or deleted, and the result returned to the caller. Do not infer database tables or columns that are not in the source.',
-    '- Use 6–12 connected steps, ordered from top to bottom. Do not stop at the first helper when the supplied source shows what it calls next.',
+    '- Use as many connected steps as the source-proven path needs, ordered from top to bottom. Do not stop at the first helper when the supplied source shows what it calls next.',
     '- Every node must stand on its own for a developer seeing this codebase for the first time: write the action, the meaning of the data, and the purpose in everyday language. Good: "Receive the selected visit details", "Find the selected visit in local storage", "Check whether the visit can continue", "Save the completed survey result". Bad: "Action binding received", "selectedVisitODataReadLink", "isSurvey", "visitWithoutCheckin", or any other raw identifier.',
     '- Never put variable names, parameter names, binding names, OData names, field names, acronyms, file paths, class names, or function names in a Mermaid node or edge. Translate them: selectedVisitODataReadLink becomes "the selected visit reference"; isSurvey becomes "whether this action opens a survey". If a code name is necessary for verification, put it only at the end of its description as Evidence: name in file.',
     '- Name conditional behaviour truthfully. If the source branches, show both meaningful outcomes with labels such as "valid data" and "missing data"; do not quietly present only the happy path.',
@@ -1831,6 +1978,7 @@ function buildCodeStoryNewbieReviewPrompt(
   return [
     `You are a senior developer reviewing a "How it works" explanation of "${name}" for a teammate opening this codebase for the first time.`,
     'Improve the candidate diagram rather than giving general feedback. Output ONLY the replacement JSON—no fences or prose.',
+    diagramReadabilityGuidance(),
     '',
     'REVIEW STANDARD:',
     '- Preserve only source-proven behavior. Remove guesses; use `unknown` when a contract detail is not in the evidence.',
@@ -1878,6 +2026,7 @@ function buildWalkthroughFocusSection(settings: WalkthroughSettings): string {
   if (settings.dbInteractions) lines.push('- DATABASE: For every DB read/write show the operation (SELECT/INSERT/UPDATE/DELETE), the proven table/entity, key fields used, and result shape returned.');
   if (settings.dbSchema) lines.push('- DB SCHEMA: Show proven table/entity structure at each persistence boundary: primary keys, foreign keys, important columns, and relationships.');
   if (settings.restCalls) lines.push('- REST CALLS: This is required output. For every source-proven HTTP call, add visible request and response nodes to the Mermaid diagram. Include METHOD and path plus proven request fields as symbolic examples like {id}, response shape, status codes, and error cases. Use "unknown" for anything unproven.');
+  if (settings.grpcCalls) lines.push('- GRPC CALLS: For every source-proven gRPC call, add visible service/RPC, request, and response or stream-result nodes. Include unary/streaming mode, proven request and response fields as symbolic examples, status/error details, and use "unknown" for anything unproven.');
   if (settings.graphqlOps) lines.push('- GRAPHQL: For every GraphQL operation show: type (query/mutation/subscription), name, proven arguments, selection fields, and result/error shape.');
   if (settings.externalIntegrations) lines.push('- EXTERNAL INTEGRATIONS: Show every third-party SDK or external service call — input, result, and how it is used. State "Endpoint: unknown (SDK)" when the HTTP layer is hidden.');
   if (settings.authChecks) lines.push('- AUTH: Show exactly where authentication is verified, what credential or token is checked, what roles are required, and the failure path.');
@@ -1905,6 +2054,7 @@ function buildWalkthroughFocusSection(settings: WalkthroughSettings): string {
 function buildImplementationFocusEvidence(settings: WalkthroughSettings): string {
   const rules: string[] = [];
   if (settings.restCalls) rules.push('- REST CALLS: when the selected chain reaches a source-proven HTTP boundary, prioritize separate cards for (1) request data-class/DTO construction with its proven fields, (2) the client call with METHOD and path, and (3) response data-class/DTO decoding or consumption with its proven fields. A status code alone is incomplete. If the source does not prove a boundary, field, or endpoint, do not add it.');
+  if (settings.grpcCalls) rules.push('- GRPC CALLS: include separate cards for the source-proven service/RPC invocation, request message fields, response or streaming result fields, and the caller that consumes them. Do not infer service methods or message fields.');
   if (settings.graphqlOps) rules.push('- GRAPHQL: include separate cards for the operation definition, proven variables/input fields, and the returned selection/result fields. A bare operation name is incomplete.');
   if (settings.dataFlow || settings.dataTypes) rules.push('- DATA FLOW / TYPES: each important handoff must name the source-proven input shape, fields read or changed, and output shape in its card explanation. Do not replace a data class with a vague word such as payload.');
   if (settings.dbInteractions || settings.dbSchema) rules.push('- DATABASE: show the call that constructs/reads the entity, the repository/DAO operation, and the returned entity/result. Name only fields, keys, and operations proved by the source.');
@@ -1924,11 +2074,12 @@ function buildImplementationPrompt(name: string, sourceCode: string, hierarchyCo
     'Produce a simple-English code walkthrough in flowchart form. Every visible step must be anchored to the real function, method, class, or handler that performs it, so someone can follow the chart and then find that code in the source.',
     'Output ONLY the JSON below — no fences, no prose.',
     analysisDepthGuidance(), '',
+    diagramReadabilityGuidance(),
     'YOUR GOAL:',
     'After reading the flowchart, the developer should know which real code entry point starts the work, which functions it calls, what each one reads or changes, what it checks, and how it finishes. Cover every meaningful part, but combine tiny helpers when that makes the story easier to follow.',
     '',
     'DIAGRAM — flowchart TD:',
-    '- This is a FOCUSED FUNCTION CHAIN, not a full call dump. Show only the 5–12 most important source-proven functions, methods, handlers, or external boundaries: the entry point, meaningful orchestration, decisions that alter control flow, data reads/writes, cross-component calls, and final result. Skip logging, trivial getters/setters, simple adapters, and boilerplate.',
+    '- This is a FOCUSED FUNCTION CHAIN, not a full call dump. Show every important source-proven function, method, handler, or external boundary: the entry point, meaningful orchestration, decisions that alter control flow, data reads/writes, cross-component calls, and final result. Skip logging, trivial getters/setters, simple adapters, and boilerplate.',
     '- SEQUENCE IS THE PRIMARY TEACHING GOAL: number the main chain in execution order. Every main-path node label starts with Step N — followed by its exact source symbol and short explanation, for example Step 1 — MainServlet.service receives request. Use consecutive numbers with no gaps.',
     '- Every arrow represents a real caller → callee relationship in that focused chain. Label it calls functionName() for a direct call, or returns result to functionName() for a meaningful return. Use an explicit source symbol in every call label so a developer can follow the code without guessing.',
     '- On the main chain, every arrow label must start with the destination step number, for example Step 2 — calls requestForTenant(). This makes the reading order unambiguous even when cards are far apart.',
@@ -1975,6 +2126,7 @@ function buildRepositoryCodeStoryPrompt(projectStructure: string): string {
     'Create one plain-English Code Story for this entire repository. This is a guided overview for a developer who needs to understand what the application does and how its major parts work together.',
     'Output ONLY the JSON below — no fences or prose.',
     analysisDepthGuidance(),
+    diagramReadabilityGuidance(),
     '',
     'WHAT TO SHOW:',
     '- Show the 5–10 most important responsibilities or feature areas, in the order a request or user action moves through the application.',
@@ -2007,39 +2159,86 @@ function buildRepositoryCodeStoryPrompt(projectStructure: string): string {
 
 function buildArchitectureStoryPrompt(projectContext: string): string {
   return [
-    "Create an evidence-based Architecture Story for this repository. This is separate from a code-flow story: it explains the project's technical shape so a developer can orient themselves before tracing a feature.",
-    'Output ONLY the JSON below — no fences or prose.',
+    "Create an architecture explanation a new developer can understand in ten minutes. This is an evidence-based developer orientation package, not a component inventory or an idealised design.",
+    'Output ONLY the JSON schema below — no markdown fences or prose outside JSON.',
     analysisDepthGuidance(),
+    diagramReadabilityGuidance(),
     '',
-    'WHAT TO EXPLAIN:',
-    '- Runtime and framework: name the framework, language, package manager, and app/runtime type only when the supplied files prove them.',
-    '- Architectural pattern: identify the closest pattern actually present, such as layered, MVC, MVVM, feature-based, client-server, or modular. State when it is mixed or unclear.',
-    '- State management: explain where UI, domain, or shared state lives and how it changes. If there is no dedicated state library, say so and describe the local mechanism found.',
-    '- Data and integrations: identify database, ORM, API, file storage, auth, or external services. If none are evident, explicitly say "No persistence layer detected" rather than inventing one.',
-    '- Main boundaries: show how the entry point, UI, business logic, and data/integration layers connect.',
+    'ANALYSIS RULES:',
+    '- Start from actual entry points, then follow imports, calls, configuration, package manifests, tests, and infrastructure definitions in PROJECT CONTEXT.',
+    '- Separate confirmed facts, cautious inferences, recommendations, and unknowns. Never invent components, APIs, tables, deployments, credentials, paths, functions, or integrations.',
+    '- Cite a relative source path and line number when the context proves it. If a line cannot be determined, cite the path only. Never expose secrets.',
+    '- Keep diagrams readable. Omit a diagram only when the repository gives no evidence for that concern; say so in the document.',
     '',
-    'EVIDENCE RULES:',
-    '- Every claim must be supported by a package manifest, config file, import, or source reference in PROJECT CONTEXT.',
-    '- Do not infer a database from a model name or an architectural pattern from folder names alone.',
-    '- Put specific findings in the node labels and supporting evidence in descriptions.',
+    'DOCUMENT CONTENT — EXPLAIN, DO NOT LIST:',
+    '- executiveSummary must say what the software does, who or what triggers it, its primary workflow, and its proven system boundary in 3–5 direct sentences.',
+    '- technologyStack must contain only proven language/runtime/framework/build/dependency facts, each with a short source reference.',
+    '- sections must use these exact titles where evidence exists: System context; High-level architecture; Component and module breakdown; Critical execution flows; Data and integrations; State, concurrency, and resilience; Security; Infrastructure, build, and testing; Architectural risks and improvement opportunities.',
+    '- Each section must explain responsibility, direction of control/data movement, contracts, and why the boundary exists. Cite only the 2–6 most important relevant source paths; do not dump every path.',
+    '- Component breakdown must cover only major logical components. For each: responsibility, entry point/symbol, input/output, dependencies, dependents, and source reference. Keep implementation details out of the high-level explanation.',
+    '- Risks must be evidence-based and use: observed evidence → likely impact → practical improvement. Do not call a preference a defect.',
+    '- End with unresolved questions for information that the repository does not prove.',
     '',
-    'MERMAID:',
-    '- Start with flowchart TD.',
-    '- Use connected Id[Label] nodes. Include nodes for Runtime and architecture, then state and data when relevant.',
-    '- Use short technical labels; framework and pattern names are welcome.',
-    '- Every edge must explain the responsibility or data passed between the layers.',
-    '- No subgraphs, code snippets, or guesses.',
+    'DIAGRAMS — EACH ONE ANSWERS A DIFFERENT QUESTION:',
+    '- Return concise Mermaid flowchart TD diagrams under these keys when supported by evidence: communicationFlow, systemContext, highLevel, components, criticalFlow, dataFlow, integrations, deployment, dependencies. Do not return two diagrams that say the same thing.',
+    '- communicationFlow is mandatory and is the default canvas view. It must explain the whole proven project communication path: trigger/actor → entry point/UI → feature module or class → domain/use case → repository/service → storage and/or external boundary → response/result back to the caller. Group only trivial workers, callbacks, or repeated mechanics when that makes the flow clearer.',
+    '- For every proven HTTP/API operation, use ONE short boundary node labelled HTTP METHOD /path between the caller and external system—do not create separate request and response boxes. The card is the contract; the outgoing and return arrows show where the call goes and where its result is used. For every proven database operation, show DB read/write — entity or table and its returned data/result. If a request, response, status, entity, or error is not proven, label it unknown rather than guessing.',
+    '- For direct module/class interactions, label each arrow with plain English plus the actual proven contract when useful: `direct call — task details`, `callback — progress update`, `read — cached profile`, `returns — result/error`. Show return/callback arrows for material results and errors; do not draw every helper function.',
+    '- Component nodes may use a verified module, class, or interface name when it clarifies the real interaction, followed by a short plain-English responsibility. Examples: `OrderViewModel — owns screen state` or `OrderRepository — reads orders`. Never use a symbol that is not present in the repository.',
+    '- systemContext: show actors, this project as one internal system, proven external systems, trust/boundary crossings, and protocols. Do not show internal classes.',
+    '- highLevel: 5–9 nodes. Explain the project shape as layers/boundaries: entry point or presentation → feature/domain logic → state/data/integrations → known external systems.',
+    '- components: show every major module and its dependency direction. A component node needs a responsibility, not a file list.',
+    '- criticalFlow/dataFlow/integrations/deployment/dependencies: include only if source evidence proves them; focus each diagram on its named concern.',
+    '- Keep labels short enough to read at a glance. Never put file paths, package names, line numbers, or long explanations inside diagram nodes. Verified class/module names are allowed only in communicationFlow/components; put all source traceability in descriptions and document evidence instead.',
+    '- Label arrows with protocol, event, input/output, or responsibility. Distinguish internal vs external with the literal prefixes "Internal: " and "External: " when both appear. Use "unknown" rather than inventing absent layers.',
+    '- Use only flowchart TD; no classDef, styles, subgraphs, click handlers, code snippets, or sequenceDiagram.',
+    '- Normal-node descriptions use: What: responsibility and data/control relationship. Evidence: path[:line]. For EVERY HTTP boundary node, use this exact multiline contract instead: HTTP Contract:\\nMethod: GET|POST|PUT|PATCH|DELETE|unknown\\nEndpoint: /proven-path or unknown\\nRequest:\\n{ only source-proven fields/types }\\nResponse:\\n{ only source-proven fields/types }\\nEvidence: path[:line]. Use symbolic placeholders such as {id} only when the field is source-proven. This exact format is rendered as a readable API card.',
     '',
-    'DESCRIPTIONS:',
-    '- Give every node one concise explanation in this exact shape: "What: [finding]. Evidence: [specific files or imports]."',
-    '',
-    'Schema:',
-    '{"mermaid":"flowchart TD string","descriptions":{"Node Label":"What: finding. Evidence: path/file"}}',
+    'JSON SCHEMA:',
+    '{"diagrams":{"communicationFlow":"flowchart TD...","systemContext":"flowchart TD...","highLevel":"flowchart TD...","components":"flowchart TD...","criticalFlow":"flowchart TD...","dataFlow":"flowchart TD...","integrations":"flowchart TD...","deployment":"flowchart TD...","dependencies":"flowchart TD..."},"descriptions":{"HTTP GET /products":"HTTP Contract:\\nMethod: GET\\nEndpoint: /products\\nRequest:\\n{ id: \\"{id}\\" }\\nResponse:\\n{ name: \\"string\\" }\\nEvidence: src/api.ts:10","Other node":"What: finding. Evidence: path[:line]."},"document":{"executiveSummary":"confirmed project purpose and system boundary","technologyStack":["language/framework (evidence)"],"sections":[{"title":"Component and module breakdown","content":"confirmed findings, data/contracts, dependents, risks or unknowns","evidence":["relative/path:line"]}],"unresolved":["Unknown deployment topology — no infrastructure definition found"]}}',
     '',
     'PROJECT CONTEXT:',
-    projectContext.slice(0, 28000),
+    projectContext.slice(0, 50000),
     '',
     'JSON only.',
+  ].join('\n');
+}
+
+/**
+ * The first pass discovers the architecture. This second pass is deliberately
+ * narrower: it audits every boundary against source evidence and the user's
+ * selected focus filters, then returns a replacement architecture package.
+ */
+function buildArchitectureBoundaryReviewPrompt(
+  projectContext: string,
+  candidate: { diagrams: Record<string, string>; descriptions: Record<string, string>; document?: ArchitectureDocument },
+  settings: WalkthroughSettings,
+): string {
+  return [
+    'Review and replace this Technical Architecture package. Treat the candidate as incomplete until every source-proven boundary and every selected focus area has been checked against PROJECT CONTEXT.',
+    'Output ONLY replacement JSON using the same schema — no fences, commentary, or review notes.',
+    diagramReadabilityGuidance(),
+    '',
+    'NON-NEGOTIABLE BOUNDARY AUDIT:',
+    '- Preserve correct candidate content, remove guesses, and add only source-proven information. Use unknown where the source does not expose a required detail.',
+    '- For EVERY proven HTTP or REST call, use exactly one short boundary node labelled HTTP METHOD /path. Do not create separate request and response nodes: its card presents the complete request/response contract, while arrows show the caller, external boundary, and where the result returns.',
+    '- EVERY HTTP boundary description must use this exact layout so the canvas can draw an API contract card: HTTP Contract:\\nMethod: GET|POST|PUT|PATCH|DELETE|unknown\\nEndpoint: /proven-path or unknown\\nRequest:\\n{ only source-proven fields/types }\\nResponse:\\n{ only source-proven fields/types }\\nEvidence: path[:line]. Use a symbolic object and unknown for any unproven field, status, header, error, or credential. Never fabricate real values.',
+    '- For EVERY proven database or storage call, visibly show the actual operation and target: SQL/DAO/ORM/client method when proven, read/create/update/delete action, proven table/entity/key, and returned result. In descriptions, name the actual call format only when the source proves it, such as SQL SELECT, Room DAO query, Prisma findMany, or Supabase from table select.',
+    '- For EVERY proven gRPC call, visibly show service or RPC method, unary or streaming mode when proven, a request step, and a response or stream-result step. Descriptions must include symbolic request/response shapes using only proven fields.',
+    '- For GraphQL, SDK, message/event, cache, or other integration boundaries, apply the same rule: show the actual proven operation, source-proven input format, returned data/error, and how the caller uses it. If an SDK hides its endpoint, write Endpoint: unknown provider SDK.',
+    '- Component-to-component arrows must identify the source-proven operation and the meaningful input/result. Do not turn tiny helpers into separate nodes.',
+    '- Keep diagrams readable: put long sample payloads and contracts in descriptions, not Mermaid labels. Keep all diagrams as flowchart TD with labelled edges.',
+    '',
+    buildWalkthroughFocusSection(settings) || 'No optional focus filters are selected. The boundary audit above still applies.',
+    '',
+    'JSON SCHEMA:',
+    '{"diagrams":{"communicationFlow":"flowchart TD...","systemContext":"flowchart TD...","highLevel":"flowchart TD...","components":"flowchart TD...","criticalFlow":"flowchart TD...","dataFlow":"flowchart TD...","integrations":"flowchart TD...","deployment":"flowchart TD...","dependencies":"flowchart TD..."},"descriptions":{"HTTP GET /products":"HTTP Contract:\\nMethod: GET\\nEndpoint: /products\\nRequest:\\n{ id: \\"{id}\\" }\\nResponse:\\n{ name: \\"string\\" }\\nEvidence: src/api.ts:10","Other node":"What: responsibility. Evidence: path[:line]."},"document":{"executiveSummary":"...","technologyStack":["..."],"sections":[{"title":"Data and integrations","content":"...","evidence":["path:line"]}],"unresolved":["..."]}}',
+    '',
+    'CANDIDATE TO RECHECK:', JSON.stringify(candidate),
+    '',
+    'PROJECT CONTEXT:', projectContext.slice(0, 50000),
+    '',
+    'Replacement JSON only.',
   ].join('\n');
 }
 
@@ -2048,10 +2247,11 @@ function buildRepositoryImplementationPrompt(projectContext: string, settings: W
     'Create a feature-by-feature “How it builds” map for this repository. Explain how EVERY meaningful feature found in the supplied source is implemented in plain English, so a developer can understand the code flow just by reading the chart.',
     'Output ONLY the JSON below — no fences or prose.',
     analysisDepthGuidance(), '',
+    diagramReadabilityGuidance(),
     'WHAT TO SHOW:',
     '- First show the shared startup/entry point. Then create one clearly labelled branch for EACH meaningful, independent feature or workflow found in the source. A feature is a cohesive user or domain capability, not an individual file or helper.',
     '- Treat build scripts, dependency manifests, plugin setup, and generated configuration as infrastructure—not features. Do not devote a feature branch to them unless the repository contains no application or domain feature code.',
-    '- For every feature, show its actual implementation path and every meaningful component contract: trigger or entry → important logic/decision → state, data, or API work → result. Use as many contract nodes as needed; do not hide a component-to-component handoff to stay compact.',
+    '- For every feature, show its actual implementation path and meaningful component contracts: trigger or entry → important logic/decision → state, data, or API work → result. Group only repeated low-level mechanics when that improves comprehension.',
     '- Cover every meaningful feature the supplied source proves. Keep closely related minor features together only when that makes their implementation easier to understand.',
     '- Node labels must be plain English operations, not raw class, function, variable, or file names.',
     '- Every description appears directly below its chart node. Use one or two short, plain-English sentences (under 260 characters) that explain the input, the work, the result, and why it matters. Do not include raw function, class, variable, type, or file names in it.',
@@ -2080,9 +2280,10 @@ function buildRepositoryImplementationPrompt(projectContext: string, settings: W
 function architectureStoryContext(folder: string, structure: ExtractedStructure): string {
   const context: string[] = [groundedStructureJson(folder, structure).json];
   const evidenceFiles = [
-    'package.json', 'composer.json', 'pyproject.toml', 'requirements.txt', 'Pipfile',
-    'build.gradle', 'build.gradle.kts', 'settings.gradle', 'Podfile', 'pubspec.yaml',
-    'docker-compose.yml', 'docker-compose.yaml', 'prisma/schema.prisma',
+    'README.md', 'package.json', 'composer.json', 'pyproject.toml', 'requirements.txt', 'Pipfile',
+    'build.gradle', 'build.gradle.kts', 'settings.gradle', 'settings.gradle.kts', 'Podfile', 'pubspec.yaml',
+    'docker-compose.yml', 'docker-compose.yaml', 'Dockerfile', 'vite.config.ts', 'webpack.config.js',
+    'prisma/schema.prisma', 'firebase.json', 'supabase/config.toml',
   ];
 
   for (const relative of evidenceFiles) {
@@ -2093,15 +2294,27 @@ function architectureStoryContext(folder: string, structure: ExtractedStructure)
     } catch { /* optional project evidence */ }
   }
 
+  const architecturePriority = (filePath: string) => {
+    const relative = path.relative(folder, filePath).toLowerCase();
+    let score = 0;
+    if (/(mainactivity|application|app\.|index\.|main\.|bootstrap|entry)/.test(relative)) score += 80;
+    if (/(navigation|router|route|presenter|viewmodel|controller|service|usecase|interactor)/.test(relative)) score += 45;
+    if (/(repository|database|dao|store|cache|worker|queue|sync|api|client|network|auth)/.test(relative)) score += 35;
+    if (/(test|spec|fixture|mock)/.test(relative)) score -= 15;
+    return score;
+  };
   const sourceEvidence: string[] = [];
-  for (const filePath of Object.values(structure.nodePaths).slice(0, 30)) {
+  const relevantPaths = Object.values(structure.nodePaths)
+    .sort((left, right) => architecturePriority(right) - architecturePriority(left))
+    .slice(0, 45);
+  for (const filePath of relevantPaths) {
     try {
       const content = fs.readFileSync(filePath, 'utf8');
-      if (/\b(useState|useReducer|createStore|configureStore|Provider|zustand|redux|mobx|pinia|vuex|Context|Room|SQLite|Realm|prisma|typeorm|mongoose|sequelize|supabase|firebase|fetch\(|axios|graphql)\b/i.test(content)) {
+      if (architecturePriority(filePath) > 0 || /\b(useState|useReducer|createStore|configureStore|Provider|zustand|redux|mobx|pinia|vuex|Context|Room|SQLite|Realm|prisma|typeorm|mongoose|sequelize|supabase|firebase|fetch\(|axios|graphql)\b/i.test(content)) {
         sourceEvidence.push('\n// ── ' + path.relative(folder, filePath) + ' ──\n' + content.slice(0, 3500));
       }
     } catch { /* source file may no longer exist */ }
-    if (sourceEvidence.join('').length > 14000) break;
+    if (sourceEvidence.join('').length > 22000) break;
   }
   return [...context, ...sourceEvidence].join('\n');
 }
@@ -2135,23 +2348,57 @@ function repositoryImplementationContext(folder: string, structure: ExtractedStr
   return context.join('\n');
 }
 
-async function runArchitectureStory(): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string> }> {
+async function runArchitectureStory(): Promise<ArchitectureStoryResult> {
   if (!currentFolder) return { error: 'no project folder' };
-  const cacheKey = '__architecture_story__:node-unlimited-v2';
+  const cacheKey = '__architecture_document__:boundary-review-v7:focus-' + walkthroughSettingsFingerprint(walkthroughSettings);
   try {
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
-      const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string> };
-      if (cached.version === 2 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {} };
+      const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string>; diagrams?: Record<string, string>; document?: ArchitectureDocument };
+      if (cached.version === 7 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, diagrams: cached.diagrams ?? {}, document: cached.document };
     }
 
     const structure = extractStructure(currentFolder);
-    const raw = await runCapture(buildArchitectureStoryPrompt(architectureStoryContext(currentFolder, structure)), currentFolder);
-    const parsed = extractJson(raw) as { mermaid?: string; descriptions?: Record<string, string> } | null;
-    if (!parsed?.mermaid) return { error: 'no mermaid in response' };
-    const descriptions = parsed.descriptions ?? {};
-    saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 2, mermaid: parsed.mermaid, descriptions }));
-    return { ok: true, mermaid: parsed.mermaid, descriptions };
+    const context = architectureStoryContext(currentFolder, structure);
+    const raw = await runCapture(buildArchitectureStoryPrompt(context), currentFolder);
+    const parsed = extractJson(raw) as (Record<string, unknown> & { descriptions?: Record<string, string>; document?: ArchitectureDocument }) | null;
+    const diagrams = architectureFlowcharts(parsed);
+    const mermaid = diagrams.communicationFlow || diagrams.highLevel || Object.values(diagrams)[0];
+    if (!mermaid) {
+      // Retain the local provider response so a schema change can be diagnosed
+      // without asking the user to reproduce the analysis. It is never synced.
+      try { fs.writeFileSync(path.join(os.tmpdir(), 'rex-last-architecture-response.txt'), raw, 'utf8'); } catch { /* diagnostic only */ }
+      const returnedKeys = parsed ? Object.keys(parsed).join(', ') : 'no JSON payload';
+      console.error('[architecture] No usable Mermaid flowchart. Response keys:', returnedKeys);
+      return { error: `Architecture response had no usable Mermaid flowchart (returned: ${returnedKeys}). The raw local response was saved for diagnosis.` };
+    }
+
+    let reviewedDiagrams = diagrams;
+    let reviewedDescriptions = parsed?.descriptions ?? {};
+    let reviewedDocument = parsed?.document;
+    try {
+      const reviewRaw = await runCapture(buildArchitectureBoundaryReviewPrompt(
+        context,
+        { diagrams, descriptions: reviewedDescriptions, document: reviewedDocument },
+        walkthroughSettings,
+      ), currentFolder);
+      const review = extractJson(reviewRaw) as (Record<string, unknown> & { descriptions?: Record<string, string>; document?: ArchitectureDocument }) | null;
+      const replacementDiagrams = architectureFlowcharts(review);
+      if (Object.keys(replacementDiagrams).length > 0) {
+        reviewedDiagrams = replacementDiagrams;
+        reviewedDescriptions = review?.descriptions ?? reviewedDescriptions;
+        reviewedDocument = review?.document ?? reviewedDocument;
+      }
+    } catch {
+      // A usable first-pass architecture is more helpful than failing the
+      // entire action when the enrichment pass is interrupted.
+    }
+
+    const reviewedMermaid = reviewedDiagrams.communicationFlow || reviewedDiagrams.highLevel || Object.values(reviewedDiagrams)[0];
+    if (!reviewedMermaid) return { error: 'Architecture review produced no usable Mermaid flowchart.' };
+    const result = { version: 7, mermaid: reviewedMermaid, descriptions: reviewedDescriptions, diagrams: reviewedDiagrams, document: reviewedDocument };
+    saveCodeFlow(currentFolder, cacheKey, JSON.stringify(result));
+    return { ok: true, mermaid: reviewedMermaid, descriptions: reviewedDescriptions, diagrams: reviewedDiagrams, document: reviewedDocument };
   } catch (err: unknown) {
     return { error: err instanceof Error ? err.message : String(err) };
   }
@@ -2200,7 +2447,7 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
       return { ok: true, mermaid: parsed.mermaid, descriptions, happyPath };
     }
 
-    const sourceFiles = graphFirstSourceFiles(name, structure.nodePaths, currentFolder);
+    const sourceFiles = sourceFilesForSelection(name, structure.nodePaths, currentFolder);
     const cacheKey = `v22:depth-${analysisDepth}:focus-${walkthroughSettingsFingerprint(walkthroughSettings)}:${name}:${componentEvidenceFingerprint(name, sourceFiles)}`;
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
@@ -2226,10 +2473,14 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
       return { error: `No source code was found for "${name}". Select a code component to create a Code Story.` };
     }
 
+    const handoff = parseSelectedHandoff(name);
+    const handoffContext = handoff
+      ? `SELECTED CONNECTION (explain this handoff, not either endpoint in isolation): ${handoff.from} → ${handoff.to}. Data or action carried: ${handoff.data}.\n\n`
+      : '';
     const hierarchyContext = [buildHierarchyContext(sourceFiles), graphifyPromptContext(currentFolder, name).evidence].filter(Boolean).join('\n\n');
     const raw = await runCapture(buildCodeStoryPrompt(
       name,
-      sourceCode,
+      handoffContext + sourceCode,
       hierarchyContext,
       walkthroughSettings,
     ), currentFolder);
@@ -2275,6 +2526,16 @@ async function runComponentSource(rawName: string): Promise<{ ok: boolean; error
   try {
     const structure = extractStructure(currentFolder);
     const graphify = graphifyPromptContext(currentFolder, name);
+    const handoff = parseSelectedHandoff(name);
+    if (handoff) {
+      const handoffFiles = sourceFilesForSelection(name, structure.nodePaths, currentFolder);
+      if (handoffFiles.length === 0) return { ok: false, error: `No local source was found for the ${handoff.from} → ${handoff.to} handoff.` };
+      return {
+        ok: true,
+        files: handoffFiles.map(file => ({ path: path.relative(currentFolder!, file.filePath), content: file.content, highlight: handoff.data })),
+        graphify: { available: graphify.available, confidence: graphify.resolution?.confidence, matchKind: graphify.resolution?.matchKind, reasons: graphify.resolution?.reasons },
+      };
+    }
     const sourceHash = hashStructure(toClaudePromptJSON(structure) + ':graphify:' + graphify.fingerprint);
     const cacheKey = `__source_browser__:v5:${name}:${sourceHash}`;
     const isImplementationPath = (relPath: string) => {
@@ -2400,7 +2661,7 @@ async function runComponentImplementation(rawName: string, drillMermaid = ''): P
   if (!currentFolder || !name) return { error: 'no component' };
   try {
     const structure = extractStructure(currentFolder);
-    const sourceFiles = graphFirstSourceFiles(name, structure.nodePaths, currentFolder);
+    const sourceFiles = sourceFilesForSelection(name, structure.nodePaths, currentFolder);
     const cacheKey = '__implementation__:v37:depth-' + analysisDepth + ':focus-' + walkthroughSettingsFingerprint(walkthroughSettings) + ':' + name + ':' + componentEvidenceFingerprint(name, sourceFiles);
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
@@ -2416,11 +2677,15 @@ async function runComponentImplementation(rawName: string, drillMermaid = ''): P
       if (budget <= 0) break;
     }
     if (!sourceCode.trim()) return { error: `No source code was found for "${name}". Select a code component to explain its implementation.` };
+    const handoff = parseSelectedHandoff(name);
+    const handoffScope = handoff
+      ? `\n\nSELECTED CONNECTION — explain the source-proven handoff from ${handoff.from} to ${handoff.to}. The arrow carries: ${handoff.data}. Focus the walkthrough on how that input is prepared, sent or called, received, and turned into the result.\n`
+      : '';
     const scope = drillMermaid
       ? '\n\nFEATURE SCOPE ONLY — this is a user-facing flow. Use it only to identify the feature and its outcomes. Do NOT repeat, paraphrase, or draw its user steps. Explain the source-proven component contracts that make those outcomes happen instead:\n' + drillMermaid
       : '';
     const hierarchyContext = [buildHierarchyContext(sourceFiles), graphifyPromptContext(currentFolder, name).evidence].filter(Boolean).join('\n\n');
-    const parsed = extractJson(await runCapture(buildImplementationPrompt(name, sourceCode + scope, hierarchyContext, walkthroughSettings), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
+    const parsed = extractJson(await runCapture(buildImplementationPrompt(name, sourceCode + handoffScope + scope, hierarchyContext, walkthroughSettings), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
     const result = { version: 37, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {}, happyPath: parsed.happyPath ?? [] };
     saveCodeFlow(currentFolder, cacheKey, JSON.stringify(result));
@@ -2439,6 +2704,7 @@ function buildCommitFeatureFlowPrompt(commitMsg: string, diffSource: string): st
     `This git commit was just made: "${commitMsg}"`,
     'Look at the diff below and draw a user-facing feature flow diagram showing WHAT CHANGED for the user.',
     'Output ONLY the JSON below — no fences, no prose.',
+    diagramReadabilityGuidance(),
     '',
     'WHAT TO SHOW:',
     '1. The features or user-facing behaviours that changed in this commit.',
@@ -2485,6 +2751,7 @@ function buildCommitCodeFlowPrompt(commitMsg: string, diffSource: string): strin
     'Look at the diff and draw a code flow for ONLY the functions that were directly added or modified by this commit.',
     'DO NOT include helper functions or callers that were not changed. Focus on what is NEW or DIFFERENT.',
     'Output ONLY the JSON below — no fences, no prose.',
+    diagramReadabilityGuidance(),
     '',
     'FOR EACH CHANGED FUNCTION, create two nodes:',
     '  1. A function node (rectangle):  Id["functionName()\\nmost important NEW line"]',

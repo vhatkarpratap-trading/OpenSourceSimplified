@@ -70,6 +70,15 @@ const DIAGRAM_TABS: { kind: DiagramKind; label: string }[] = [
   { kind: 'gitDiff',   label: 'Git Diff' },
 ];
 
+// Fast, outcome-oriented lenses for the Focus menu. The detailed checkboxes
+// below remain available when someone needs a more precise investigation.
+const FOCUS_PRESETS: Array<{ label: string; keys: Array<keyof WalkthroughSettings> }> = [
+  { label: 'API contracts', keys: ['restCalls', 'grpcCalls', 'graphqlOps', 'externalIntegrations'] },
+  { label: 'Data and state', keys: ['dataFlow', 'dataTypes', 'stateManagement', 'dbInteractions', 'dbSchema', 'caching'] },
+  { label: 'Safety', keys: ['authChecks', 'permissions', 'inputValidation', 'sensitiveData', 'errorHandling'] },
+  { label: 'Reliability', keys: ['asyncPatterns', 'fallbacks', 'concurrency', 'logging', 'events'] },
+];
+
 const STATUS_DOT_COLOR: Record<AnalysisStatus, string> = {
   idle:     'transparent',
   running:  '#f9e2af',
@@ -109,6 +118,9 @@ export default function App() {
   const [codeFlowDepth, setCodeFlowDepth]     = useState(0);
   const [selectedComponent, setSelectedComponent] = useState<string | null>(null);
   const [selectedComponents, setSelectedComponents] = useState<string[]>([]);
+  // Excalidraw selection events and a toolbar click can occur in the same
+  // React turn. Keep the just-selected handoff synchronously available.
+  const selectedComponentRef = useRef<string | null>(null);
   const [selectionQuestion, setSelectionQuestion] = useState('');
   const [selectionQuestionOpen, setSelectionQuestionOpen] = useState(false);
   const [selectionAnswering, setSelectionAnswering] = useState(false);
@@ -130,7 +142,7 @@ export default function App() {
     entryPoints: false, callChain: false, asyncPatterns: false, branchingLogic: false,
     dataFlow: false, dataTypes: false, stateManagement: false,
     dbInteractions: false, dbSchema: false,
-    restCalls: false, graphqlOps: false, externalIntegrations: false,
+    restCalls: false, grpcCalls: false, graphqlOps: false, externalIntegrations: false,
     authChecks: false, permissions: false,
     inputValidation: false, sensitiveData: false,
     errorHandling: false, fallbacks: false,
@@ -466,6 +478,7 @@ export default function App() {
     const restoredNames = names.map(name => restoreSelectionLabel(name, diagram));
     setSelectedComponents(restoredNames);
     setSelectedComponent(restoredNames[0] ?? null);
+    selectedComponentRef.current = restoredNames[0] ?? null;
     const selected = restoredNames[0];
     if (!selected) return;
   }, [diagram]);
@@ -496,23 +509,25 @@ export default function App() {
   }, []);
 
   const handleDrill = useCallback(async () => {
-    if (!selectedComponent || drilling) return;
+    const selected = selectedComponentRef.current ?? selectedComponent;
+    if (!selected || drilling) return;
     setDrilling(true);
-    await renderDrilldownRef.current?.(selectedComponent);
+    await renderDrilldownRef.current?.(selected);
     setDrillDepth(d => d + 1);
-    sessionPanelsRef.current = [...sessionPanelsRef.current, { name: selectedComponent, mode: 'drill' }];
+    sessionPanelsRef.current = [...sessionPanelsRef.current, { name: selected, mode: 'drill' }];
     window.electronAPI.saveSessionPanels(sessionPanelsRef.current);
     setDrilling(false);
   }, [selectedComponent, drilling]);
 
   const handleCodeFlow = useCallback(async () => {
-    if (!selectedComponent || flowInFlightRef.current) return;
+    const selected = selectedComponentRef.current ?? selectedComponent;
+    if (!selected || flowInFlightRef.current) return;
     flowInFlightRef.current = true;
     setStoryLoading(true);
     try {
-      await renderCodeFlowRef.current?.(selectedComponent);
+      await renderCodeFlowRef.current?.(selected);
       setCodeFlowDepth(d => d + 1);
-      sessionPanelsRef.current = [...sessionPanelsRef.current, { name: selectedComponent, mode: 'story' }];
+      sessionPanelsRef.current = [...sessionPanelsRef.current, { name: selected, mode: 'story' }];
       window.electronAPI.saveSessionPanels(sessionPanelsRef.current);
     } finally {
       setStoryLoading(false);
@@ -521,24 +536,26 @@ export default function App() {
   }, [selectedComponent]);
 
   const handleActualCodeFlow = useCallback(async () => {
-    if (!selectedComponent) return;
+    const selected = selectedComponentRef.current ?? selectedComponent;
+    if (!selected) return;
     setSourcePanelOpen(true);
     setSourceFileIndex(0);
     setSourceView({});
-    const result = await window.electronAPI.getComponentSource(selectedComponent);
+    const result = await window.electronAPI.getComponentSource(selected);
     setSourceView(result.ok
       ? { files: result.files, graphify: result.graphify }
       : { error: result.error ?? 'No matching source file was found.' });
   }, [selectedComponent]);
 
   const handleImplementation = useCallback(async () => {
-    if (!selectedComponent || flowInFlightRef.current) return;
+    const selected = selectedComponentRef.current ?? selectedComponent;
+    if (!selected || flowInFlightRef.current) return;
     flowInFlightRef.current = true;
     setImplLoading(true);
     try {
-      await renderCodeFlowRef.current?.(selectedComponent, 'implementation');
+      await renderCodeFlowRef.current?.(selected, 'implementation');
       setCodeFlowDepth(d => d + 1);
-      sessionPanelsRef.current = [...sessionPanelsRef.current, { name: selectedComponent, mode: 'implementation' }];
+      sessionPanelsRef.current = [...sessionPanelsRef.current, { name: selected, mode: 'implementation' }];
       window.electronAPI.saveSessionPanels(sessionPanelsRef.current);
     } finally {
       setImplLoading(false);
@@ -585,13 +602,16 @@ export default function App() {
     try {
       const result = await window.electronAPI.getArchitectureStory();
       if (!result?.ok || !result.mermaid) throw new Error(result?.error || 'No architecture story was returned');
+      const diagrams = Object.keys(result.diagrams ?? {}).length ? result.diagrams! : { highLevel: result.mermaid };
+      const initialDiagramKey = diagrams.communicationFlow ? 'communicationFlow' : diagrams.highLevel ? 'highLevel' : Object.keys(diagrams)[0];
+      const initialMermaid = diagrams[initialDiagramKey] || result.mermaid;
       clearDrilldownRef.current?.();
       clearCodeFlowRef.current?.();
       setDrilldownActive(false);
       setCodeFlowActive(false);
       setDiagramAndRecord({
-        pattern: 'Project architecture — Code story',
-        diagrams: { structure: result.mermaid },
+        pattern: 'Technical architecture',
+        diagrams: { structure: initialMermaid },
         descriptions: result.descriptions ?? {},
       });
       setActiveKind('structure');
@@ -891,6 +911,7 @@ export default function App() {
           </span>
         </label>
 
+
         {/* Folder path */}
         <span style={{
           flex: 1, fontSize: 11, fontFamily: 'ui-monospace, monospace',
@@ -1024,11 +1045,28 @@ export default function App() {
           <FlowIcon /> {implLoading ? 'Explaining…' : 'Project code walkthrough'}
         </button>
 
+        <button
+          onClick={() => { if (!flowInFlightRef.current) void handleArchitectureStory(); }}
+          disabled={!canFlow || storyLoading}
+          title="Show the project’s technical architecture: runtime, state, data, integrations, and their connections"
+          style={{
+            display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
+            background: canFlow && !storyLoading ? '#163b36' : '#1b1b24',
+            border: `1px solid ${canFlow && !storyLoading ? '#2f8f75' : '#3b3b47'}`, borderRadius: 6,
+            color: canFlow && !storyLoading ? '#d8fff2' : '#777782', fontSize: 12, fontFamily: 'system-ui, -apple-system, sans-serif',
+            cursor: canFlow && !storyLoading ? 'pointer' : 'not-allowed', opacity: canFlow && !storyLoading ? 1 : 0.45, flexShrink: 0,
+            // @ts-ignore
+            WebkitAppRegion: 'no-drag',
+          }}
+        >
+          <ArchitectureIcon /> {storyLoading ? 'Mapping architecture…' : 'Technical architecture'}
+        </button>
+
         {/* Walkthrough settings gear button */}
         <div style={{ position: 'relative', flexShrink: 0 }} ref={walkthroughSettingsRef}>
           <button
             onClick={() => setWalkthroughSettingsOpen(o => !o)}
-            title="Configure what to focus on in code walkthroughs"
+            title="Configure details to include in Technical Architecture and code walkthroughs"
             style={{
               display: 'flex', alignItems: 'center', gap: 5, padding: '6px 10px',
               background: walkthroughSettingsOpen ? '#2a2a42' : '#20202a',
@@ -1063,7 +1101,7 @@ export default function App() {
               <div style={{ padding: '0 14px 8px', borderBottom: '1px solid #2a2a3e', marginBottom: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <div>
                   <div style={{ fontSize: 12, fontWeight: 700, color: '#ededf2' }}>Walkthrough Focus</div>
-                  <div style={{ fontSize: 10, color: '#7777a0', marginTop: 2 }}>Tick what you want the AI to give extra attention to</div>
+                  <div style={{ fontSize: 10, color: '#7777a0', marginTop: 2 }}>Tick what Technical Architecture and walkthroughs should check in detail</div>
                 </div>
                 {Object.values(walkthroughSettings).some(v => v) && (
                   <button
@@ -1075,6 +1113,41 @@ export default function App() {
                     style={{ fontSize: 10, color: '#9999bb', background: 'transparent', border: '1px solid #3a3a58', borderRadius: 4, padding: '2px 7px', cursor: 'pointer' }}
                   >Clear all</button>
                 )}
+              </div>
+
+              <div style={{ padding: '0 14px 12px', borderBottom: '1px solid #2a2a3e', marginBottom: 8 }}>
+                <div style={{ fontSize: 9, color: '#6666a0', fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 7 }}>
+                  Quick focus
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {FOCUS_PRESETS.map(preset => {
+                    const enabled = preset.keys.every(key => walkthroughSettings[key]);
+                    return (
+                      <button
+                        key={preset.label}
+                        type="button"
+                        aria-pressed={enabled}
+                        title={(enabled ? 'Remove ' : 'Add ') + preset.label + ' focus'}
+                        onClick={() => {
+                          const next = { ...walkthroughSettings };
+                          preset.keys.forEach(key => { next[key] = !enabled; });
+                          setWalkthroughSettings(next);
+                          window.electronAPI.setWalkthroughSettings(next).catch(() => undefined);
+                        }}
+                        style={{
+                          minHeight: 28, padding: '4px 8px', borderRadius: 14,
+                          border: '1px solid ' + (enabled ? '#7c6aed' : '#3a3a58'),
+                          background: enabled ? '#302b55' : '#20202d',
+                          color: enabled ? '#ddd6fe' : '#aaaac0', fontSize: 10,
+                          cursor: 'pointer',
+                        }}
+                      >{preset.label}</button>
+                    );
+                  })}
+                </div>
+                <div style={{ fontSize: 10, color: '#7777a0', marginTop: 7, lineHeight: 1.35 }}>
+                  Choose a lens first, then use the detailed controls only when needed.
+                </div>
               </div>
 
               {[
@@ -1095,6 +1168,7 @@ export default function App() {
                 ] as { key: keyof WalkthroughSettings; label: string }[] },
                 { label: 'NETWORK & APIs', keys: [
                   { key: 'restCalls', label: 'REST calls and payloads' },
+                  { key: 'grpcCalls', label: 'gRPC calls and message contracts' },
                   { key: 'graphqlOps', label: 'GraphQL operations' },
                   { key: 'externalIntegrations', label: 'External integrations and SDKs' },
                 ] as { key: keyof WalkthroughSettings; label: string }[] },
@@ -2034,6 +2108,16 @@ function FlowIcon() {
   return (
     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
       <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+    </svg>
+  );
+}
+
+function ArchitectureIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="3" width="7" height="7" rx="1" />
+      <rect x="14" y="14" width="7" height="7" rx="1" />
+      <path d="M10 6.5h4M14 6.5v11M10 17.5h4" />
     </svg>
   );
 }

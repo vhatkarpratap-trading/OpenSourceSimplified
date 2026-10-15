@@ -235,6 +235,34 @@ function horizontalBounds(elements: ExcalidrawElement[]): { left: number; right:
   };
 }
 
+// Mermaid's automatic layout can make a valid wide diagram. Fitting every
+// element into the viewport in that case turns the whole map into illegible
+// postage stamps. Start centred on the map, but keep a readable floor and let
+// people pan across the remaining branches.
+const MIN_INITIAL_DIAGRAM_ZOOM = 0.55;
+
+function fitDiagramAtReadableZoom(api: ExcalidrawImperativeAPI, elements: EXEl[]): number {
+  api.scrollToContent(elements, { fitToContent: true, animate: false });
+  const appState = api.getAppState();
+  const fittedZoom = (appState.zoom as { value: number }).value;
+  if (fittedZoom < MIN_INITIAL_DIAGRAM_ZOOM) {
+    // Keep the scene centre fixed while raising the zoom. Excalidraw's public
+    // imperative API does not expose zoomCanvas in v0.17, but updateScene
+    // supports app-state updates.
+    const centreX = appState.width / 2 / fittedZoom - appState.scrollX;
+    const centreY = appState.height / 2 / fittedZoom - appState.scrollY;
+    api.updateScene({
+      appState: {
+        zoom: { value: MIN_INITIAL_DIAGRAM_ZOOM as typeof appState.zoom.value },
+        scrollX: appState.width / 2 / MIN_INITIAL_DIAGRAM_ZOOM - centreX,
+        scrollY: appState.height / 2 / MIN_INITIAL_DIAGRAM_ZOOM - centreY,
+      },
+    });
+    return MIN_INITIAL_DIAGRAM_ZOOM;
+  }
+  return fittedZoom;
+}
+
 export default function Canvas({ diagramData, activeKind = 'structure', onAPIReady, onRenderError, onDrilldownChange, onCodeFlowChange, onSelectionChange, clearDrilldownRef, clearCodeFlowRef, clearAllCodeFlowsRef, renderDrilldownRef, renderCodeFlowRef, componentNamesRef, canvasContextRef, rawElementsRef, renderCommitDiffRef, clearCommitDiffRef, addNoteRef, selectionAnswerRef, errorAnnotations }: CanvasProps) {
   const [apiReady, setApiReady] = useState(false);
   const apiRef          = useRef<ExcalidrawImperativeAPI | null>(null);
@@ -312,6 +340,14 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       for (const [name, ids] of Object.entries(flat.nodeIds)) {
         for (const id of ids) rev[id] = name;
       }
+      // Edges carry their own source → destination handoff. Treating that as a
+      // selectable target lets Code Story and Code Walkthrough explain the
+      // contract on the arrow rather than only either endpoint.
+      for (const element of flat.elements) {
+        if (element.type !== 'arrow') continue;
+        const handoff = element.customData?.handoff;
+        if (typeof handoff === 'string' && handoff.trim()) rev[element.id] = handoff.trim();
+      }
       idToNameRef.current = rev;
       selectedNameRef.current = '';
 
@@ -325,7 +361,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       const tryFit = (n: number) => {
         const els = api.getSceneElements().filter(e => (e.opacity ?? 100) > 0);
         if (els.length > 0) {
-          api.scrollToContent(els as EXEl[], { fitToContent: true, animate: false });
+          lastZoomRef.current = fitDiagramAtReadableZoom(api, els as EXEl[]);
           if (annotationsRef.current.length > 0) {
             setTimeout(() => renderAnnotationBadges(annotationsRef.current), 100);
           }

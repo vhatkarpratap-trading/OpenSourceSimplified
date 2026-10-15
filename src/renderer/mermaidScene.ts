@@ -13,8 +13,96 @@
  */
 
 import { parseMermaidToExcalidraw } from '@excalidraw/mermaid-to-excalidraw';
-import { convertToExcalidrawElements } from '@excalidraw/excalidraw';
+import { convertToExcalidrawElements, FONT_FAMILY } from '@excalidraw/excalidraw';
 import { FlatScene, ExcalidrawElement } from './diagramBuilder';
+
+interface MermaidConnection { from: string; to: string; data: string; label: string }
+
+/** Preserve the meaning carried by each Mermaid edge so it can be selected. */
+function extractMermaidConnections(src: string): MermaidConnection[] {
+  const labels = new Map<string, string>();
+  const nodePattern = /([A-Za-z][A-Za-z0-9_]*)\s*(?:\[\s*"([^"]*)"\s*\]|\[\s*([^\]]*)\s*\]|\(\s*([^)]*)\s*\)|\{\s*([^}]*)\s*\})/g;
+  for (const line of src.split('\n')) {
+    let match: RegExpExecArray | null;
+    while ((match = nodePattern.exec(line))) {
+      const label = String(match[2] ?? match[3] ?? match[4] ?? match[5] ?? '')
+        .replace(/^\[|\]$/g, '').replace(/<br\s*\/?\s*>/gi, ' ').trim();
+      if (label) labels.set(match[1], label);
+    }
+  }
+
+  const connections: MermaidConnection[] = [];
+  for (const line of src.split('\n')) {
+    if (/^\s*(?:flowchart|graph|subgraph|end|classDef|style|click)\b/i.test(line)) continue;
+    const from = line.match(/^\s*([A-Za-z][A-Za-z0-9_]*)/);
+    const edge = line.match(/(?:-->|==>|-\.->|---)\s*(?:\|([^|]*)\|\s*)?([A-Za-z][A-Za-z0-9_]*)/);
+    if (!from || !edge) continue;
+    const fromLabel = labels.get(from[1]) ?? from[1];
+    const toLabel = labels.get(edge[2]) ?? edge[2];
+    const data = (edge[1] ?? 'passes control or data').trim();
+    connections.push({ from: fromLabel, to: toLabel, data, label: fromLabel + ' → ' + toLabel + ' · ' + data });
+  }
+  return connections;
+}
+
+interface HttpContract {
+  method: string;
+  endpoint: string;
+  request: string;
+  response: string;
+}
+
+/** Read the canonical HTTP contract supplied by Technical Architecture. */
+function parseHttpContract(description: string): HttpContract | null {
+  if (!/^\s*HTTP Contract\s*:/im.test(description)) return null;
+  const valueAfter = (name: string, stop: string[]) => {
+    const stops = stop.map(item => item.replace(/[.*+?^$()|[\]\\]/g, '\\$&')).join('|');
+    const match = description.match(new RegExp('(?:^|\\n)' + name + ':\\s*\\n?([\\s\\S]*?)(?=\\n(?:' + stops + '):|$)', 'i'));
+    return match?.[1]?.trim() || 'unknown';
+  };
+  const method = valueAfter('Method', ['Endpoint', 'Request', 'Response', 'Evidence']);
+  const endpoint = valueAfter('Endpoint', ['Request', 'Response', 'Evidence']);
+  const request = valueAfter('Request', ['Response', 'Evidence']);
+  const response = valueAfter('Response', ['Evidence']);
+  return { method: method.toUpperCase(), endpoint, request, response };
+}
+
+/**
+ * Mermaid calculates a node's size before Excalidraw sees it. Expand HTTP
+ * contracts at that point, rather than stretching a finished node and making
+ * its arrows overlap neighbouring cards.
+ */
+function injectHttpContractCards(src: string, descriptions?: Record<string, string>): string {
+  if (!descriptions) return src;
+  const contracts = new Map<string, HttpContract>();
+  for (const [label, description] of Object.entries(descriptions)) {
+    const contract = parseHttpContract(description);
+    if (contract) contracts.set(label.trim().toLowerCase(), contract);
+  }
+  if (contracts.size === 0) return src;
+
+  const lineBreaks = (value: string) => value
+    .replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/\r?\n/g, '<br/>');
+  // Technical Architecture emits ordinary square nodes. Limiting this rewrite
+  // to those nodes keeps flowchart syntax and edge labels untouched.
+  return src.replace(/(^|\n)(\s*)([A-Za-z0-9_]+)\s*\[\s*(?:"([^"]*)"|([^\]]*))\s*\]/g, (whole, prefix, indent, id, quoted, bare) => {
+    const label = String(quoted ?? bare ?? '').trim();
+    const contract = contracts.get(label.toLowerCase());
+    if (!contract) return whole;
+    const card = [
+      contract.method,
+      'api: ' + contract.endpoint,
+      '',
+      'request:',
+      lineBreaks(contract.request),
+      '',
+      'response:',
+      lineBreaks(contract.response),
+    ].join('<br/>');
+    return prefix + indent + id + '["' + card + '"]';
+  });
+}
 
 /** Strip ```mermaid fences and stray whitespace an LLM may wrap around the code. */
 export function cleanMermaid(src: string, keepSubgraphs = false): string {
@@ -284,10 +372,12 @@ async function tryParse(def: string): Promise<{ type?: string }[] | null> {
 }
 
 export async function buildMermaidScene(mermaid: string, descriptions?: Record<string, string>): Promise<FlatScene> {
-  const cleaned = cleanMermaid(mermaid);
+  const connections = extractMermaidConnections(mermaid);
+  const diagramWithContractCards = injectHttpContractCards(mermaid, descriptions);
+  const cleaned = cleanMermaid(diagramWithContractCards);
   // cleanMermaid strips subgraphs — for diagrams that intentionally use them (code flow),
   // try the original cleaned version without stripping first, then fall back.
-  const cleanedNoStrip = cleanMermaid(mermaid, /* keepSubgraphs */ true);
+  const cleanedNoStrip = cleanMermaid(diagramWithContractCards, /* keepSubgraphs */ true);
 
   let skeletons =
     await tryParse(cleanedNoStrip) ??
@@ -356,6 +446,7 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
     }
   }
 
+  let connectionIndex = 0;
   const elements = converted.map(el => {
     if (el.type === 'rectangle') {
       if (layerIds.has(el.id)) {
@@ -368,6 +459,7 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
       }
       const isChanged = CHANGED_FILLS.has((el.backgroundColor || '').toLowerCase());
       const label = containerLabel.get(el.id);
+      const isHttpContract = /^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|UNKNOWN)\s*\napi:/i.test(label || '');
       // Mermaid owns layout. Keep supporting descriptions out of this scene:
       // enlarging a node after its edges are laid out makes the flow overlap.
       const desc = null;
@@ -426,12 +518,12 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
         ...el,
         height: (el as { height: number }).height + extraH,
         groupIds: mergedGroupIds,
-        backgroundColor: isChanged ? '#fef3c7' : isRequestContract ? '#e0f2fe' : isResponseContract ? '#f3e8ff' : NODE_BG,
-        strokeColor:     isChanged ? '#d97706' : isRequestContract ? '#0284c7' : isResponseContract ? '#9333ea' : NODE_STROKE,
-        strokeWidth:     isChanged ? 2.5 : (isRequestContract || isResponseContract) ? 2.5 : 2,
+        backgroundColor: isChanged ? '#fef3c7' : isHttpContract ? '#f8fbff' : isRequestContract ? '#e0f2fe' : isResponseContract ? '#f3e8ff' : NODE_BG,
+        strokeColor:     isChanged ? '#d97706' : isHttpContract ? '#2563eb' : isRequestContract ? '#0284c7' : isResponseContract ? '#9333ea' : NODE_STROKE,
+        strokeWidth:     isChanged ? 2.5 : (isHttpContract || isRequestContract || isResponseContract) ? 2.5 : 2,
         fillStyle: 'solid',
         roughness: ROUGHNESS,
-        customData: { ...el.customData, nodeType: 'component', changed: isChanged, contractType: isRequestContract ? 'request' : isResponseContract ? 'response' : undefined },
+        customData: { ...el.customData, nodeType: 'component', changed: isChanged, contractType: isHttpContract ? 'http' : isRequestContract ? 'request' : isResponseContract ? 'response' : undefined },
       } as ExcalidrawElement;
     }
     if (el.type === 'text') {
@@ -440,6 +532,8 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
         return { ...el, strokeColor: LAYER_TEXT, fontFamily: FONT, opacity: 100 } as ExcalidrawElement;
       }
       const isEdgeLabel = !boundTo;
+      const labelText = (el as { text?: string }).text || '';
+      const isHttpContract = /^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|UNKNOWN)\s*\napi:/i.test(labelText);
       const nodeGrp = boundTo ? nodeGroupId.get(boundTo) : undefined;
       // Check if this text belongs to a class header diamond
       const parentEl = boundTo ? converted.find(e => e.id === boundTo) : null;
@@ -450,16 +544,21 @@ export async function buildMermaidScene(mermaid: string, descriptions?: Record<s
       return {
         ...el,
         groupIds: mergedGroupIds,
-        fontFamily: FONT,
+        fontFamily: isHttpContract ? FONT_FAMILY.Cascadia : FONT,
         fontSize: isClassHeaderText ? 13 : (el as { fontSize?: number }).fontSize,
         strokeColor: isClassHeaderText ? '#ffffff' : isEdgeLabel ? EDGE_LABEL : NODE_TEXT,
         opacity: 100,
       } as ExcalidrawElement;
     }
     if (el.type === 'arrow') {
+      const connection = connections[connectionIndex++];
       // Dotted arrows are class-header connectors — style them subtly
       const isDotted = (el as { strokeStyle?: string }).strokeStyle === 'dashed';
-      return { ...el, strokeColor: isDotted ? '#94a3b8' : EDGE, strokeWidth: isDotted ? 1 : 2, opacity: isDotted ? 50 : 90, roughness: ROUGHNESS } as ExcalidrawElement;
+      return {
+        ...el,
+        strokeColor: isDotted ? '#94a3b8' : EDGE, strokeWidth: isDotted ? 1 : 2, opacity: isDotted ? 50 : 90, roughness: ROUGHNESS,
+        customData: { ...el.customData, handoff: connection?.label, handoffFrom: connection?.from, handoffTo: connection?.to, handoffData: connection?.data },
+      } as ExcalidrawElement;
     }
     // Diamond/hexagon = class header node (from {{ClassName}} syntax) — passthrough with dark styling
     if ((el as unknown as { type: string }).type === 'diamond') {

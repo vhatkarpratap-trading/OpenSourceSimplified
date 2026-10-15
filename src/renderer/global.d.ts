@@ -72,6 +72,7 @@ export interface WalkthroughSettings {
   dbSchema: boolean;
   // Network & APIs
   restCalls: boolean;
+  grpcCalls: boolean;
   graphqlOps: boolean;
   externalIntegrations: boolean;
   // Access Control
@@ -121,7 +122,7 @@ declare global {
       getComponentSource: (name: string) => Promise<{ ok: boolean; error?: string; files?: Array<{ path: string; content: string; highlight?: string }>; graphify?: { available: boolean; confidence?: string; matchKind?: string; reasons?: string[] } }> ;
       getActualCodeFlow: (name: string) => Promise<{ ok: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] }> ;
       getComponentImplementation: (name: string, drillMermaid?: string) => Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] }>;
-      getArchitectureStory: () => Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string> }>;
+      getArchitectureStory: () => Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; diagrams?: Record<string, string>; document?: { executiveSummary?: string; technologyStack?: string[]; sections?: Array<{ title: string; content: string; evidence?: string[] }>; unresolved?: string[] } }>;
       getRepositoryImplementation: () => Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string> }> ;
       onDiagram: (cb: (diagram: DiagramData | null) => void) => void;
       onAnalysisStatus: (cb: (status: string) => void) => void;
