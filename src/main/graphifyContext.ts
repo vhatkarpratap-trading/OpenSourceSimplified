@@ -12,7 +12,7 @@ export interface GraphifyPromptContext {
   edgeCount: number;
   resolution?: GraphifyResolution;
 }
-export interface GraphifyBuildResult { ok: boolean; error?: string; nodeCount?: number; edgeCount?: number; }
+export interface GraphifyBuildResult { ok: boolean; error?: string; warning?: string; skipped?: boolean; nodeCount?: number; edgeCount?: number; }
 export type GraphifyMatchKind = 'exact-id' | 'exact-symbol' | 'source-file' | 'text-fallback' | 'overview';
 export interface GraphifyEvidenceNode {
   id: string; label: string; sourceFile?: string; sourceLocation?: string;
@@ -53,6 +53,27 @@ const text = (value: unknown, max = 220) => String(value ?? '').replace(/[\u0000
 const normalized = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, '');
 const terms = (value: string) => value.toLowerCase().split(/[^a-z0-9]+/).filter(part => part.length >= 3);
 const graphFile = (folder: string) => path.join(folder, 'graphify-out', 'graph.json');
+
+/**
+ * Do not make a diagram request depend on loading an enormous local graph.
+ * Graphify itself declines files above its own safety threshold; our lower
+ * ceiling also avoids holding hundreds of MB of JSON in Electron just to pick
+ * a small evidence subset. The caller can still analyse from the local source
+ * extractor and cache.
+ */
+function oversizedGraphResult(folder: string): GraphifyBuildResult | null {
+  try {
+    const bytes = fs.statSync(graphFile(folder)).size;
+    if (bytes <= MAX_GRAPH_BYTES) return null;
+    const mb = Math.ceil(bytes / (1024 * 1024));
+    const limitMb = Math.floor(MAX_GRAPH_BYTES / (1024 * 1024));
+    return {
+      ok: true,
+      skipped: true,
+      warning: `Graphify graph is ${mb} MB, above the ${limitMb} MB local safety limit. Continuing with source-based analysis.`,
+    };
+  } catch { return null; }
+}
 
 function parse(folder: string): Graph | null {
   try {
@@ -201,6 +222,11 @@ async function runGraphifyExtract(folder: string, force = false): Promise<{ code
 /** Build a deterministic, local-only Graphify index. */
 export async function buildGraphifyIndex(folder: string, onStatus: (message: string) => void): Promise<GraphifyBuildResult> {
   onStatus('Building local Graphify code graph…');
+  const existingOversized = oversizedGraphResult(folder);
+  if (existingOversized) {
+    onStatus(existingOversized.warning!);
+    return existingOversized;
+  }
   let output = await runGraphifyExtract(folder);
   if (output.code !== 0) return { ok: false, error: (output.error || output.text.trim().split('\n').slice(-4).join(' ') || 'Graphify did not complete').slice(0, 700) };
   let context = graphifyPromptContext(folder);
@@ -212,6 +238,11 @@ export async function buildGraphifyIndex(folder: string, onStatus: (message: str
     output = await runGraphifyExtract(folder, true);
     if (output.code !== 0) return { ok: false, error: (output.error || output.text.trim().split('\n').slice(-4).join(' ') || 'Graphify rebuild did not complete').slice(0, 700) };
     context = graphifyPromptContext(folder);
+  }
+  const oversized = oversizedGraphResult(folder);
+  if (oversized) {
+    onStatus(oversized.warning!);
+    return oversized;
   }
   if (!context.available) return { ok: false, error: 'Graphify completed, but a readable graphify-out/graph.json could not be produced. Check project write permissions and that the folder contains supported source files.' };
   return { ok: true, nodeCount: context.nodeCount, edgeCount: context.edgeCount };
