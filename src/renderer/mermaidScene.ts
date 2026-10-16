@@ -104,9 +104,32 @@ function injectHttpContractCards(src: string, descriptions?: Record<string, stri
   });
 }
 
+/**
+ * Keep the diagram portion when an otherwise valid Mermaid response has prompt
+ * context appended to it. Graph evidence and source excerpts occasionally leak
+ * into cached/provider output; treating those lines as Mermaid makes recovery
+ * create a card for every word of the evidence. This is deliberately a guard
+ * for non-diagram markers, not a node-count limit: valid large diagrams stay
+ * intact.
+ */
+function extractDiagramBlock(src: string): string {
+  const lines = src.replace(/\r\n?/g, '\n').split('\n');
+  const start = lines.findIndex(line => /^\s*(?:flowchart|graph)\b/i.test(line));
+  if (start < 0) return src;
+
+  const trailingContext = /^\s*(?:GRAPHIFY\s+EVIDENCE|SOURCE\s+CODE|PROJECT\s+CONTEXT|DISCOVERY\s+RULES|LOCAL\s+AST\s+EVIDENCE|CODE\s+STRUCTURE\s+EVIDENCE|CANDIDATE\s+TO\s+(?:RECHECK|IMPROVE)|REPOSITORY\s+(?:STRUCTURE|EVIDENCE)|THE\s+USER\s+SELECTED\s+THESE)\b/i;
+  const out: string[] = [];
+  for (let index = start; index < lines.length; index++) {
+    const line = lines[index];
+    if (trailingContext.test(line) || /^\s*```/.test(line)) break;
+    out.push(line);
+  }
+  return out.join('\n');
+}
+
 /** Strip ```mermaid fences and stray whitespace an LLM may wrap around the code. */
 export function cleanMermaid(src: string, keepSubgraphs = false): string {
-  let s = src
+  let s = extractDiagramBlock(src)
     .replace(/^\s*```(?:mermaid)?\s*/i, '')
     .replace(/```\s*$/i, '')
     .trim();
@@ -185,6 +208,24 @@ function sanitizeMermaid(src: string): string {
   });
 
   return out;
+}
+
+/**
+ * Code walkthrough edges often mention source symbols such as `useQuery()` or
+ * response values such as `{turnId}`. Mermaid reads those delimiters as its
+ * own syntax when they appear inside a pipe label. Preserve ordinary contract
+ * text (including HTTP paths), while neutralising only unsafe delimiters.
+ */
+function sanitizeUnsafeEdgeLabels(src: string): string {
+  return src.replace(/\|([^|\r\n]*)\|/g, (whole, label) => {
+    const value = String(label);
+    if (!/[()[\]{}"'`]/.test(value)) return whole;
+    const safe = value
+      .replace(/[()[\]{}"'`]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return `|${safe}|`;
+  });
 }
 
 /** Build a tiny safe diagram when malformed AI Mermaid cannot be parsed. */
@@ -372,16 +413,19 @@ async function tryParse(def: string): Promise<{ type?: string }[] | null> {
 }
 
 export async function buildMermaidScene(mermaid: string, descriptions?: Record<string, string>): Promise<FlatScene> {
-  const connections = extractMermaidConnections(mermaid);
-  const diagramWithContractCards = injectHttpContractCards(mermaid, descriptions);
+  const diagramSource = extractDiagramBlock(mermaid);
+  const connections = extractMermaidConnections(diagramSource);
+  const diagramWithContractCards = injectHttpContractCards(diagramSource, descriptions);
   const cleaned = cleanMermaid(diagramWithContractCards);
   // cleanMermaid strips subgraphs — for diagrams that intentionally use them (code flow),
   // try the original cleaned version without stripping first, then fall back.
   const cleanedNoStrip = cleanMermaid(diagramWithContractCards, /* keepSubgraphs */ true);
+  const edgeSafe = sanitizeUnsafeEdgeLabels(cleaned);
+  const edgeSafeNoStrip = sanitizeUnsafeEdgeLabels(cleanedNoStrip);
 
   let skeletons =
-    await tryParse(cleanedNoStrip) ??
-    await tryParse(cleaned) ??
+    await tryParse(edgeSafeNoStrip) ??
+    await tryParse(edgeSafe) ??
     await tryParse(sanitizeMermaid(cleanedNoStrip)) ??
     await tryParse(sanitizeMermaid(cleaned));
 

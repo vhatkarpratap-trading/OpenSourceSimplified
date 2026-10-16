@@ -24,15 +24,18 @@ let preferredDiagramType = 'flowchart'; // updated by renderer type picker
 let analysisDepth: 1 | 2 | 3 = 2; // overview, balanced, deep — set by the user
 let accountService: AccountService | null = null;
 let currentRepositoryAccess: RepositoryAccess | null = null;
+// A background preparation belongs to one analysis snapshot. Incrementing this
+// stops any remaining work when the user analyses again or opens another repo.
+let componentWarmupGeneration = 0;
 
 function diagramReadabilityGuidance(): string {
-  return 'DIAGRAM READABILITY: Choose the number of visible nodes from the source evidence. Include every independently important component, boundary, decision, and handoff needed to explain the behaviour. Group only trivial helpers or repeated mechanics; never omit a meaningful path merely to make the diagram smaller. Keep labels concise and put detailed contracts in descriptions.';
+  return 'DIAGRAM READABILITY — PRIORITISE, DO NOT INVENT A FIXED CAP: Tell one clear primary execution path first. A visible card earns its place only when it is an entry point, coordinator/orchestrator, state read or write with a consequence, HTTP/DB/gRPC/IPC/external boundary, meaningful auth/validation/decision/error branch, cross-component handoff, or final outcome. Fold trivial helpers, framework plumbing, repeated transforms, getters/setters, logging, and closely coupled local mechanics into their nearest important card and explain them in that card description. Keep HTTP/DB/gRPC/auth/error boundaries visible when source-proven, but use one compact contract card per logical boundary rather than separate cards for request plumbing, client wrappers, and response plumbing. Put payload shapes, return values, and implementation detail in descriptions and labelled arrows, not extra nodes. Choose detail adaptively: overview usually needs about 5–8 significant cards; balanced about 8–12; deep about 10–16 only when the source proves independently important paths or boundaries. These are readability targets, not limits: exceed them only for a distinct critical boundary or outcome. Keep labels concise and merge any card that does not change the reader’s understanding of control, data, or outcome.';
 }
 
 function analysisDepthGuidance(): string {
-  if (analysisDepth === 1) return 'DEPTH: Overview. Prioritize the essential steps and main success path. Prefer a short explanation over completeness.';
-  if (analysisDepth === 3) return 'DEPTH: Deep. Show the complete meaningful path, important alternatives/errors, and every proven component or boundary handoff. Explain unfamiliar terms and why each step exists.';
-  return 'DEPTH: Balanced. Show the important steps, the main path, and the choices or communications needed to understand how it works.';
+  if (analysisDepth === 1) return 'DEPTH: Overview. Prefer one primary path and roughly 5–8 significant cards. Include only critical boundaries and outcomes; summarise mechanics in descriptions.';
+  if (analysisDepth === 3) return 'DEPTH: Deep. Aim for roughly 10–16 significant cards when the source proves distinct paths. Include critical alternatives/errors and boundary contracts, but still merge local mechanics that do not independently alter the outcome.';
+  return 'DEPTH: Balanced. Prefer one primary path with roughly 8–12 significant cards, plus only the choices and communications needed to understand the outcome.';
 }
 
 // All main-process AI actions inherit the user's selected detail level,
@@ -1148,6 +1151,7 @@ function createWindow() {
   });
 
   mainWindow.on('closed', () => {
+    componentWarmupGeneration++;
     stopMcpServer();
     stopFileWatcher();
     killPty();
@@ -1192,6 +1196,7 @@ ipcMain.handle('project:relationships', () => {
 
 async function openProject(folder: string, access: RepositoryAccess) {
   if (!mainWindow) return null;
+  componentWarmupGeneration++;
   currentFolder = folder;
   currentRepositoryAccess = access;
   currentDiagram = null;
@@ -1253,6 +1258,8 @@ ipcMain.handle('cache:clearProject', () => {
 async function runAnalysisInternal(): Promise<{ ok?: boolean; error?: string; fromCache?: boolean }> {
   if (!mainWindow || !currentFolder) return { error: 'No folder selected' };
 
+  // An explicit Analyse supersedes any preparation for the previous snapshot.
+  componentWarmupGeneration++;
   mainWindow.webContents.send('analysis:status', 'running');
 
   try {
@@ -1323,6 +1330,7 @@ async function runAnalysisInternal(): Promise<{ ok?: boolean; error?: string; fr
     if (!cacheSaved) mainWindow.webContents.send('analysis:statusDetail', 'Diagram generated, but it could not be saved to cache.');
     mainWindow.webContents.send('analysis:status', 'done');
     sendGitStatus(mainWindow);
+    if (cacheSaved) scheduleComponentCacheWarmup(currentFolder, diagram);
 
     return { ok: true };
   } catch (err: unknown) {
@@ -1802,7 +1810,7 @@ function buildDrilldownPrompt(name: string, sourceCode: string, imports: string[
     '- Label: letters, digits, spaces only. NO special chars inside [ ].',
     '- Edge with label: `A -->|taps submit| B`.',
     '- NO subgraph, NO classDiagram, NO sequenceDiagram.',
-    '- Include every source-proven step. Every node must be connected.',
+    '- Include the source-proven steps that change the user-visible state, decision, boundary, or outcome. Fold local implementation mechanics into the closest meaningful step. Every node must be connected.',
     '',
     'Schema:',
     '{"mermaid":"flowchart TD string — use \\n for newlines"}',
@@ -1883,11 +1891,11 @@ ipcMain.handle('component:drilldown', (_e, rawName: string) => runComponentDrill
 
 function buildCodeFlowPrompt(name: string, sourceCode: string): string {
   return [
-    `Produce a Mermaid code flow diagram for the "${name}" feature. Use one connected flowchart; each function gets TWO nodes: a function node and a description note below it.`,
+    `Produce a focused Mermaid code flow diagram for the "${name}" feature. Use one connected flowchart; give a function node and description note only to functions that materially advance the entry → outcome chain.`,
     'Output ONLY the JSON below — no fences, no prose.',
     diagramReadabilityGuidance(),
     '',
-    'FOR EACH FUNCTION, create two nodes:',
+    'FOR EACH SELECTED SIGNIFICANT FUNCTION, create two nodes:',
     '  1. A function node (rectangle):  Id["functionName()\\nkey code line"]',
     '     - Line 1: exact function name with ()',
     '     - Line 2: the single most important line of real code from that function',
@@ -1917,7 +1925,7 @@ function buildCodeFlowPrompt(name: string, sourceCode: string): string {
     '- Description node: `IdDesc(["plain sentence"])`  — stadium shape with double quotes',
     '- Node ids: letters/digits/underscore only, unique across all subgraphs',
     '- Cross-class edges go between the description node of one class and the function node of another',
-    '- Include the source-proven functions needed to explain the chain. Group only trivial helpers; every visible node must remain connected.',
+    '- Select only the source-proven functions needed to explain the entry → orchestration → material branch/boundary → outcome chain. Merge local leaf helpers and repeated transforms into their caller description; every visible node must remain connected.',
     '',
     'Also return "happyPath": ordered list of node IDs that form the optimistic success path (no errors, no retries).',
     '  - Include ONLY function node IDs (not description node IDs)',
@@ -1963,7 +1971,7 @@ function buildCodeStoryPrompt(name: string, sourceCode: string, hierarchyContext
     ].join('\n') : '',
     '',
     'WHAT TO SHOW:',
-    '- Tell the complete feature story across all supplied files: entry/input → orchestration → every meaningful decision → local/service/storage work → success result and meaningful failure result.',
+    '- Tell one clear feature story across the supplied files: entry/input → orchestration → material decision or boundary → result. Add only failure, empty, or alternate paths that change the outcome; merge local mechanics into the closest meaningful step.',
     '- Treat every meaningful boundary as a contract, not a black box. When the source shows a call across components, processes, services, repositories, storage, or an external system, say who calls whom, what information crosses the boundary, and what comes back (including a proved failure or empty result).',
     '- For each source-proven REST/HTTP call, show a request and response boundary. Name the method and path, then describe only the proved path/query/header/body fields and response fields, types, status, or errors. Use `unknown` where the source does not prove a detail; never turn “load data” into a vague substitute for an endpoint contract.',
     '- A provider name alone is NOT a contract. Never emit a node such as “Remote recognition API called” without its adjacent request and response details. If a library/SDK hides the HTTP request, state `Endpoint: unknown (provider SDK)` and name the proved SDK operation, input shape, and returned result shape; do not guess the provider endpoint.',
@@ -2056,16 +2064,16 @@ function shouldRunCodeStoryReview(sourceCode: string, candidate: { mermaid?: str
 function buildWalkthroughFocusSection(settings: WalkthroughSettings): string {
   const lines: string[] = [];
   if (settings.entryPoints) lines.push('- ENTRY POINTS: Explicitly identify every trigger, entry function, or starting event and explain its real signature.');
-  if (settings.callChain) lines.push('- CALL CHAIN: Show the complete caller → callee chain from entry to exit, naming every function that crosses a boundary.');
-  if (settings.asyncPatterns) lines.push('- ASYNC PATTERNS: Flag every async/await, Promise chain, and callback. State whether operations run sequentially or in parallel. Call out any unhandled Promise.');
-  if (settings.branchingLogic) lines.push('- BRANCHING LOGIC: Show every meaningful if/else, switch/case, and try/catch. Name the condition and both outcome paths.');
+  if (settings.callChain) lines.push('- CALL CHAIN: Trace the complete entry → exit chain, but render cards only for functions that cross a meaningful boundary or change control/data/outcome. Fold adjacent local helpers into their caller description.');
+  if (settings.asyncPatterns) lines.push('- ASYNC PATTERNS: Surface async/await, Promise chains, and callbacks only where they affect ordering, concurrency, failure, or the returned result. State whether those meaningful operations run sequentially or in parallel.');
+  if (settings.branchingLogic) lines.push('- BRANCHING LOGIC: Show if/else, switch/case, and try/catch branches whose outcomes materially differ. Name the condition and meaningful outcome paths; summarise repetitive guards in their parent card.');
   if (settings.dataFlow) lines.push('- DATA FLOW: Trace the data shape at each key step — what enters, what changes, what leaves. Use source-proven field names.');
   if (settings.dataTypes) lines.push('- DATA TYPES: Name proven input/output types, DTOs, and schemas at every boundary. Use "unknown" where the source does not prove it.');
   if (settings.stateManagement) lines.push('- STATE: Show every piece of state the code reads or writes — where it lives, what mutates it, and in what order.');
   if (settings.dbInteractions) lines.push('- DATABASE: For every DB read/write show the operation (SELECT/INSERT/UPDATE/DELETE), the proven table/entity, key fields used, and result shape returned.');
   if (settings.dbSchema) lines.push('- DB SCHEMA: Show proven table/entity structure at each persistence boundary: primary keys, foreign keys, important columns, and relationships.');
-  if (settings.restCalls) lines.push('- REST CALLS: This is required output. For every source-proven HTTP call, add visible request and response nodes to the Mermaid diagram. Include METHOD and path plus proven request fields as symbolic examples like {id}, response shape, status codes, and error cases. Use "unknown" for anything unproven.');
-  if (settings.grpcCalls) lines.push('- GRPC CALLS: For every source-proven gRPC call, add visible service/RPC, request, and response or stream-result nodes. Include unary/streaming mode, proven request and response fields as symbolic examples, status/error details, and use "unknown" for anything unproven.');
+  if (settings.restCalls) lines.push('- REST CALLS: This is required output. For every source-proven HTTP call, add one visible compact HTTP contract card (or a separate request/response card only when the transformation itself is important). Include METHOD and path plus proven request fields as symbolic examples like {id}, response shape, status codes, and error cases in its description. Use "unknown" for anything unproven.');
+  if (settings.grpcCalls) lines.push('- GRPC CALLS: For every source-proven gRPC call, add one visible compact RPC contract card (or separate request/response cards only when the transformation is important). Include service/RPC, unary/streaming mode, proven request and response fields, status/error details, and use "unknown" for anything unproven.');
   if (settings.graphqlOps) lines.push('- GRAPHQL: For every GraphQL operation show: type (query/mutation/subscription), name, proven arguments, selection fields, and result/error shape.');
   if (settings.externalIntegrations) lines.push('- EXTERNAL INTEGRATIONS: Show every third-party SDK or external service call — input, result, and how it is used. State "Endpoint: unknown (SDK)" when the HTTP layer is hidden.');
   if (settings.authChecks) lines.push('- AUTH: Show exactly where authentication is verified, what credential or token is checked, what roles are required, and the failure path.');
@@ -2115,10 +2123,10 @@ function buildImplementationPrompt(name: string, sourceCode: string, hierarchyCo
     analysisDepthGuidance(), '',
     diagramReadabilityGuidance(),
     'YOUR GOAL:',
-    'After reading the flowchart, the developer should know which real code entry point starts the work, which functions it calls, what each one reads or changes, what it checks, and how it finishes. Cover every meaningful part, but combine tiny helpers when that makes the story easier to follow.',
+    'After reading the flowchart, the developer should know which real entry point starts the work, which key functions it calls, what key state or data changes, what material check occurs, and how it finishes. Prefer an understandable chain over a complete call dump; combine nearby local mechanics into the card that owns their outcome.',
     '',
     'DIAGRAM — flowchart TD:',
-    '- This is a FOCUSED FUNCTION CHAIN, not a full call dump. Show every important source-proven function, method, handler, or external boundary: the entry point, meaningful orchestration, decisions that alter control flow, data reads/writes, cross-component calls, and final result. Skip logging, trivial getters/setters, simple adapters, and boilerplate.',
+    '- This is a FOCUSED FUNCTION CHAIN, not a full call dump. Prioritize the entry point, meaningful orchestration, decisions that alter control flow, consequential data reads/writes, cross-component calls, external boundaries, and final result. Merge leaf helpers, adjacent transforms, logging, trivial getters/setters, simple adapters, and boilerplate into the nearest important card.',
     '- SEQUENCE IS THE PRIMARY TEACHING GOAL: number the main chain in execution order. Every main-path node label starts with Step N — followed by its exact source symbol and short explanation, for example Step 1 — MainServlet.service receives request. Use consecutive numbers with no gaps.',
     '- Every arrow represents a real caller → callee relationship in that focused chain. Label it calls functionName() for a direct call, or returns result to functionName() for a meaningful return. Use an explicit source symbol in every call label so a developer can follow the code without guessing.',
     '- On the main chain, every arrow label must start with the destination step number, for example Step 2 — calls requestForTenant(). This makes the reading order unambiguous even when cards are far apart.',
@@ -2129,10 +2137,10 @@ function buildImplementationPrompt(name: string, sourceCode: string, hierarchyCo
     '- FUNCTION CHAIN IS REQUIRED: draw one clear source-proven caller → callee route from entry point through the important work to the returned result. Do not add disconnected utility functions or alternate paths unless they materially change the result.',
     '- Node syntax: use short safe IDs (A, B, C...) and plain, quoted labels, for example: A["Load the saved project"].',
     '- Draw an arrow from A to B wherever A calls B.',
-    '- Use a diamond node for every real conditional branch (if/else, try/catch, guard that changes the path).',
+    '- Use a diamond node only for a source-proven conditional branch whose outcomes materially change the path or result; describe minor guards in the preceding card.',
     '- Represent an external service, storage area, or platform API with a normal plain-English action; do not name its implementation class or provider.',
     '- Edge labels must say the meaning of the information or decision, not its code name or type.',
-    '- Include every important source-proven function or boundary in one obvious top-to-bottom numbered chain. Return happyPath as every main-chain node ID in Step order.',
+    '- Include the significant source-proven functions and boundaries in one obvious top-to-bottom numbered chain. Return happyPath as every main-chain node ID in Step order.',
     '',
     'DESCRIPTIONS:',
     '- Every description MUST use this exact layout: Code:\n[one to five exact, consecutive source lines; each line at most 72 characters]\n\nExplanation: [one or two concise sentences explaining the inputs, result/state change, and why this function runs after the preceding step].\nNext: [Step N and its function name, plus why this call happens; or final result].',
@@ -2168,10 +2176,10 @@ function buildRepositoryCodeStoryPrompt(projectStructure: string): string {
     diagramReadabilityGuidance(),
     '',
     'WHAT TO SHOW:',
-    '- Show the 5–10 most important responsibilities or feature areas, in the order a request or user action moves through the application.',
+    '- Show the most important responsibilities or feature areas in the order a request or user action moves through the application. Use enough cards to distinguish independent workflows, while grouping related mechanics under their owning responsibility.',
     '- Begin with the app entry or user action and finish with the visible result, stored data, or external effect.',
     '- Combine implementation details into meaningful steps. Do not create one node per file, class, or function.',
-    '- If the repository has independent feature areas, show the shared entry point splitting into no more than 3 clear paths, then their outcomes.',
+    '- If the repository has independent feature areas, show a small set of clear paths from the shared entry point, then their outcomes. Group closely related feature mechanics under the same path.',
     '- Node labels must be plain English: no function names, class names, source code, or folder paths.',
     '- Every edge must say what is passed or decided in plain English.',
     '- Do not hide system boundaries. For every source-proven API, IPC, storage, repository, or inter-component handoff, identify caller → receiver, transport, the meaningful input, and result/error. For HTTP, include METHOD and path plus only proven request/response fields; for persistence, identify the proven record/key and read/write operation. Use `unknown` instead of guessing.',
@@ -2184,7 +2192,7 @@ function buildRepositoryCodeStoryPrompt(projectStructure: string): string {
     'MERMAID:',
     '- Start with flowchart TD.',
     '- Use Id[Plain English Step] nodes and labelled A -->|data or decision| B edges.',
-    '- Include every important connected responsibility. No subgraphs, no code snippets, and no technical boilerplate.',
+    '- Include only independently important connected responsibilities. No subgraphs, no code snippets, and no technical boilerplate.',
     '',
     'Schema:',
     '{"mermaid":"flowchart TD string","descriptions":{"Node Label":"How: implementation. Contract: caller → receiver; transport; input → result/error. Why: purpose (path/file.ts)"},"happyPath":["nodeId1","nodeId2"]}',
@@ -2225,7 +2233,7 @@ function buildArchitectureStoryPrompt(projectContext: string): string {
     '- For direct module/class interactions, label each arrow with plain English plus the actual proven contract when useful: `direct call — task details`, `callback — progress update`, `read — cached profile`, `returns — result/error`. Show return/callback arrows for material results and errors; do not draw every helper function.',
     '- Component nodes may use a verified module, class, or interface name when it clarifies the real interaction, followed by a short plain-English responsibility. Examples: `OrderViewModel — owns screen state` or `OrderRepository — reads orders`. Never use a symbol that is not present in the repository.',
     '- systemContext: show actors, this project as one internal system, proven external systems, trust/boundary crossings, and protocols. Do not show internal classes.',
-    '- highLevel: 5–9 nodes. Explain the project shape as layers/boundaries: entry point or presentation → feature/domain logic → state/data/integrations → known external systems.',
+    '- highLevel: use the smallest clear set of major layers and boundaries—typically a compact entry → feature/domain → state/data/integration → external-system path. Add a card only for an independently important boundary or responsibility.',
     '- components: show every major module and its dependency direction. A component node needs a responsibility, not a file list.',
     '- criticalFlow/dataFlow/integrations/deployment/dependencies: include only if source evidence proves them; focus each diagram on its named concern.',
     '- Keep labels short enough to read at a glance. Never put file paths, package names, line numbers, or long explanations inside diagram nodes. Verified class/module names are allowed only in communicationFlow/components; put all source traceability in descriptions and document evidence instead.',
@@ -2291,7 +2299,7 @@ function buildRepositoryImplementationPrompt(projectContext: string, settings: W
     '- First show the shared startup/entry point. Then create one clearly labelled branch for EACH meaningful, independent feature or workflow found in the source. A feature is a cohesive user or domain capability, not an individual file or helper.',
     '- Treat build scripts, dependency manifests, plugin setup, and generated configuration as infrastructure—not features. Do not devote a feature branch to them unless the repository contains no application or domain feature code.',
     '- For every feature, show its actual implementation path and meaningful component contracts: trigger or entry → important logic/decision → state, data, or API work → result. Group only repeated low-level mechanics when that improves comprehension.',
-    '- Cover every meaningful feature the supplied source proves. Keep closely related minor features together only when that makes their implementation easier to understand.',
+    '- Cover each independently important feature the supplied source proves. Group closely related minor features and their mechanics under the feature that owns their outcome.',
     '- Node labels must be plain English operations, not raw class, function, variable, or file names.',
     '- Every description appears directly below its chart node. Use one or two short, plain-English sentences (under 260 characters) that explain the input, the work, the result, and why it matters. Do not include raw function, class, variable, type, or file names in it.',
     '- For EVERY communication between components, describe a contract as: caller → receiver → operation/event and source-proven input → source-proven result/error. State its transport: direct call, event/callback, IPC, HTTP/REST, repository, storage, or other proven mechanism.',
@@ -2735,6 +2743,73 @@ async function runComponentImplementation(rawName: string, drillMermaid = ''): P
 ipcMain.handle('component:implementation', (_e, rawName: string, drillMermaid?: string) => runComponentImplementation(rawName, drillMermaid));
 ipcMain.handle('project:architectureStory', () => runArchitectureStory());
 ipcMain.handle('project:implementation', () => runRepositoryImplementation());
+
+/**
+ * Return the human labels from the primary analysis map. These are the same
+ * first-level components a person can select on the canvas; Mermaid IDs (A,
+ * B, and so on) are deliberately excluded so each component is prepared once.
+ */
+function componentLabelsForWarmup(diagram: object): string[] {
+  const structure = (diagram as { diagrams?: { structure?: unknown } }).diagrams?.structure;
+  if (typeof structure !== 'string') return [];
+  const labels = new Set<string>();
+  const node = /[A-Za-z][A-Za-z0-9_]*\s*\[\s*(?:"([^"]+)"|([^\]]+))\s*\]/g;
+  let match: RegExpExecArray | null;
+  while ((match = node.exec(structure))) {
+    const label = String(match[1] ?? match[2] ?? '')
+      .replace(/<br\s*\/?\s*>/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (label) labels.add(label);
+  }
+  return [...labels];
+}
+
+const backgroundPause = () => new Promise<void>(resolve => setTimeout(resolve, 250));
+
+/**
+ * Prepare the first selectable layer for every analysis component after the
+ * base diagram is ready. Work is strictly sequential because all AI actions
+ * share one project conversation; that preserves context and lets an explicit
+ * user request enter between background calls. Each result saves itself to the
+ * ordinary local/Supabase cache as soon as it is produced.
+ */
+function scheduleComponentCacheWarmup(folder: string, diagram: object) {
+  const generation = ++componentWarmupGeneration;
+  const components = componentLabelsForWarmup(diagram);
+  if (components.length === 0) return;
+
+  void (async () => {
+    console.log(`[cache-warmup] preparing first-level Drill, Code Story, and Code Walkthrough for ${components.length} components`);
+    for (const [index, name] of components.entries()) {
+      // Do not let an old project or superseded analysis continue spending
+      // tokens. The in-flight call is allowed to finish safely; no next call is
+      // started once its snapshot is no longer current.
+      if (generation !== componentWarmupGeneration || currentFolder !== folder || currentDiagram !== diagram) return;
+
+      const prefix = `[cache-warmup] ${index + 1}/${components.length} ${name}`;
+      console.log(`${prefix} — Drill`);
+      const drill = await runComponentDrilldown(name);
+      if (!drill.ok) console.warn(`${prefix} — Drill skipped: ${drill.error ?? 'no result'}`);
+      await backgroundPause();
+
+      if (generation !== componentWarmupGeneration || currentFolder !== folder || currentDiagram !== diagram) return;
+      console.log(`${prefix} — Code Story`);
+      const story = await runComponentCodeFlow(name);
+      if (!story.ok) console.warn(`${prefix} — Code Story skipped: ${story.error ?? 'no result'}`);
+      await backgroundPause();
+
+      if (generation !== componentWarmupGeneration || currentFolder !== folder || currentDiagram !== diagram) return;
+      console.log(`${prefix} — Code Walkthrough`);
+      const walkthrough = await runComponentImplementation(name);
+      if (!walkthrough.ok) console.warn(`${prefix} — Code Walkthrough skipped: ${walkthrough.error ?? 'no result'}`);
+      await backgroundPause();
+    }
+    if (generation === componentWarmupGeneration && currentFolder === folder && currentDiagram === diagram) {
+      console.log('[cache-warmup] first-level component preparation complete');
+    }
+  })().catch(error => console.error('[cache-warmup] failed:', error instanceof Error ? error.message : String(error)));
+}
 
 // ── Git history ───────────────────────────────────────────────────────────────
 
@@ -3556,6 +3631,7 @@ function setupPtyClaudeDetection() {
       const win = mainWindow;
 
       if (folder !== currentFolder && fs.existsSync(folder)) {
+        componentWarmupGeneration++;
         currentFolder = folder;
         saveLastProject(folder);
         win.webContents.send('folder:restored', { folder, hasCachedDiagram: false });

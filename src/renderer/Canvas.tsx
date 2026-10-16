@@ -177,53 +177,6 @@ function applyZoomAndGit(
   });
 }
 
-/** Add a quiet visual boundary around the generated diagram without making it a component. */
-function withGeneratedDesignBoundary(scene: FlatScene): FlatScene {
-  const content = scene.elements.filter(el => !el.isDeleted && !el.customData?.isGeneratedDesignBoundary);
-  if (content.length === 0) return scene;
-
-  const left = Math.min(...content.map(el => el.x));
-  const top = Math.min(...content.map(el => el.y));
-  const right = Math.max(...content.map(el => el.x + el.width));
-  const bottom = Math.max(...content.map(el => el.y + el.height));
-  const padding = 48;
-
-  const boundary = {
-    type: 'rectangle',
-    id: '__generated-design-boundary__',
-    x: left - padding,
-    y: top - padding,
-    width: right - left + padding * 2,
-    height: bottom - top + padding * 2,
-    strokeColor: '#64748b',
-    backgroundColor: 'transparent',
-    fillStyle: 'solid',
-    strokeWidth: 2,
-    strokeStyle: 'dashed',
-    angle: 0,
-    roughness: 0.5,
-    opacity: 100,
-    roundness: { type: 3 },
-    groupIds: [],
-    frameId: null,
-    seed: 246813,
-    version: 1,
-    versionNonce: 246814,
-    isDeleted: false,
-    updated: Date.now(),
-    link: null,
-    locked: true,
-    boundElements: [],
-    customData: { isGeneratedDesignBoundary: true },
-  } as unknown as ExcalidrawElement;
-
-  return {
-    ...scene,
-    elements: [boundary, ...scene.elements],
-    normalIds: [boundary.id, ...scene.normalIds],
-  };
-}
-
 /** Mermaid scenes can start left of their nominal origin. Account for their
  * actual bounds when placing a new panel beside an existing diagram. */
 function horizontalBounds(elements: ExcalidrawElement[]): { left: number; right: number } {
@@ -316,7 +269,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     (async () => {
       let flat: FlatScene;
       try {
-        flat = withGeneratedDesignBoundary(await buildMermaidScene(mermaid, diagramData.descriptions));
+        flat = await buildMermaidScene(mermaid, diagramData.descriptions);
         onRenderError?.(null);
       } catch (err) {
         // Invalid Mermaid from the LLM — keep the last good scene, surface error
@@ -746,7 +699,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
     const mermaid = answer.diagrams?.structure;
     if (!api || !mermaid) return;
 
-    const scene = withGeneratedDesignBoundary(await buildMermaidScene(mermaid, answer.descriptions));
+    const scene = await buildMermaidScene(mermaid, answer.descriptions);
     const existing = api.getSceneElements() as unknown as ExcalidrawElement[];
     const existingRects = existing.filter(e => e.type === 'rectangle') as (ExcalidrawElement & { x: number; y: number; width: number; height: number })[];
     const existingRight = existingRects.reduce((max, e) => Math.max(max, e.x + e.width), 0);
@@ -958,7 +911,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       if (!res?.ok || !res.mermaid) throw new Error('no mermaid');
 
       const { buildMermaidScene: bms } = await import('./mermaidScene');
-      const drillScene = withGeneratedDesignBoundary(await bms(res.mermaid));
+      const drillScene = await bms(res.mermaid);
 
       // Place new drill panel to the right of everything currently on canvas
       const freshEls = api.getSceneElements() as unknown as ExcalidrawElement[];
@@ -1155,8 +1108,6 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       if (mode === 'implementation') {
         flowScene.elements = applyImplementationCodeCards(flowScene.elements, res.descriptions);
       }
-      flowScene = withGeneratedDesignBoundary(flowScene);
-
       const freshEls = api.getSceneElements() as unknown as ExcalidrawElement[];
       const freshRects = freshEls.filter(e =>
         e.type === 'rectangle' && !e.id.startsWith('flow-loading')
@@ -1169,34 +1120,63 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       const depth = flowStackRef.current.length;
       seed = 7000000 + depth * 100000;
 
-      // Parse Mermaid source to map nodeId → label text (first line only)
-      // e.g. `A["login()\ncode line"]` → { A: "login()" }
+      // Parse every Mermaid node definition to map nodeId → label text. Nodes
+      // commonly appear after an arrow on the same line, so an anchored match
+      // loses most of a walkthrough's main path and its highlight badges.
       const mermaidNodeLabels = new Map<string, string>();
       for (const line of (res.mermaid || '').split('\n')) {
-        const m = line.trim().match(/^([A-Za-z0-9_]+)\s*[\[({]+"?([^\\"\\n]+)/);
-        if (m) mermaidNodeLabels.set(m[1], m[2].replace(/["]/g, '').trim());
+        // Walkthrough prompts use square cards and decision diamonds. Excluding
+        // round nodes prevents source calls such as `useQuery()` in an edge
+        // label from being mistaken for Mermaid nodes.
+        const nodeDefinition = /([A-Za-z][A-Za-z0-9_]*)\s*(?:\[\s*"?([^"\]\r\n]+)|\{\s*"?([^"}\r\n]+))/g;
+        let match: RegExpExecArray | null;
+        while ((match = nodeDefinition.exec(line))) {
+          const label = String(match[2] ?? match[3] ?? '').replace(/["]/g, '').trim();
+          if (label) mermaidNodeLabels.set(match[1], label);
+        }
       }
 
-      const flowEls = flowScene.elements.map((e, i) => ({
-        ...e,
-        id: `flow-d${depth}-${i}-${e.id}`,
-        x: (e as { x: number }).x + panelOffsetX,
-        y: (e as { y: number }).y + panelY,
-        _baseOpacity: 100, opacity: 100,
-        customData: {
-          ...(e as { customData?: object }).customData,
-          drillDepth: depth,
-          drillName: (e as { type?: string }).type === 'rectangle'
-            ? (() => {
-                const t = flowScene.elements.find(t =>
-                  (t as { type?: string; containerId?: string }).type === 'text' &&
-                  (t as { containerId?: string }).containerId === (e as { id: string }).id
-                );
-                return t ? (t as { text?: string }).text?.split('\n')[0].trim() : undefined;
-              })()
-            : undefined,
-        },
-      })) as unknown as ExcalidrawElement[];
+      // Code Story is placed beside the base diagram, so every generated
+      // element gets a unique ID. Re-map all element references as well: an
+      // arrow binds to its cards and a label binds to its card by ID. Leaving
+      // those references on the pre-placement IDs makes Excalidraw discard the
+      // relationships, which is why flows appeared as disconnected boxes.
+      const flowElementIds = new Map(flowScene.elements.map((e, i) => [e.id, `flow-d${depth}-${i}-${e.id}`]));
+      const remapElementId = (id: string | null | undefined) => id ? (flowElementIds.get(id) ?? id) : id;
+      const flowEls = flowScene.elements.map((e, i) => {
+        const element = e as ExcalidrawElement & {
+          containerId?: string | null;
+          boundElements?: Array<{ id: string; type: string }> | null;
+          startBinding?: { elementId: string; [key: string]: unknown } | null;
+          endBinding?: { elementId: string; [key: string]: unknown } | null;
+        };
+        const remapBinding = (binding: typeof element.startBinding) =>
+          binding ? { ...binding, elementId: remapElementId(binding.elementId)! } : binding;
+        return {
+          ...element,
+          id: flowElementIds.get(element.id)!,
+          x: element.x + panelOffsetX,
+          y: element.y + panelY,
+          containerId: remapElementId(element.containerId),
+          boundElements: element.boundElements?.map(binding => ({ ...binding, id: remapElementId(binding.id)! })) ?? element.boundElements,
+          startBinding: remapBinding(element.startBinding),
+          endBinding: remapBinding(element.endBinding),
+          _baseOpacity: 100, opacity: 100,
+          customData: {
+            ...element.customData,
+            drillDepth: depth,
+            drillName: element.type === 'rectangle'
+              ? (() => {
+                  const t = flowScene.elements.find(t =>
+                    (t as { type?: string; containerId?: string }).type === 'text' &&
+                    (t as { containerId?: string }).containerId === element.id
+                  );
+                  return t ? (t as { text?: string }).text?.split('\n')[0].trim() : undefined;
+                })()
+              : undefined,
+          },
+        };
+      }) as unknown as ExcalidrawElement[];
 
       // ── Happy path overlay ────────────────────────────────────────────────────
       // Match Mermaid node IDs from happyPath to rendered element IDs by label text
@@ -1207,10 +1187,12 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
 
       // Build a lookup of all text content per rect (by containerId or by groupId proximity)
       const rectTexts = new Map<string, string>(); // rectId → first line of label text
+      const isFlowCard = (element: { type?: string }) =>
+        element.type === 'rectangle' || String(element.type) === 'diamond';
       for (const el of flowEls) {
         if (el.type !== 'text') continue;
         const cid = (el as { containerId?: string | null }).containerId;
-        const txt = ((el as { text?: string }).text ?? '').split('\n')[0].trim().toLowerCase().replace(/[().\s]/g, '');
+        const txt = ((el as { text?: string }).text ?? '').split('\n')[0].trim().toLocaleLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
         if (cid) {
           // prefer containerId binding
           const existing = rectTexts.get(cid) ?? '';
@@ -1219,24 +1201,41 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       }
       // Fallback: for rects with no containerId text, use first text in same group
       for (const el of flowEls) {
-        if (el.type !== 'rectangle' || rectTexts.has(el.id)) continue;
+        if (!isFlowCard(el) || rectTexts.has(el.id)) continue;
         const grp = el.groupIds?.[0];
         if (!grp) continue;
         const groupText = flowEls.find(t =>
           t.type === 'text' && t.groupIds?.includes(grp)
         );
         if (groupText) {
-          const txt = ((groupText as { text?: string }).text ?? '').split('\n')[0].trim().toLowerCase().replace(/[().\s]/g, '');
+          const txt = ((groupText as { text?: string }).text ?? '').split('\n')[0].trim().toLocaleLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
           rectTexts.set(el.id, txt);
+          continue;
+        }
+        // Mermaid diamonds can carry an unbound label. Associate the text card
+        // nearest its centre so decisions participate in happy-path matching.
+        const card = el as ExcalidrawElement & { x: number; y: number; width: number; height: number };
+        const centreX = card.x + card.width / 2;
+        const centreY = card.y + card.height / 2;
+        const closestText = flowEls
+          .filter((candidate): candidate is ExcalidrawElement & { x: number; y: number; width: number; height: number; text?: string } => candidate.type === 'text')
+          .map(text => ({
+            text,
+            distance: Math.hypot(text.x + text.width / 2 - centreX, text.y + text.height / 2 - centreY),
+          }))
+          .sort((a, b) => a.distance - b.distance)[0];
+        if (closestText) {
+          const txt = (closestText.text.text ?? '').split('\n')[0].trim().toLocaleLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+          if (txt) rectTexts.set(el.id, txt);
         }
       }
 
       for (const [mermaidId, labelText] of mermaidNodeLabels.entries()) {
         // Skip Desc nodes — we only track function nodes
         if (mermaidId.endsWith('Desc')) continue;
-        const needle = labelText.toLowerCase().replace(/[().\s]/g, '').slice(0, 14);
+        const needle = labelText.toLocaleLowerCase().replace(/[^\p{L}\p{N}]/gu, '').slice(0, 14);
         const match = flowEls.find(el =>
-          el.type === 'rectangle' && (rectTexts.get(el.id) ?? '').startsWith(needle)
+          isFlowCard(el) && (rectTexts.get(el.id) ?? '').startsWith(needle)
         );
         if (match) origToNewId.set(mermaidId, match.id);
       }
@@ -1252,7 +1251,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
 
       const flowElsMutable = flowEls.map(el => {
         // Red border on happy path function nodes
-        if (happyNodeIds.has(el.id) && el.type === 'rectangle') {
+        if (happyNodeIds.has(el.id) && isFlowCard(el)) {
           return { ...el, strokeColor: '#dc2626', strokeWidth: 2.5 } as ExcalidrawElement;
         }
         // Red arrows: connecting a happy path Desc node to the next happy path function node
@@ -1282,7 +1281,7 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
         const newId = origToNewId.get(origId);
         if (!newId) return;
         const el = flowElsMutable.find(e => e.id === newId) as (ExcalidrawElement & { x: number; y: number; width: number; height: number }) | undefined;
-        if (!el || el.type !== 'rectangle') return;
+        if (!el || !isFlowCard(el)) return;
 
         const badgeSize = 20;
         happyOverlayEls.push({
