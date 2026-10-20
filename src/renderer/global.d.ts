@@ -103,12 +103,14 @@ declare global {
   interface Window {
     electronAPI: {
       isDebugMode: () => Promise<boolean>;
+      rendererReady: () => Promise<boolean>;
       getAccountState: () => Promise<{ configured: boolean; user: { email: string; name: string; picture?: string } | null; subscription: { plan: 'monthly' | 'yearly'; status: string; id: string; renewsAt?: string } | null }> ;
       signInWithGoogle: () => Promise<{ configured: boolean; user: { email: string; name: string; picture?: string } | null; subscription: { plan: 'monthly' | 'yearly'; status: string; id: string; renewsAt?: string } | null }> ;
       startSubscription: (plan: 'monthly' | 'yearly') => Promise<{ configured: boolean; user: { email: string; name: string; picture?: string } | null; subscription: { plan: 'monthly' | 'yearly'; status: string; id: string; renewsAt?: string } | null }> ;
       signOut: () => Promise<{ configured: boolean; user: null; subscription: null }> ;
       openFolder: () => Promise<{ opened: boolean; folder: string; hasCachedDiagram?: boolean; access: { kind: 'open-source' | 'private'; source: string; detail: string; remoteUrl?: string } } | null>;
       clearProjectCache: () => Promise<{ ok: boolean; error?: string }>;
+      syncCurrentProjectToSupabase: () => Promise<{ ok: boolean; error?: string }>;
       getAiProvider: () => Promise<{ provider: string; providers: { id: string; label: string }[] }>;
       setAiProvider: (provider: string) => Promise<{ provider: string; providers: { id: string; label: string }[] }>;
       getAnalysisDepth: () => Promise<1 | 2 | 3>;

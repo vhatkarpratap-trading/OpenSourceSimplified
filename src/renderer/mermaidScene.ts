@@ -401,6 +401,10 @@ async function tryParse(def: string): Promise<{ type?: string }[] | null> {
   console.log('[mermaidScene] tryParse input:\n' + def.slice(0, 800));
   try {
     const { elements } = await parseMermaidToExcalidraw(def);
+    if (elements.length === 0) {
+      console.warn('[mermaidScene] parser returned an empty scene');
+      return null;
+    }
     if (elements.some(s => (s as { type?: string }).type === 'image')) {
       console.warn('[mermaidScene] parsed but got a raster image, not shapes');
       return null;

@@ -2,6 +2,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
   isDebugMode: (): Promise<boolean> => ipcRenderer.invoke('app:isDebugMode'),
+  // Sent after the React app has attached its IPC listeners.
+  rendererReady: (): Promise<boolean> => ipcRenderer.invoke('renderer:ready'),
   // Account and Pro billing. Provider credentials remain in the main process.
   getAccountState: (): Promise<{ configured: boolean; user: { email: string; name: string; picture?: string } | null; subscription: { plan: 'monthly' | 'yearly'; status: string; id: string; renewsAt?: string } | null }> =>
     ipcRenderer.invoke('account:getState'),
@@ -15,6 +17,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.invoke('folder:open'),
   clearProjectCache: (): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('cache:clearProject'),
+  syncCurrentProjectToSupabase: (): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('supabase:syncCurrent'),
 
   // AI provider used for all canvas analysis and question requests
   getAiProvider: (): Promise<{ provider: string; providers: { id: string; label: string }[] }> =>

@@ -132,6 +132,7 @@ export default function App() {
   const [sourceView, setSourceView] = useState<{ files?: Array<{ path: string; content: string; highlight?: string }>; error?: string; graphify?: { available: boolean; confidence?: string; matchKind?: string; reasons?: string[] } } | null>(null);
   const [sourceFileIndex, setSourceFileIndex] = useState(0);
   const [graphBuilding, setGraphBuilding] = useState(false);
+  const [supabaseSyncing, setSupabaseSyncing] = useState(false);
   const [aiProvider, setAiProvider] = useState('claude');
   const [analysisDepth, setAnalysisDepth] = useState<1 | 2 | 3>(2);
   const [aiProviders, setAiProviders] = useState<{ id: string; label: string }[]>([
@@ -382,6 +383,10 @@ export default function App() {
       }
     });
 
+    // Initial cached-diagram delivery is gated on this acknowledgement, so it
+    // cannot race these subscriptions on a cold Electron launch.
+    void window.electronAPI.rendererReady();
+
   }
 
   const handleOpenFolder = useCallback(async () => {
@@ -408,6 +413,19 @@ export default function App() {
     setStatus('idle');
     setStatusDetail('Project cache cleared — run Analyse to create a new map.');
   }, [folder, status]);
+
+  const handleSupabaseSync = useCallback(async () => {
+    if (!folder || supabaseSyncing) return;
+    setSupabaseSyncing(true);
+    setRenderError(null);
+    const result = await window.electronAPI.syncCurrentProjectToSupabase();
+    setSupabaseSyncing(false);
+    if (!result.ok) {
+      setRenderError(result.error ?? 'Could not push this project to Supabase');
+      return;
+    }
+    setStatusDetail('Project cache pushed to Supabase.');
+  }, [folder, supabaseSyncing]);
 
   const handleAnalyse = useCallback(async () => {
     if (!folder || status === 'running' || status === 'patching') return;
@@ -1237,6 +1255,21 @@ export default function App() {
             </div>
           )}
         </div>
+
+        <button
+          onClick={() => void handleSupabaseSync()}
+          disabled={!folder || supabaseSyncing}
+          title="Push this project's saved analysis and prepared walkthroughs to Supabase"
+          style={{
+            padding: '6px 10px', background: '#123b5a', border: '1px solid #1d6d9c', borderRadius: 6,
+            color: '#d9f2ff', fontSize: 11, fontFamily: 'system-ui, -apple-system, sans-serif',
+            cursor: (!folder || supabaseSyncing) ? 'not-allowed' : 'pointer', opacity: (!folder || supabaseSyncing) ? 0.45 : 1, flexShrink: 0,
+            // @ts-ignore
+            WebkitAppRegion: 'no-drag',
+          }}
+        >
+          {supabaseSyncing ? 'Pushing…' : 'Push to Supabase'}
+        </button>
 
         <button
           onClick={handleClearProjectCache}

@@ -163,18 +163,29 @@ export function runCapture(prompt: string, cwd: string): Promise<string> {
   return run;
 }
 
-function runCaptureInProjectSession(prompt: string, cwd: string, provider: AiProvider): Promise<string> {
+/**
+ * Run an independent request without joining the resumable project conversation.
+ * This is for cache preparation where each prompt carries its own source evidence
+ * and many components can be prepared at the same time. Interactive requests
+ * continue to use runCapture above so their conversational context stays ordered.
+ */
+export function runCaptureIsolated(prompt: string, cwd: string): Promise<string> {
+  return runCaptureInProjectSession(prompt, cwd, activeProvider, false);
+}
+
+function runCaptureInProjectSession(prompt: string, cwd: string, provider: AiProvider, resumeProjectSession = true): Promise<string> {
   return new Promise((resolve) => {
     let output = '';
 
     // Write prompt to a temp file and pass via stdin to avoid shell arg length limits
-    const tmpFile = require('os').tmpdir() + '/rex-canvas-prompt-' + Date.now() + '.txt';
+    const requestId = crypto.randomUUID();
+    const tmpFile = require('os').tmpdir() + '/rex-canvas-prompt-' + requestId + '.txt';
     require('fs').writeFileSync(tmpFile, prompt, 'utf8');
     // Codex emits progress and tool events to its normal output. Ask it to put
     // just the final assistant message in a file so structured canvas replies
     // are not polluted by those events.
     const finalMessageFile = provider === 'codex'
-      ? require('os').tmpdir() + '/rex-canvas-codex-final-' + Date.now() + '.txt'
+      ? require('os').tmpdir() + '/rex-canvas-codex-final-' + requestId + '.txt'
       : null;
 
     // Claude supports resumable sessions. Other CLIs receive the complete prompt
@@ -183,11 +194,15 @@ function runCaptureInProjectSession(prompt: string, cwd: string, provider: AiPro
     const sessionKey = `${provider}:${cwd}`;
     let cmd: string;
     if (provider === 'claude') {
+      if (!resumeProjectSession) {
+        cmd = CLAUDE_BIN + ' --print < "' + tmpFile + '"';
+      } else {
       const sessionId = projectSessionId(sessionKey);
       const sessionFlag = (initializedProjectSessions.has(sessionKey) || (!!loadStoredSessions()[sessionKey] && !newlyCreatedProjectSessions.has(sessionKey)))
         ? '--resume ' + sessionId
         : '--session-id ' + sessionId;
       cmd = CLAUDE_BIN + ' --print ' + sessionFlag + ' < "' + tmpFile + '"';
+      }
     } else if (provider === 'codex') {
       cmd = 'codex exec --skip-git-repo-check --output-last-message "' + finalMessageFile + '" "$(cat "' + tmpFile + '")"';
     } else {
@@ -215,7 +230,7 @@ function runCaptureInProjectSession(prompt: string, cwd: string, provider: AiPro
         try { require('fs').unlinkSync(finalMessageFile); } catch {}
       }
       try { require('fs').unlinkSync(tmpFile); } catch {} // cleanup temp file
-      if (provider === 'claude') initializedProjectSessions.add(sessionKey);
+      if (provider === 'claude' && resumeProjectSession) initializedProjectSessions.add(sessionKey);
       resolve(output);
     });
 

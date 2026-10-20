@@ -256,8 +256,10 @@ export default function Canvas({ diagramData, activeKind = 'structure', onAPIRea
       return;
     }
 
-    // Fingerprint = active kind + its mermaid source; redraw only when it changes
-    const key = `${activeKind}|${mermaid.length}|${mermaid.slice(0, 64)}`;
+    // Keep the full Mermaid source in the fingerprint. Two cached diagrams can
+    // legitimately share a prefix and length; treating them as identical leaves
+    // Electron showing an old or empty canvas after a cache restore.
+    const key = `${activeKind}|${mermaid}`;
     if (key === lastDiagramKey.current) return;
     // Don't reload base scene while drilldown or code flow is active — it would wipe the overlay
     if (drilldownActiveRef.current || flowActiveRef.current) return;

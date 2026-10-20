@@ -50,6 +50,15 @@ function repositoryAuthor(folder: string): string | null {
   } catch { return null; }
 }
 
+/** Extract the repository slug from HTTPS, SSH, or file-style Git remote URLs. */
+function repositoryName(remoteUrl?: string): string {
+  const remote = remoteUrl?.trim()
+    .replace(/[?#].*$/, '')
+    .replace(/\/+$/, '');
+  const name = remote?.split(/[/:]/).filter(Boolean).pop()?.replace(/\.git$/i, '');
+  return name || 'repository';
+}
+
 function supabaseClient() {
   const url = value('NEXT_PUBLIC_SUPABASE_URL') ?? value('SUPABASE_URL');
   const key = value('NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY') ?? value('SUPABASE_PUBLISHABLE_KEY');
@@ -87,7 +96,7 @@ export async function syncAnalysisToSupabase(snapshot: SupabaseAnalysisSnapshot)
   if (!supabase) return;
   const { error } = await supabase.from('repository_analysis_cache').upsert({
     repository_key: repositoryKey,
-    repository_name: snapshot.folder.split(/[\/]/).filter(Boolean).pop() || 'repository',
+    repository_name: repositoryName(snapshot.remoteUrl),
     repository_description: snapshot.description.slice(0, 500),
     repository_author: repositoryAuthor(snapshot.folder),
     repository_url: snapshot.remoteUrl ?? null,

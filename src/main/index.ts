@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as crypto from 'crypto';
 import { execSync } from 'child_process';
-import { createPty, writeToPty, resizePty, killPty, restartPty, runCapture as runProviderCapture, setPtyDataCallback, getPtyCwd, getAiProvider, setAiProvider, AI_PROVIDERS, AiProvider } from './ptyManager';
+import { createPty, writeToPty, resizePty, killPty, restartPty, runCapture as runProviderCapture, runCaptureIsolated, setPtyDataCallback, getPtyCwd, getAiProvider, setAiProvider, AI_PROVIDERS, AiProvider } from './ptyManager';
 import { startFileWatcher, stopFileWatcher } from './fileWatcher';
 import { extractStructure, toClaudePromptJSON, ExtractedStructure, CodeNode } from './codeExtractor';
 import { buildGraphifyIndex, graphifyPromptContext, graphifySourceFiles } from './graphifyContext';
@@ -24,6 +24,20 @@ let preferredDiagramType = 'flowchart'; // updated by renderer type picker
 let analysisDepth: 1 | 2 | 3 = 2; // overview, balanced, deep — set by the user
 let accountService: AccountService | null = null;
 let currentRepositoryAccess: RepositoryAccess | null = null;
+// Electron's did-finish-load fires before React is guaranteed to have attached
+// its IPC listeners.  Delay restoration of a cached canvas until the renderer
+// explicitly reports that those listeners are ready.
+let rendererReadyPromise: Promise<void> | null = null;
+let resolveRendererReady: (() => void) | null = null;
+
+function resetRendererReady() {
+  rendererReadyPromise = new Promise(resolve => { resolveRendererReady = resolve; });
+}
+
+function waitForRendererReady() {
+  if (!rendererReadyPromise) resetRendererReady();
+  return rendererReadyPromise!;
+}
 // A background preparation belongs to one analysis snapshot. Incrementing this
 // stops any remaining work when the user analyses again or opens another repo.
 let componentWarmupGeneration = 0;
@@ -42,6 +56,10 @@ function analysisDepthGuidance(): string {
 // including focused questions and change/commit explanations.
 function runCapture(prompt: string, cwd: string): Promise<string> {
   return runProviderCapture(`${prompt}\n\n${analysisDepthGuidance()}`, cwd);
+}
+
+function runIsolatedCapture(prompt: string, cwd: string): Promise<string> {
+  return runCaptureIsolated(`${prompt}\n\n${analysisDepthGuidance()}`, cwd);
 }
 
 function aiProviderSettingsFile() { return path.join(app.getPath('userData'), 'ai-provider.json'); }
@@ -136,6 +154,24 @@ function saveWalkthroughSettings(settings: WalkthroughSettings): WalkthroughSett
   return walkthroughSettings;
 }
 
+type WarmupStage = 'drill' | 'story' | 'walkthrough';
+
+interface ComponentWarmupState {
+  drill?: boolean;
+  story?: boolean;
+  walkthrough?: boolean;
+  updatedAt: number;
+}
+
+/** Persisted so a quit/relaunch resumes unfinished component preparation. */
+interface ComponentWarmupQueue {
+  version: 1;
+  analysisHash: string;
+  components: Record<string, ComponentWarmupState>;
+  completed?: boolean;
+  updatedAt: number;
+}
+
 interface CacheFile {
   structureHash: string;
   provider?: AiProvider;
@@ -145,6 +181,7 @@ interface CacheFile {
   codeflows: Record<string, string>;
   commitDiagrams?: Record<string, CommitDiagram>;
   lastSession?: SessionPanel[];
+  warmup?: ComponentWarmupQueue;
   /** Options that shaped the cached result, so cache-only viewers can explain it. */
   analysisOptions?: { depth: 1 | 2 | 3; walkthroughSettings: WalkthroughSettings; savedAt: number };
   savedAt: number;
@@ -432,6 +469,10 @@ function saveCache(folder: string, data: Partial<CacheFile> & { diagram: object;
       drilldowns: { ...(existing?.drilldowns ?? {}), ...(data.drilldowns ?? {}) },
       codeflows: { ...(existing?.codeflows ?? {}), ...(data.codeflows ?? {}) },
       commitDiagrams: { ...(existing?.commitDiagrams ?? {}), ...(data.commitDiagrams ?? {}) },
+      // Component entries are fingerprinted from their source evidence. Retain
+      // them across analyses: stale keys cannot be selected, while unchanged
+      // components are immediately reusable.
+      warmup: existing?.warmup?.analysisHash === data.structureHash ? existing.warmup : undefined,
       analysisOptions: cacheAnalysisOptions(),
       savedAt: now,
     };
@@ -450,17 +491,6 @@ function saveDrilldown(folder: string, componentName: string, mermaid: string) {
     if (!existing) return;
     existing.drilldowns[componentName] = mermaid;
     existing.analysisOptions = cacheAnalysisOptions();
-    existing.savedAt = Date.now();
-    writeCache(folder, existing);
-  } catch { /* ignore */ }
-}
-
-function invalidateDrilldowns(folder: string) {
-  try {
-    const existing = loadCache(folder);
-    if (!existing) return;
-    existing.drilldowns = {};
-    existing.codeflows = {};
     existing.savedAt = Date.now();
     writeCache(folder, existing);
   } catch { /* ignore */ }
@@ -1075,6 +1105,7 @@ function createWindow() {
   loadAiProvider();
   walkthroughSettings = loadWalkthroughSettings();
   accountService = new AccountService(app.getPath('userData'), url => shell.openExternal(url));
+  resetRendererReady();
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -1097,7 +1128,12 @@ function createWindow() {
   mainWindow.loadFile(path.join(__dirname, '../../dist/renderer/index.html'));
 
   mainWindow.webContents.on('did-finish-load', () => {
-    if (!mainWindow) return;
+    void (async () => {
+      // The renderer registers its event listeners during its first React
+      // render. Without this handshake, the initial canvas:diagram event can
+      // be lost, leaving a valid cached diagram blank only in Electron.
+      await waitForRendererReady();
+      if (!mainWindow || mainWindow.isDestroyed()) return;
     createPty(mainWindow);
     setupPtyClaudeDetection();
 
@@ -1138,6 +1174,7 @@ function createWindow() {
         if (restorablePanels.length) {
           mainWindow.webContents.send('canvas:restoreSession', restorablePanels);
         }
+        if (cached) scheduleComponentCacheWarmup(last, restoredDiagram, cached.structureHash);
         } else {
           mainWindow.webContents.send('folder:restored', { folder: last, hasCachedDiagram: false });
         }
@@ -1148,6 +1185,7 @@ function createWindow() {
         });
       });
     }
+    })();
   });
 
   mainWindow.on('closed', () => {
@@ -1168,6 +1206,11 @@ app.on('activate', () => { if (mainWindow === null) createWindow(); });
 ipcMain.handle('ai:getProvider', () => ({ provider: getAiProvider(), providers: AI_PROVIDERS }));
 ipcMain.handle('ai:setProvider', (_e, provider: string) => ({ provider: saveAiProvider(provider), providers: AI_PROVIDERS }));
 ipcMain.handle('analysis:getDepth', () => analysisDepth);
+ipcMain.handle('renderer:ready', () => {
+  resolveRendererReady?.();
+  resolveRendererReady = null;
+  return true;
+});
 ipcMain.handle('walkthrough:getSettings', () => walkthroughSettings);
 ipcMain.handle('walkthrough:setSettings', (_e, settings: WalkthroughSettings) => saveWalkthroughSettings(settings));
 ipcMain.handle('analysis:setDepth', (_e, depth: number) => {
@@ -1220,6 +1263,7 @@ async function openProject(folder: string, access: RepositoryAccess) {
     if (restorablePanels.length) {
       mainWindow.webContents.send('canvas:restoreSession', restorablePanels);
     }
+    if (cached) scheduleComponentCacheWarmup(folder, restoredDiagram, cached.structureHash);
   }
 
   startFileWatcher(folder, (changedFiles) => {
@@ -1253,6 +1297,32 @@ ipcMain.handle('cache:clearProject', () => {
   const ok = clearProjectCache(currentFolder);
   if (ok) currentDiagram = null;
   return ok ? { ok: true } : { ok: false, error: 'Could not clear the project cache' };
+});
+
+/** Explicit user-requested upload of the current project snapshot. */
+ipcMain.handle('supabase:syncCurrent', async () => {
+  if (!currentFolder) return { ok: false, error: 'No project is open' };
+  const cache = loadCache(currentFolder);
+  if (!cache?.diagram) return { ok: false, error: 'Run Analyse before pushing this project to Supabase' };
+  try {
+    const access = currentRepositoryAccess ?? await getRepositoryAccess(currentFolder);
+    currentRepositoryAccess = access;
+    const account = accountService?.getState().user ?? null;
+    await syncAnalysisToSupabase({
+      folder: currentFolder,
+      structureHash: cache.structureHash,
+      cache,
+      analysis: cache.diagram,
+      description: String((cache.diagram as { pattern?: unknown }).pattern ?? 'Repository analysis'),
+      provider: cache.provider ?? getAiProvider(),
+      visibility: access.kind,
+      remoteUrl: access.remoteUrl,
+      publishedBy: account,
+    });
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
 });
 
 async function runAnalysisInternal(): Promise<{ ok?: boolean; error?: string; fromCache?: boolean }> {
@@ -1322,15 +1392,15 @@ async function runAnalysisInternal(): Promise<{ ok?: boolean; error?: string; fr
     currentDiagram = diagram;
     currentNodePaths = structure.nodePaths;
 
-    // Persist to cache; structure changed so drilldowns and Code Stories are stale.
+    // Component entries are evidence-fingerprinted. Keep reusable entries and
+    // let the new queue regenerate only components whose evidence changed.
     const cacheSaved = saveCache(currentFolder, { structureHash, diagram });
-    invalidateDrilldowns(currentFolder);
 
     mainWindow.webContents.send('canvas:diagram', diagram);
     if (!cacheSaved) mainWindow.webContents.send('analysis:statusDetail', 'Diagram generated, but it could not be saved to cache.');
     mainWindow.webContents.send('analysis:status', 'done');
     sendGitStatus(mainWindow);
-    if (cacheSaved) scheduleComponentCacheWarmup(currentFolder, diagram);
+    if (cacheSaved) scheduleComponentCacheWarmup(currentFolder, diagram, structureHash);
 
     return { ok: true };
   } catch (err: unknown) {
@@ -1824,7 +1894,7 @@ function buildDrilldownPrompt(name: string, sourceCode: string, imports: string[
   ].filter(Boolean).join('\n');
 }
 
-async function runComponentDrilldown(rawName: string): Promise<{ ok?: boolean; error?: string; mermaid?: string; fromCache?: boolean }> {
+async function runComponentDrilldown(rawName: string, isolated = false): Promise<{ ok?: boolean; error?: string; mermaid?: string; fromCache?: boolean }> {
   const name = rawName.trim();
   if (!currentFolder || !name) return { error: 'no component' };
   try {
@@ -1874,7 +1944,7 @@ async function runComponentDrilldown(rawName: string): Promise<{ ok?: boolean; e
     const hierarchyContext = buildHierarchyContext(sourceFiles);
     const graphEvidence = graphifyPromptContext(currentFolder, name).evidence;
     const prompt = buildDrilldownPrompt(name, contextForClaude, imports, calledBy.slice(0, 8), hierarchyContext, graphEvidence);
-    const raw = await runCapture(prompt, currentFolder);
+    const raw = await (isolated ? runIsolatedCapture : runCapture)(prompt, currentFolder);
     const parsed = extractJson(raw) as { mermaid?: string } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
 
@@ -2469,7 +2539,7 @@ async function runRepositoryImplementation(): Promise<{ ok?: boolean; error?: st
   } catch (err: unknown) { return { error: err instanceof Error ? err.message : String(err) }; }
 }
 
-async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; dataFlow?: Record<string, DataFlowSnapshot>; happyPath?: string[]; fromCache?: boolean }> {
+async function runComponentCodeFlow(rawName: string, _drillMermaid = '', isolated = false): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; dataFlow?: Record<string, DataFlowSnapshot>; happyPath?: string[]; fromCache?: boolean }> {
   const name = rawName.trim();
   if (!currentFolder || !name) return { error: 'no component' };
   try {
@@ -2485,7 +2555,7 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
           // Regenerate malformed cache data.
         }
       }
-      const raw = await runCapture(buildRepositoryCodeStoryPrompt(groundedStructureJson(currentFolder, structure).json), currentFolder);
+      const raw = await (isolated ? runIsolatedCapture : runCapture)(buildRepositoryCodeStoryPrompt(groundedStructureJson(currentFolder, structure).json), currentFolder);
       const parsed = extractJson(raw) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
       if (!parsed?.mermaid) return { error: 'no mermaid in response' };
       const happyPath = parsed.happyPath ?? [];
@@ -2525,7 +2595,8 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
       ? `SELECTED CONNECTION (explain this handoff, not either endpoint in isolation): ${handoff.from} → ${handoff.to}. Data or action carried: ${handoff.data}.\n\n`
       : '';
     const hierarchyContext = [buildHierarchyContext(sourceFiles), graphifyPromptContext(currentFolder, name).evidence].filter(Boolean).join('\n\n');
-    const raw = await runCapture(buildCodeStoryPrompt(
+    const capture = isolated ? runIsolatedCapture : runCapture;
+    const raw = await capture(buildCodeStoryPrompt(
       name,
       handoffContext + sourceCode,
       hierarchyContext,
@@ -2537,7 +2608,7 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = ''): Promis
     // The first pass establishes the flow; this second pass fills in contracts
     // that a newcomer needs to follow the implementation with confidence.
     if (shouldRunCodeStoryReview(sourceCode, parsed)) try {
-      const reviewed = extractJson(await runCapture(
+      const reviewed = extractJson(await capture(
         buildCodeStoryNewbieReviewPrompt(name, sourceCode, hierarchyContext, parsed, getAiProvider() === 'claude'),
         currentFolder,
       )) as { mermaid?: string; descriptions?: Record<string, string>; dataFlow?: Record<string, DataFlowSnapshot>; happyPath?: string[] } | null;
@@ -2703,7 +2774,7 @@ async function runActualCodeFlow(rawName: string): Promise<{ ok: boolean; error?
 
 ipcMain.handle('component:actualCodeFlow', (_e, rawName: string) => runActualCodeFlow(rawName));
 
-async function runComponentImplementation(rawName: string, drillMermaid = ''): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] }> {
+async function runComponentImplementation(rawName: string, drillMermaid = '', isolated = false): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] }> {
   const name = rawName.trim();
   if (!currentFolder || !name) return { error: 'no component' };
   try {
@@ -2732,7 +2803,7 @@ async function runComponentImplementation(rawName: string, drillMermaid = ''): P
       ? '\n\nFEATURE SCOPE ONLY — this is a user-facing flow. Use it only to identify the feature and its outcomes. Do NOT repeat, paraphrase, or draw its user steps. Explain the source-proven component contracts that make those outcomes happen instead:\n' + drillMermaid
       : '';
     const hierarchyContext = [buildHierarchyContext(sourceFiles), graphifyPromptContext(currentFolder, name).evidence].filter(Boolean).join('\n\n');
-    const parsed = extractJson(await runCapture(buildImplementationPrompt(name, sourceCode + handoffScope + scope, hierarchyContext, walkthroughSettings), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
+    const parsed = extractJson(await (isolated ? runIsolatedCapture : runCapture)(buildImplementationPrompt(name, sourceCode + handoffScope + scope, hierarchyContext, walkthroughSettings), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
     const result = { version: 37, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {}, happyPath: parsed.happyPath ?? [] };
     saveCodeFlow(currentFolder, cacheKey, JSON.stringify(result));
@@ -2752,59 +2823,146 @@ ipcMain.handle('project:implementation', () => runRepositoryImplementation());
 function componentLabelsForWarmup(diagram: object): string[] {
   const structure = (diagram as { diagrams?: { structure?: unknown } }).diagrams?.structure;
   if (typeof structure !== 'string') return [];
-  const labels = new Set<string>();
-  const node = /[A-Za-z][A-Za-z0-9_]*\s*\[\s*(?:"([^"]+)"|([^\]]+))\s*\]/g;
+  const labelsById = new Map<string, string>();
+  const declarationOrder = new Map<string, number>();
+  const node = /([A-Za-z][A-Za-z0-9_]*)\s*\[\s*(?:"([^"]+)"|([^\]]+))\s*\]/g;
   let match: RegExpExecArray | null;
   while ((match = node.exec(structure))) {
-    const label = String(match[1] ?? match[2] ?? '')
+    const label = String(match[2] ?? match[3] ?? '')
       .replace(/<br\s*\/?\s*>/gi, ' ')
       .replace(/\s+/g, ' ')
       .trim();
-    if (label) labels.add(label);
+    if (!label || labelsById.has(match[1])) continue;
+    labelsById.set(match[1], label);
+    declarationOrder.set(match[1], declarationOrder.size);
   }
-  return [...labels];
+  if (labelsById.size === 0) return [];
+
+  // People most often inspect the high-level hubs directly below an entry
+  // point. Rank those first, then their broad downstream branches. This uses
+  // only the source-backed analysis map and never asks the model to guess.
+  const outgoing = new Map<string, Set<string>>();
+  const incoming = new Set<string>();
+  const edge = /^\s*([A-Za-z][A-Za-z0-9_]*)\s*(?:\[[^\]]*\]|\([^)]*\)|\{[^}]*\})?\s*(?:-->|==>|-\.->|---)\s*(?:\|[^|]*\|\s*)?([A-Za-z][A-Za-z0-9_]*)/;
+  for (const line of structure.split('\n')) {
+    const pair = line.match(edge);
+    if (!pair || !labelsById.has(pair[1]) || !labelsById.has(pair[2])) continue;
+    const targets = outgoing.get(pair[1]) ?? new Set<string>();
+    targets.add(pair[2]);
+    outgoing.set(pair[1], targets);
+    incoming.add(pair[2]);
+  }
+
+  const roots = [...labelsById.keys()].filter(id => !incoming.has(id));
+  const depth = new Map<string, number>();
+  const frontier = roots.map(id => ({ id, depth: 0 }));
+  while (frontier.length) {
+    const current = frontier.shift()!;
+    if ((depth.get(current.id) ?? Infinity) <= current.depth) continue;
+    depth.set(current.id, current.depth);
+    for (const target of outgoing.get(current.id) ?? []) frontier.push({ id: target, depth: current.depth + 1 });
+  }
+
+  const descendants = (id: string) => {
+    const seen = new Set<string>();
+    const visit = (value: string) => {
+      for (const next of outgoing.get(value) ?? []) if (!seen.has(next)) { seen.add(next); visit(next); }
+    };
+    visit(id);
+    return seen.size;
+  };
+
+  return [...labelsById.keys()]
+    .sort((a, b) => {
+      const score = (id: string) => {
+        const d = depth.get(id) ?? 9;
+        const level = d === 1 ? 1200 : d === 2 ? 800 : d === 0 ? 500 : Math.max(0, 500 - d * 60);
+        return level + descendants(id) * 25 + (outgoing.get(id)?.size ?? 0) * 80;
+      };
+      return score(b) - score(a) || (declarationOrder.get(a)! - declarationOrder.get(b)!);
+    })
+    .map(id => labelsById.get(id)!);
 }
 
-const backgroundPause = () => new Promise<void>(resolve => setTimeout(resolve, 250));
+function initialiseWarmupQueue(folder: string, analysisHash: string, components: string[]): ComponentWarmupQueue | null {
+  const cache = loadCache(folder);
+  if (!cache) return null;
+  const existing = cache.warmup;
+  const componentsState: Record<string, ComponentWarmupState> =
+    existing?.version === 1 && existing.analysisHash === analysisHash ? { ...existing.components } : {};
+  const now = Date.now();
+  for (const name of components) componentsState[name] ??= { updatedAt: now };
+  for (const name of Object.keys(componentsState)) if (!components.includes(name)) delete componentsState[name];
+  const queue: ComponentWarmupQueue = {
+    version: 1, analysisHash, components: componentsState,
+    completed: components.length > 0 && components.every(name => {
+      const state = componentsState[name];
+      return !!state?.drill && !!state?.story && !!state?.walkthrough;
+    }),
+    updatedAt: now,
+  };
+  cache.warmup = queue;
+  cache.savedAt = now;
+  writeCache(folder, cache);
+  return queue;
+}
+
+function warmupState(folder: string, analysisHash: string, name: string): ComponentWarmupState | null {
+  const queue = loadCache(folder)?.warmup;
+  return queue?.version === 1 && queue.analysisHash === analysisHash ? (queue.components[name] ?? null) : null;
+}
+
+function recordWarmupStage(folder: string, analysisHash: string, name: string, stage: WarmupStage) {
+  const cache = loadCache(folder);
+  const queue = cache?.warmup;
+  if (!cache || !queue || queue.version !== 1 || queue.analysisHash !== analysisHash) return;
+  const now = Date.now();
+  queue.components[name] = { ...(queue.components[name] ?? { updatedAt: now }), [stage]: true, updatedAt: now };
+  queue.completed = Object.values(queue.components).every(state => !!state.drill && !!state.story && !!state.walkthrough);
+  queue.updatedAt = now;
+  cache.savedAt = now;
+  writeCache(folder, cache);
+}
 
 /**
  * Prepare the first selectable layer for every analysis component after the
- * base diagram is ready. Work is strictly sequential because all AI actions
- * share one project conversation; that preserves context and lets an explicit
- * user request enter between background calls. Each result saves itself to the
- * ordinary local/Supabase cache as soon as it is produced.
+ * base diagram is ready. Each request has complete source evidence and uses
+ * an isolated AI invocation, so all artifacts can be prepared concurrently
+ * without interleaving prompts in the interactive project conversation. Each
+ * result saves itself to the ordinary local/Supabase cache as it arrives.
  */
-function scheduleComponentCacheWarmup(folder: string, diagram: object) {
+function scheduleComponentCacheWarmup(folder: string, diagram: object, analysisHash: string) {
   const generation = ++componentWarmupGeneration;
   const components = componentLabelsForWarmup(diagram);
   if (components.length === 0) return;
+  const queue = initialiseWarmupQueue(folder, analysisHash, components);
+  if (!queue || queue.completed) return;
 
   void (async () => {
-    console.log(`[cache-warmup] preparing first-level Drill, Code Story, and Code Walkthrough for ${components.length} components`);
-    for (const [index, name] of components.entries()) {
-      // Do not let an old project or superseded analysis continue spending
-      // tokens. The in-flight call is allowed to finish safely; no next call is
-      // started once its snapshot is no longer current.
-      if (generation !== componentWarmupGeneration || currentFolder !== folder || currentDiagram !== diagram) return;
-
+    const complete = components.filter(name => {
+      const state = queue.components[name];
+      return state?.drill && state?.story && state?.walkthrough;
+    }).length;
+    console.log(`[cache-warmup] resuming ${complete}/${components.length} prepared components`);
+    const jobs = components.flatMap((name, index) => {
+      const state = warmupState(folder, analysisHash, name);
       const prefix = `[cache-warmup] ${index + 1}/${components.length} ${name}`;
-      console.log(`${prefix} — Drill`);
-      const drill = await runComponentDrilldown(name);
-      if (!drill.ok) console.warn(`${prefix} — Drill skipped: ${drill.error ?? 'no result'}`);
-      await backgroundPause();
-
-      if (generation !== componentWarmupGeneration || currentFolder !== folder || currentDiagram !== diagram) return;
-      console.log(`${prefix} — Code Story`);
-      const story = await runComponentCodeFlow(name);
-      if (!story.ok) console.warn(`${prefix} — Code Story skipped: ${story.error ?? 'no result'}`);
-      await backgroundPause();
-
-      if (generation !== componentWarmupGeneration || currentFolder !== folder || currentDiagram !== diagram) return;
-      console.log(`${prefix} — Code Walkthrough`);
-      const walkthrough = await runComponentImplementation(name);
-      if (!walkthrough.ok) console.warn(`${prefix} — Code Walkthrough skipped: ${walkthrough.error ?? 'no result'}`);
-      await backgroundPause();
-    }
+      const prepare = async (stage: WarmupStage, label: string, work: () => Promise<{ ok?: boolean; error?: string }>) => {
+        // Do not start work for an old project or superseded analysis. Work
+        // already started can finish harmlessly into its fingerprinted cache.
+        if (generation !== componentWarmupGeneration || currentFolder !== folder || currentDiagram !== diagram) return;
+        console.log(`${prefix} — ${label}`);
+        const result = await work();
+        if (result.ok) recordWarmupStage(folder, analysisHash, name, stage);
+        else console.warn(`${prefix} — ${label} skipped: ${result.error ?? 'no result'}`);
+      };
+      return [
+        !state?.drill && prepare('drill', 'Drill', () => runComponentDrilldown(name, true)),
+        !state?.story && prepare('story', 'Code Story', () => runComponentCodeFlow(name, '', true)),
+        !state?.walkthrough && prepare('walkthrough', 'Code Walkthrough', () => runComponentImplementation(name, '', true)),
+      ].filter((job): job is Promise<void> => Boolean(job));
+    });
+    await Promise.all(jobs);
     if (generation === componentWarmupGeneration && currentFolder === folder && currentDiagram === diagram) {
       console.log('[cache-warmup] first-level component preparation complete');
     }
