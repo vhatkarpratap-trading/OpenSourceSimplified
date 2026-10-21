@@ -43,13 +43,13 @@ function waitForRendererReady() {
 let componentWarmupGeneration = 0;
 
 function diagramReadabilityGuidance(): string {
-  return 'DIAGRAM READABILITY — PRIORITISE, DO NOT INVENT A FIXED CAP: Tell one clear primary execution path first. A visible card earns its place only when it is an entry point, coordinator/orchestrator, state read or write with a consequence, HTTP/DB/gRPC/IPC/external boundary, meaningful auth/validation/decision/error branch, cross-component handoff, or final outcome. Fold trivial helpers, framework plumbing, repeated transforms, getters/setters, logging, and closely coupled local mechanics into their nearest important card and explain them in that card description. Keep HTTP/DB/gRPC/auth/error boundaries visible when source-proven, but use one compact contract card per logical boundary rather than separate cards for request plumbing, client wrappers, and response plumbing. Put payload shapes, return values, and implementation detail in descriptions and labelled arrows, not extra nodes. Choose detail adaptively: overview usually needs about 5–8 significant cards; balanced about 8–12; deep about 10–16 only when the source proves independently important paths or boundaries. These are readability targets, not limits: exceed them only for a distinct critical boundary or outcome. Keep labels concise and merge any card that does not change the reader’s understanding of control, data, or outcome.';
+  return 'DIAGRAM READABILITY — ADAPTIVE, EVIDENCE-DRIVEN DETAIL: Choose the number of visible nodes from the source-proven story; there is no fixed node limit. First tell one clear primary path, then add a node only when it materially improves understanding of control, data, or outcome. A visible node earns its place when it is an entry point, coordinator/orchestrator, state read or write with a consequence, HTTP/DB/gRPC/IPC/external boundary, meaningful auth/validation/decision/error branch, cross-component handoff, or final outcome. Prioritise nodes that are central to the proven execution path or a selected focus area. Fold trivial helpers, framework plumbing, repeated transforms, getters/setters, logging, and closely coupled local mechanics into the nearest meaningful card. When a story is complex, keep distinct consequential paths visible but group closely related steps under a clear hub rather than flattening every mechanic into the canvas. Keep HTTP/DB/gRPC/auth/error boundaries visible when source-proven, but use one compact contract card per logical boundary rather than separate request plumbing, client wrappers, and response plumbing. Put payload shapes, return values, and implementation detail in descriptions and labelled arrows rather than extra nodes. Every visible node must be source-proven, connected to the story, and concise.';
 }
 
 function analysisDepthGuidance(): string {
-  if (analysisDepth === 1) return 'DEPTH: Overview. Prefer one primary path and roughly 5–8 significant cards. Include only critical boundaries and outcomes; summarise mechanics in descriptions.';
-  if (analysisDepth === 3) return 'DEPTH: Deep. Aim for roughly 10–16 significant cards when the source proves distinct paths. Include critical alternatives/errors and boundary contracts, but still merge local mechanics that do not independently alter the outcome.';
-  return 'DEPTH: Balanced. Prefer one primary path with roughly 8–12 significant cards, plus only the choices and communications needed to understand the outcome.';
+  if (analysisDepth === 1) return 'DEPTH: Overview. Show the smallest complete source-proven primary story: its entry, consequential boundaries or decisions, and outcomes. Fold supporting mechanics into descriptions.';
+  if (analysisDepth === 3) return 'DEPTH: Deep. Show all source-proven paths, alternatives, errors, and boundary contracts that materially change understanding. Group related mechanics instead of omitting consequential steps.';
+  return 'DEPTH: Balanced. Show the primary path plus the source-proven choices, communications, and boundaries needed to understand the outcome. Group low-level mechanics into their nearest meaningful step.';
 }
 
 // All main-process AI actions inherit the user's selected detail level,
@@ -154,19 +154,29 @@ function saveWalkthroughSettings(settings: WalkthroughSettings): WalkthroughSett
   return walkthroughSettings;
 }
 
-type WarmupStage = 'drill' | 'story' | 'walkthrough';
+type WarmupStage = 'detail' | 'drill' | 'story' | 'walkthrough';
+type ProjectWarmupStage = 'codeStory' | 'architecture' | 'walkthrough';
 
 interface ComponentWarmupState {
+  detail?: boolean;
   drill?: boolean;
   story?: boolean;
   walkthrough?: boolean;
   updatedAt: number;
 }
 
+interface ProjectWarmupState {
+  codeStory?: boolean;
+  architecture?: boolean;
+  walkthrough?: boolean;
+  updatedAt: number;
+}
+
 /** Persisted so a quit/relaunch resumes unfinished component preparation. */
 interface ComponentWarmupQueue {
-  version: 1;
+  version: 2;
   analysisHash: string;
+  project: ProjectWarmupState;
   components: Record<string, ComponentWarmupState>;
   completed?: boolean;
   updatedAt: number;
@@ -621,7 +631,7 @@ function buildRelationshipGraphMermaid(structure: ExtractedStructure): string {
 
 // Analysis starts with the product experience. Technical detail is deliberately
 // deferred to Code Story and Implementation, which are progressive disclosures.
-const ANALYSIS_SCHEMA_VERSION = 'user-interaction-map-v12';
+const ANALYSIS_SCHEMA_VERSION = 'user-interaction-map-v14-adaptive-detail';
 
 /** File and symbol names are insufficient to infer product behaviour. */
 function buildAnalysisSourceContext(structure: ExtractedStructure): string {
@@ -690,8 +700,8 @@ function buildClaudePrompt(structure: ExtractedStructure, structureJson: string,
     '',
     'COMPACT USER MAP RULES for diagrams.structure:',
     '- This is a readable navigation overview, NOT a full interaction trace. It must be legible at a normal canvas zoom, not a wall of parallel boxes. Start at opening the app, then show every independently reachable user area as one clear branch.',
-    '- Preserve every evidenced user area, but represent it as an information hierarchy: use 3–6 plain-language journey hubs below the opening node, then place related actions below each hub. A hub can summarize a closely related set of actions. For example, “Find and read content” can cover search, opening a result, reading, saving, and sharing.',
-    '- Never put more than six direct branches below the opening node or more than four action boxes below a hub. When the evidence has more areas, choose a better grouping label instead of making another parallel branch. The detailed step-by-step paths belong in diagrams.sequence.',
+    '- Preserve every evidenced user area, but represent it as an information hierarchy: use as few plain-language journey hubs below the opening node as the evidence allows, then place related actions below each hub. A hub can summarize a closely related set of actions. For example, “Find and read content” can cover search, opening a result, reading, saving, and sharing.',
+    '- Let the evidence decide how many branches and actions the overview needs. Prefer a clearer grouping label over a new parallel card when steps share one user goal; keep a distinct card when it represents an independently reachable area, meaningful choice, or outcome. The detailed step-by-step paths belong in diagrams.sequence.',
     '- Include every evidenced user area. Keep a strict tree with one opening node, meaningful action branches, and result nodes where they clarify an outcome.',
     '- Never draw return arrows, cross-links, repeated nodes, or more than two levels below the opening node. Each node must have one parent so the map remains readable.',
     '- Every branch must answer “what can the user do?” Use action-led labels such as “Tap Search”, “Tap Explore”, “Tap Saved articles”, “Open Nearby map”, “Open Games”, or “Open Settings”. Do not use destination-only labels.',
@@ -724,6 +734,35 @@ interface AnalysisDiagram {
   pattern?: string;
   diagrams?: { structure?: string; sequence?: string; gitDiff?: string };
   descriptions?: Record<string, string>;
+}
+
+interface ProjectFlowArtifact {
+  mermaid?: string;
+  descriptions?: Record<string, string>;
+  happyPath?: string[];
+}
+
+interface ProjectUnderstanding extends AnalysisDiagram {
+  projectViews?: {
+    codeStory?: ProjectFlowArtifact;
+    architecture?: ProjectFlowArtifact & { document?: ArchitectureDocument };
+    codeWalkthrough?: ProjectFlowArtifact;
+  };
+}
+
+/** One shared reading of the repository produces the top-level learning views. */
+function buildProjectUnderstandingPrompt(structure: ExtractedStructure, structureJson: string, sourceContext: string): string {
+  return [
+    'Understand this repository once and return four complementary, source-proven learning views. Output ONLY JSON—no markdown or prose outside JSON.',
+    analysisDepthGuidance(), diagramReadabilityGuidance(), '',
+    'The visible cards in every view must be consequential: entry points, orchestration, meaningful decisions, state changes, boundaries, handoffs, errors, or outcomes. Fold helpers and repeated mechanics into their nearest meaningful card.',
+    'userFlow is product-facing: show what a person can do, with no implementation terms. architecture explains the proven system boundaries, major components, data/integration paths, and a short evidence-based document. codeStory explains the whole project running: trigger → data/control flow → result. codeWalkthrough explains how meaningful features are implemented, including proven contracts.',
+    'Never invent behavior, components, endpoints, data fields, or infrastructure. Use plain language in cards; keep implementation detail in descriptions. Use flowchart TD Mermaid only, with connected nodes and labelled edges.',
+    'JSON SCHEMA:',
+    '{"pattern":"short product map name","diagrams":{"structure":"flowchart TD...","sequence":"flowchart TD..."},"descriptions":{"Node":"user-facing meaning"},"projectViews":{"codeStory":{"mermaid":"flowchart TD...","descriptions":{},"happyPath":["A"]},"architecture":{"mermaid":"flowchart TD...","descriptions":{},"document":{"executiveSummary":"confirmed findings","technologyStack":["proven fact"],"sections":[{"title":"High-level architecture","content":"confirmed explanation","evidence":["path"]}],"unresolved":["unknowns"]}},"codeWalkthrough":{"mermaid":"flowchart TD...","descriptions":{},"happyPath":["A"]}}}',
+    '', 'REPOSITORY STRUCTURE:', structureJson, '', 'SOURCE EVIDENCE:', sourceContext || '(No readable source excerpts were available.)', '',
+    'The project contains ' + structure.totalFiles + ' source files. JSON only.',
+  ].join('\n');
 }
 
 // ── Change context prompt ─────────────────────────────────────────────────────
@@ -966,7 +1005,7 @@ function extractJson(raw: string): object | null {
           // Some providers follow the requested diagram key directly instead
           // of nesting it in diagrams. Keep that otherwise valid response.
           || Object.values(parsed as Record<string, unknown>).some(value => typeof value === 'string' && /^(?:flowchart|graph)\s+/im.test(value.trim()))
-        )) return parsed;
+        )) return parsed as object;
       } catch { /* try the next balanced object */ }
       break;
     }
@@ -1325,7 +1364,36 @@ ipcMain.handle('supabase:syncCurrent', async () => {
   }
 });
 
-async function runAnalysisInternal(): Promise<{ ok?: boolean; error?: string; fromCache?: boolean }> {
+/** Cache the views returned by the combined project-understanding request under
+ * the same keys used by their individual UI actions. */
+function saveProjectUnderstandingViews(
+  folder: string,
+  structureJson: string,
+  analysisHash: string,
+  views: ProjectUnderstanding['projectViews'] | undefined,
+) {
+  if (!views) return;
+  const cache = loadCache(folder);
+  if (!cache) return;
+  const now = Date.now();
+  const codeStoryKey = 'v24:adaptive-detail:depth-' + analysisDepth + ':__whole_repo__:' + hashStructure(structureJson);
+  const architectureKey = '__architecture_document__:boundary-review-v8:focus-' + walkthroughSettingsFingerprint(walkthroughSettings);
+  const walkthroughKey = '__repository_implementation__:adaptive-detail-v13:depth-' + analysisDepth + ':focus-' + walkthroughSettingsFingerprint(walkthroughSettings);
+  cache.codeflows ??= {};
+  if (views.codeStory?.mermaid) cache.codeflows[codeStoryKey] = JSON.stringify({ version: 24, mermaid: views.codeStory.mermaid, descriptions: views.codeStory.descriptions ?? {}, happyPath: views.codeStory.happyPath ?? [] });
+  if (views.architecture?.mermaid) cache.codeflows[architectureKey] = JSON.stringify({ version: 8, mermaid: views.architecture.mermaid, descriptions: views.architecture.descriptions ?? {}, diagrams: { communicationFlow: views.architecture.mermaid }, document: views.architecture.document });
+  if (views.codeWalkthrough?.mermaid) cache.codeflows[walkthroughKey] = JSON.stringify({ version: 13, mermaid: views.codeWalkthrough.mermaid, descriptions: views.codeWalkthrough.descriptions ?? {} });
+  cache.warmup = {
+    version: 2, analysisHash,
+    project: { codeStory: !!views.codeStory?.mermaid, architecture: !!views.architecture?.mermaid, walkthrough: !!views.codeWalkthrough?.mermaid, updatedAt: now },
+    components: cache.warmup?.analysisHash === analysisHash ? cache.warmup.components : {},
+    completed: false, updatedAt: now,
+  };
+  cache.savedAt = now;
+  writeCache(folder, cache);
+}
+
+async function runAnalysisInternal(options: { ensureGraphify?: boolean } = {}): Promise<{ ok?: boolean; error?: string; fromCache?: boolean }> {
   if (!mainWindow || !currentFolder) return { error: 'No folder selected' };
 
   // An explicit Analyse supersedes any preparation for the previous snapshot.
@@ -1333,6 +1401,16 @@ async function runAnalysisInternal(): Promise<{ ok?: boolean; error?: string; fr
   mainWindow.webContents.send('analysis:status', 'running');
 
   try {
+    // The user-flow map is graph-backed whenever Graphify can build an index.
+    // Other project-level analyses consume the same evidence in the warmup
+    // stages that follow this primary map.
+    if (options.ensureGraphify !== false && !graphifyPromptContext(currentFolder).available) {
+      mainWindow.webContents.send('analysis:statusDetail', 'Building Graphify code graph…');
+      const graphifyResult = await buildGraphifyIndex(currentFolder, detail =>
+        mainWindow?.webContents.send('analysis:statusDetail', detail),
+      );
+      if (!graphifyResult.ok) console.warn('[graphify] index unavailable:', graphifyResult.error ?? 'unknown error');
+    }
     mainWindow.webContents.send('analysis:statusDetail', 'Extracting code structure…');
     // Graphify enriches the prompt and its content fingerprint participates in
     // the key, while the native structure stays stable across both Analyse paths.
@@ -1358,6 +1436,7 @@ async function runAnalysisInternal(): Promise<{ ok?: boolean; error?: string; fr
       mainWindow.webContents.send('analysis:statusDetail', 'Loaded from cache');
       mainWindow.webContents.send('analysis:status', 'done');
       sendGitStatus(mainWindow);
+      if (cached) scheduleComponentCacheWarmup(currentFolder, cachedDiagram, structureHash);
       return { ok: true, fromCache: true };
     }
 
@@ -1369,9 +1448,9 @@ async function runAnalysisInternal(): Promise<{ ok?: boolean; error?: string; fr
       ? ` ${graphify.resolution.reasons[0]}`
       : '';
     mainWindow.webContents.send('analysis:statusDetail', `Analysing ${structure.totalFiles} files${graphNote} with ${providerLabel()}…${graphProvenance}`);
-    const prompt = buildClaudePrompt(structure, structureJson, buildAnalysisSourceContext(structure));
+    const prompt = buildProjectUnderstandingPrompt(structure, structureJson, buildAnalysisSourceContext(structure));
     const raw = await runCapture(prompt, currentFolder);
-    const diagram = extractJson(raw) as AnalysisDiagram | null;
+    const diagram = extractJson(raw) as ProjectUnderstanding | null;
 
     try {
       fs.writeFileSync(path.join(os.tmpdir(), 'rex-last-analysis.json'),
@@ -1395,6 +1474,7 @@ async function runAnalysisInternal(): Promise<{ ok?: boolean; error?: string; fr
     // Component entries are evidence-fingerprinted. Keep reusable entries and
     // let the new queue regenerate only components whose evidence changed.
     const cacheSaved = saveCache(currentFolder, { structureHash, diagram });
+    if (cacheSaved) saveProjectUnderstandingViews(currentFolder, structureJson, structureHash, diagram.projectViews);
 
     mainWindow.webContents.send('canvas:diagram', diagram);
     if (!cacheSaved) mainWindow.webContents.send('analysis:statusDetail', 'Diagram generated, but it could not be saved to cache.');
@@ -1431,7 +1511,7 @@ ipcMain.handle('graphify:buildAndAnalyse', async () => {
       mainWindow.webContents.send('analysis:status', 'error');
       return result;
     }
-    return { ...result, analysis: await runAnalysisInternal() };
+    return { ...result, analysis: await runAnalysisInternal({ ensureGraphify: false }) };
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : String(err);
     mainWindow.webContents.send('analysis:statusDetail', error);
@@ -1461,7 +1541,7 @@ function buildComponentDetailPrompt(name: string, nodeNames: string[]): string {
   ].join('\n');
 }
 
-async function runComponentDetail(name: string): Promise<{ ok?: boolean; error?: string; detail?: unknown }> {
+async function runComponentDetail(name: string, isolated = false): Promise<{ ok?: boolean; error?: string; detail?: unknown }> {
   if (!currentFolder || !name) return { error: 'no component' };
   try {
     const nodeNames = extractNodeNames(currentDiagram);
@@ -1476,7 +1556,7 @@ async function runComponentDetail(name: string): Promise<{ ok?: boolean; error?:
       }
     }
     const prompt = buildComponentDetailPrompt(name, nodeNames);
-    const raw = await runCapture(prompt, currentFolder);
+    const raw = await (isolated ? runIsolatedCapture : runCapture)(prompt, currentFolder);
     const detail = extractJson(raw);
     if (!detail) return { error: 'no detail' };
     saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 1, detail }));
@@ -1900,7 +1980,7 @@ async function runComponentDrilldown(rawName: string, isolated = false): Promise
   try {
     const structure = extractStructure(currentFolder);
     const sourceFiles = sourceFilesForSelection(name, structure.nodePaths, currentFolder);
-    const cacheKey = 'canonical-v6:depth-' + analysisDepth + ':' + name + ':' + componentEvidenceFingerprint(name, sourceFiles);
+    const cacheKey = 'canonical-v7:depth-' + analysisDepth + ':' + name + ':' + componentEvidenceFingerprint(name, sourceFiles);
     const cached = loadCache(currentFolder);
     if (cached?.drilldowns?.[cacheKey]) {
       return { ok: true, mermaid: cached.drilldowns[cacheKey], fromCache: true };
@@ -2465,19 +2545,20 @@ function repositoryImplementationContext(folder: string, structure: ExtractedStr
   return context.join('\n');
 }
 
-async function runArchitectureStory(): Promise<ArchitectureStoryResult> {
+async function runArchitectureStory(isolated = false): Promise<ArchitectureStoryResult> {
   if (!currentFolder) return { error: 'no project folder' };
-  const cacheKey = '__architecture_document__:boundary-review-v7:focus-' + walkthroughSettingsFingerprint(walkthroughSettings);
+  const cacheKey = '__architecture_document__:boundary-review-v8:focus-' + walkthroughSettingsFingerprint(walkthroughSettings);
   try {
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
       const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string>; diagrams?: Record<string, string>; document?: ArchitectureDocument };
-      if (cached.version === 7 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, diagrams: cached.diagrams ?? {}, document: cached.document };
+      if (cached.version === 8 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, diagrams: cached.diagrams ?? {}, document: cached.document };
     }
 
     const structure = extractStructure(currentFolder);
     const context = architectureStoryContext(currentFolder, structure);
-    const raw = await runCapture(buildArchitectureStoryPrompt(context), currentFolder);
+    const capture = isolated ? runIsolatedCapture : runCapture;
+    const raw = await capture(buildArchitectureStoryPrompt(context), currentFolder);
     const parsed = extractJson(raw) as (Record<string, unknown> & { descriptions?: Record<string, string>; document?: ArchitectureDocument }) | null;
     const diagrams = architectureFlowcharts(parsed);
     const mermaid = diagrams.communicationFlow || diagrams.highLevel || Object.values(diagrams)[0];
@@ -2494,7 +2575,7 @@ async function runArchitectureStory(): Promise<ArchitectureStoryResult> {
     let reviewedDescriptions = parsed?.descriptions ?? {};
     let reviewedDocument = parsed?.document;
     try {
-      const reviewRaw = await runCapture(buildArchitectureBoundaryReviewPrompt(
+      const reviewRaw = await capture(buildArchitectureBoundaryReviewPrompt(
         context,
         { diagrams, descriptions: reviewedDescriptions, document: reviewedDocument },
         walkthroughSettings,
@@ -2513,7 +2594,7 @@ async function runArchitectureStory(): Promise<ArchitectureStoryResult> {
 
     const reviewedMermaid = reviewedDiagrams.communicationFlow || reviewedDiagrams.highLevel || Object.values(reviewedDiagrams)[0];
     if (!reviewedMermaid) return { error: 'Architecture review produced no usable Mermaid flowchart.' };
-    const result = { version: 7, mermaid: reviewedMermaid, descriptions: reviewedDescriptions, diagrams: reviewedDiagrams, document: reviewedDocument };
+    const result = { version: 8, mermaid: reviewedMermaid, descriptions: reviewedDescriptions, diagrams: reviewedDiagrams, document: reviewedDocument };
     saveCodeFlow(currentFolder, cacheKey, JSON.stringify(result));
     return { ok: true, mermaid: reviewedMermaid, descriptions: reviewedDescriptions, diagrams: reviewedDiagrams, document: reviewedDocument };
   } catch (err: unknown) {
@@ -2521,19 +2602,19 @@ async function runArchitectureStory(): Promise<ArchitectureStoryResult> {
   }
 }
 
-async function runRepositoryImplementation(): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string> }> {
+async function runRepositoryImplementation(isolated = false): Promise<{ ok?: boolean; error?: string; mermaid?: string; descriptions?: Record<string, string> }> {
   if (!currentFolder) return { error: 'no project folder' };
-    const cacheKey = '__repository_implementation__:node-unlimited-v11:depth-' + analysisDepth + ':focus-' + walkthroughSettingsFingerprint(walkthroughSettings);
+    const cacheKey = '__repository_implementation__:adaptive-detail-v13:depth-' + analysisDepth + ':focus-' + walkthroughSettingsFingerprint(walkthroughSettings);
   try {
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
       const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string> };
-      if (cached.version === 11 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {} };
+      if (cached.version === 13 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {} };
     }
     const structure = extractStructure(currentFolder);
-    const parsed = extractJson(await runCapture(buildRepositoryImplementationPrompt(repositoryImplementationContext(currentFolder, structure), walkthroughSettings), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string> } | null;
+    const parsed = extractJson(await (isolated ? runIsolatedCapture : runCapture)(buildRepositoryImplementationPrompt(repositoryImplementationContext(currentFolder, structure), walkthroughSettings), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string> } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
-    const result = { version: 11, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {} };
+    const result = { version: 13, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {} };
     saveCodeFlow(currentFolder, cacheKey, JSON.stringify(result));
     return { ok: true, mermaid: result.mermaid, descriptions: result.descriptions };
   } catch (err: unknown) { return { error: err instanceof Error ? err.message : String(err) }; }
@@ -2545,12 +2626,12 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = '', isolate
   try {
     const structure = extractStructure(currentFolder);
     if (name === '__whole_repo__') {
-      const cacheKey = `v22:depth-${analysisDepth}:${name}:${hashStructure(groundedStructureJson(currentFolder, structure).json)}`;
+      const cacheKey = `v24:adaptive-detail:depth-${analysisDepth}:${name}:${hashStructure(groundedStructureJson(currentFolder, structure).json)}`;
       const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
       if (typeof cachedValue === 'string') {
         try {
           const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] };
-          if (cached.version === 22 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, happyPath: cached.happyPath ?? [], fromCache: true };
+          if (cached.version === 24 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, happyPath: cached.happyPath ?? [], fromCache: true };
         } catch {
           // Regenerate malformed cache data.
         }
@@ -2560,17 +2641,17 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = '', isolate
       if (!parsed?.mermaid) return { error: 'no mermaid in response' };
       const happyPath = parsed.happyPath ?? [];
       const descriptions = parsed.descriptions ?? {};
-      saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 22, mermaid: parsed.mermaid, descriptions, happyPath }));
+      saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 24, mermaid: parsed.mermaid, descriptions, happyPath }));
       return { ok: true, mermaid: parsed.mermaid, descriptions, happyPath };
     }
 
     const sourceFiles = sourceFilesForSelection(name, structure.nodePaths, currentFolder);
-    const cacheKey = `v22:depth-${analysisDepth}:focus-${walkthroughSettingsFingerprint(walkthroughSettings)}:${name}:${componentEvidenceFingerprint(name, sourceFiles)}`;
+    const cacheKey = `v24:adaptive-detail:depth-${analysisDepth}:focus-${walkthroughSettingsFingerprint(walkthroughSettings)}:${name}:${componentEvidenceFingerprint(name, sourceFiles)}`;
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
       try {
         const p = JSON.parse(cachedValue) as { version?: number; mermaid: string; descriptions?: Record<string, string>; dataFlow?: Record<string, DataFlowSnapshot>; happyPath: string[] };
-        if (p?.version === 22 && p.mermaid) return { ok: true, mermaid: p.mermaid, descriptions: p.descriptions ?? {}, dataFlow: p.dataFlow ?? {}, happyPath: p.happyPath ?? [], fromCache: true };
+        if (p?.version === 24 && p.mermaid) return { ok: true, mermaid: p.mermaid, descriptions: p.descriptions ?? {}, dataFlow: p.dataFlow ?? {}, happyPath: p.happyPath ?? [], fromCache: true };
       } catch {
         // Ignore malformed or legacy entries and regenerate from current source.
       }
@@ -2628,7 +2709,7 @@ async function runComponentCodeFlow(rawName: string, _drillMermaid = '', isolate
     const happyPath = parsed.happyPath ?? [];
     const descriptions = parsed.descriptions ?? {};
     const dataFlow = parsed.dataFlow ?? {};
-    saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 22, mermaid: parsed.mermaid, descriptions, dataFlow, happyPath }));
+    saveCodeFlow(currentFolder, cacheKey, JSON.stringify({ version: 24, mermaid: parsed.mermaid, descriptions, dataFlow, happyPath }));
     return { ok: true, mermaid: parsed.mermaid, descriptions, dataFlow, happyPath };
   } catch (err: unknown) {
     return { error: err instanceof Error ? err.message : String(err) };
@@ -2780,11 +2861,11 @@ async function runComponentImplementation(rawName: string, drillMermaid = '', is
   try {
     const structure = extractStructure(currentFolder);
     const sourceFiles = sourceFilesForSelection(name, structure.nodePaths, currentFolder);
-    const cacheKey = '__implementation__:v37:depth-' + analysisDepth + ':focus-' + walkthroughSettingsFingerprint(walkthroughSettings) + ':' + name + ':' + componentEvidenceFingerprint(name, sourceFiles);
+    const cacheKey = '__implementation__:adaptive-detail-v39:depth-' + analysisDepth + ':focus-' + walkthroughSettingsFingerprint(walkthroughSettings) + ':' + name + ':' + componentEvidenceFingerprint(name, sourceFiles);
     const cachedValue = loadCache(currentFolder)?.codeflows?.[cacheKey];
     if (typeof cachedValue === 'string') {
       const cached = JSON.parse(cachedValue) as { version?: number; mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] };
-      if (!drillMermaid && cached.version === 37 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, happyPath: cached.happyPath ?? [] };
+      if (!drillMermaid && cached.version === 39 && cached.mermaid) return { ok: true, mermaid: cached.mermaid, descriptions: cached.descriptions ?? {}, happyPath: cached.happyPath ?? [] };
     }
     let sourceCode = '';
     let budget = 16000;
@@ -2805,7 +2886,7 @@ async function runComponentImplementation(rawName: string, drillMermaid = '', is
     const hierarchyContext = [buildHierarchyContext(sourceFiles), graphifyPromptContext(currentFolder, name).evidence].filter(Boolean).join('\n\n');
     const parsed = extractJson(await (isolated ? runIsolatedCapture : runCapture)(buildImplementationPrompt(name, sourceCode + handoffScope + scope, hierarchyContext, walkthroughSettings), currentFolder)) as { mermaid?: string; descriptions?: Record<string, string>; happyPath?: string[] } | null;
     if (!parsed?.mermaid) return { error: 'no mermaid in response' };
-    const result = { version: 37, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {}, happyPath: parsed.happyPath ?? [] };
+    const result = { version: 39, mermaid: parsed.mermaid, descriptions: parsed.descriptions ?? {}, happyPath: parsed.happyPath ?? [] };
     saveCodeFlow(currentFolder, cacheKey, JSON.stringify(result));
     return { ok: true, mermaid: result.mermaid, descriptions: result.descriptions, happyPath: result.happyPath };
   } catch (err: unknown) { return { error: err instanceof Error ? err.message : String(err) }; }
@@ -2889,15 +2970,18 @@ function initialiseWarmupQueue(folder: string, analysisHash: string, components:
   if (!cache) return null;
   const existing = cache.warmup;
   const componentsState: Record<string, ComponentWarmupState> =
-    existing?.version === 1 && existing.analysisHash === analysisHash ? { ...existing.components } : {};
+    existing?.version === 2 && existing.analysisHash === analysisHash ? { ...existing.components } : {};
   const now = Date.now();
   for (const name of components) componentsState[name] ??= { updatedAt: now };
   for (const name of Object.keys(componentsState)) if (!components.includes(name)) delete componentsState[name];
+  const project = existing?.version === 2 && existing.analysisHash === analysisHash
+    ? { ...existing.project }
+    : { updatedAt: now };
   const queue: ComponentWarmupQueue = {
-    version: 1, analysisHash, components: componentsState,
-    completed: components.length > 0 && components.every(name => {
+    version: 2, analysisHash, project, components: componentsState,
+    completed: !!project.codeStory && !!project.architecture && !!project.walkthrough && components.every(name => {
       const state = componentsState[name];
-      return !!state?.drill && !!state?.story && !!state?.walkthrough;
+      return !!state?.detail && !!state?.drill && !!state?.story && !!state?.walkthrough;
     }),
     updatedAt: now,
   };
@@ -2909,62 +2993,87 @@ function initialiseWarmupQueue(folder: string, analysisHash: string, components:
 
 function warmupState(folder: string, analysisHash: string, name: string): ComponentWarmupState | null {
   const queue = loadCache(folder)?.warmup;
-  return queue?.version === 1 && queue.analysisHash === analysisHash ? (queue.components[name] ?? null) : null;
+  return queue?.version === 2 && queue.analysisHash === analysisHash ? (queue.components[name] ?? null) : null;
 }
 
 function recordWarmupStage(folder: string, analysisHash: string, name: string, stage: WarmupStage) {
   const cache = loadCache(folder);
   const queue = cache?.warmup;
-  if (!cache || !queue || queue.version !== 1 || queue.analysisHash !== analysisHash) return;
+  if (!cache || !queue || queue.version !== 2 || queue.analysisHash !== analysisHash) return;
   const now = Date.now();
   queue.components[name] = { ...(queue.components[name] ?? { updatedAt: now }), [stage]: true, updatedAt: now };
-  queue.completed = Object.values(queue.components).every(state => !!state.drill && !!state.story && !!state.walkthrough);
+  queue.completed = !!queue.project.codeStory && !!queue.project.architecture && !!queue.project.walkthrough
+    && Object.values(queue.components).every(state => !!state.detail && !!state.drill && !!state.story && !!state.walkthrough);
+  queue.updatedAt = now;
+  cache.savedAt = now;
+  writeCache(folder, cache);
+}
+
+function recordProjectWarmupStage(folder: string, analysisHash: string, stage: ProjectWarmupStage) {
+  const cache = loadCache(folder);
+  const queue = cache?.warmup;
+  if (!cache || !queue || queue.version !== 2 || queue.analysisHash !== analysisHash) return;
+  const now = Date.now();
+  queue.project = { ...queue.project, [stage]: true, updatedAt: now };
+  queue.completed = !!queue.project.codeStory && !!queue.project.architecture && !!queue.project.walkthrough
+    && Object.values(queue.components).every(state => !!state.detail && !!state.drill && !!state.story && !!state.walkthrough);
   queue.updatedAt = now;
   cache.savedAt = now;
   writeCache(folder, cache);
 }
 
 /**
- * Prepare the first selectable layer for every analysis component after the
- * base diagram is ready. Each request has complete source evidence and uses
- * an isolated AI invocation, so all artifacts can be prepared concurrently
- * without interleaving prompts in the interactive project conversation. Each
- * result saves itself to the ordinary local/Supabase cache as it arrives.
+ * Prepare the project in the order people explore it: the Graphify-backed
+ * user flow is the base diagram, followed by project-level views and then one
+ * component layer. Component requests use isolated, evidence-rich prompts in
+ * a bounded worker pool.
  */
 function scheduleComponentCacheWarmup(folder: string, diagram: object, analysisHash: string) {
   const generation = ++componentWarmupGeneration;
   const components = componentLabelsForWarmup(diagram);
-  if (components.length === 0) return;
   const queue = initialiseWarmupQueue(folder, analysisHash, components);
   if (!queue || queue.completed) return;
 
   void (async () => {
-    const complete = components.filter(name => {
-      const state = queue.components[name];
-      return state?.drill && state?.story && state?.walkthrough;
-    }).length;
-    console.log(`[cache-warmup] resuming ${complete}/${components.length} prepared components`);
-    const jobs = components.flatMap((name, index) => {
-      const state = warmupState(folder, analysisHash, name);
-      const prefix = `[cache-warmup] ${index + 1}/${components.length} ${name}`;
-      const prepare = async (stage: WarmupStage, label: string, work: () => Promise<{ ok?: boolean; error?: string }>) => {
-        // Do not start work for an old project or superseded analysis. Work
-        // already started can finish harmlessly into its fingerprinted cache.
-        if (generation !== componentWarmupGeneration || currentFolder !== folder || currentDiagram !== diagram) return;
-        console.log(`${prefix} — ${label}`);
-        const result = await work();
-        if (result.ok) recordWarmupStage(folder, analysisHash, name, stage);
-        else console.warn(`${prefix} — ${label} skipped: ${result.error ?? 'no result'}`);
-      };
-      return [
-        !state?.drill && prepare('drill', 'Drill', () => runComponentDrilldown(name, true)),
-        !state?.story && prepare('story', 'Code Story', () => runComponentCodeFlow(name, '', true)),
-        !state?.walkthrough && prepare('walkthrough', 'Code Walkthrough', () => runComponentImplementation(name, '', true)),
-      ].filter((job): job is Promise<void> => Boolean(job));
-    });
-    await Promise.all(jobs);
+    const isCurrent = () => generation === componentWarmupGeneration && currentFolder === folder && currentDiagram === diagram;
+    const runProjectStage = async (stage: ProjectWarmupStage, label: string, work: () => Promise<{ ok?: boolean; error?: string }>) => {
+      if (!isCurrent()) return;
+      const state = loadCache(folder)?.warmup;
+      if (state?.version === 2 && state.project[stage]) return;
+      console.log(`[cache-warmup] ${label}`);
+      const result = await work();
+      if (result.ok) recordProjectWarmupStage(folder, analysisHash, stage);
+      else console.warn(`[cache-warmup] ${label} skipped: ${result.error ?? 'no result'}`);
+    };
+
+    await runProjectStage('codeStory', 'Whole-project Code Story', () => runComponentCodeFlow('__whole_repo__', '', true));
+    await runProjectStage('architecture', 'Technical Architecture', () => runArchitectureStory(true));
+    await runProjectStage('walkthrough', 'Whole-project Code Walkthrough', () => runRepositoryImplementation(true));
+    if (!isCurrent()) return;
+
+    let nextComponent = 0;
+    const worker = async () => {
+      while (isCurrent()) {
+        const index = nextComponent++;
+        const name = components[index];
+        if (!name) return;
+        const prefix = `[cache-warmup] ${index + 1}/${components.length} ${name}`;
+        const prepare = async (stage: WarmupStage, label: string, work: () => Promise<{ ok?: boolean; error?: string }>) => {
+          if (!isCurrent() || warmupState(folder, analysisHash, name)?.[stage]) return;
+          console.log(`${prefix} — ${label}`);
+          const result = await work();
+          if (result.ok) recordWarmupStage(folder, analysisHash, name, stage);
+          else console.warn(`${prefix} — ${label} skipped: ${result.error ?? 'no result'}`);
+        };
+        await prepare('detail', 'Component Detail', () => runComponentDetail(name, true));
+        await prepare('drill', 'Drill', () => runComponentDrilldown(name, true));
+        await prepare('story', 'Code Story', () => runComponentCodeFlow(name, '', true));
+        await prepare('walkthrough', 'Code Walkthrough', () => runComponentImplementation(name, '', true));
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(3, components.length) }, worker));
     if (generation === componentWarmupGeneration && currentFolder === folder && currentDiagram === diagram) {
-      console.log('[cache-warmup] first-level component preparation complete');
+      console.log('[cache-warmup] project and first-level component preparation complete');
     }
   })().catch(error => console.error('[cache-warmup] failed:', error instanceof Error ? error.message : String(error)));
 }
@@ -3116,7 +3225,7 @@ ipcMain.handle('git:commitDiff', async (_e, hash: string) => {
     const commitMsg = message?.trim() ?? '';
 
     // ── 3. Cache check ──
-    const commitDiagramCacheKey = `node-unlimited-v1:${hash}`;
+    const commitDiagramCacheKey = `adaptive-detail-v3:${hash}`;
     const cached = loadCache(folder);
     if (cached?.commitDiagrams?.[commitDiagramCacheKey]) {
       const cd = cached.commitDiagrams[commitDiagramCacheKey];
