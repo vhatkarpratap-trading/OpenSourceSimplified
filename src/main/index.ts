@@ -736,35 +736,6 @@ interface AnalysisDiagram {
   descriptions?: Record<string, string>;
 }
 
-interface ProjectFlowArtifact {
-  mermaid?: string;
-  descriptions?: Record<string, string>;
-  happyPath?: string[];
-}
-
-interface ProjectUnderstanding extends AnalysisDiagram {
-  projectViews?: {
-    codeStory?: ProjectFlowArtifact;
-    architecture?: ProjectFlowArtifact & { document?: ArchitectureDocument };
-    codeWalkthrough?: ProjectFlowArtifact;
-  };
-}
-
-/** One shared reading of the repository produces the top-level learning views. */
-function buildProjectUnderstandingPrompt(structure: ExtractedStructure, structureJson: string, sourceContext: string): string {
-  return [
-    'Understand this repository once and return four complementary, source-proven learning views. Output ONLY JSON—no markdown or prose outside JSON.',
-    analysisDepthGuidance(), diagramReadabilityGuidance(), '',
-    'The visible cards in every view must be consequential: entry points, orchestration, meaningful decisions, state changes, boundaries, handoffs, errors, or outcomes. Fold helpers and repeated mechanics into their nearest meaningful card.',
-    'userFlow is product-facing: show what a person can do, with no implementation terms. architecture explains the proven system boundaries, major components, data/integration paths, and a short evidence-based document. codeStory explains the whole project running: trigger → data/control flow → result. codeWalkthrough explains how meaningful features are implemented, including proven contracts.',
-    'Never invent behavior, components, endpoints, data fields, or infrastructure. Use plain language in cards; keep implementation detail in descriptions. Use flowchart TD Mermaid only, with connected nodes and labelled edges.',
-    'JSON SCHEMA:',
-    '{"pattern":"short product map name","diagrams":{"structure":"flowchart TD...","sequence":"flowchart TD..."},"descriptions":{"Node":"user-facing meaning"},"projectViews":{"codeStory":{"mermaid":"flowchart TD...","descriptions":{},"happyPath":["A"]},"architecture":{"mermaid":"flowchart TD...","descriptions":{},"document":{"executiveSummary":"confirmed findings","technologyStack":["proven fact"],"sections":[{"title":"High-level architecture","content":"confirmed explanation","evidence":["path"]}],"unresolved":["unknowns"]}},"codeWalkthrough":{"mermaid":"flowchart TD...","descriptions":{},"happyPath":["A"]}}}',
-    '', 'REPOSITORY STRUCTURE:', structureJson, '', 'SOURCE EVIDENCE:', sourceContext || '(No readable source excerpts were available.)', '',
-    'The project contains ' + structure.totalFiles + ' source files. JSON only.',
-  ].join('\n');
-}
-
 // ── Change context prompt ─────────────────────────────────────────────────────
 
 interface ChangeContextNode {
@@ -1364,35 +1335,6 @@ ipcMain.handle('supabase:syncCurrent', async () => {
   }
 });
 
-/** Cache the views returned by the combined project-understanding request under
- * the same keys used by their individual UI actions. */
-function saveProjectUnderstandingViews(
-  folder: string,
-  structureJson: string,
-  analysisHash: string,
-  views: ProjectUnderstanding['projectViews'] | undefined,
-) {
-  if (!views) return;
-  const cache = loadCache(folder);
-  if (!cache) return;
-  const now = Date.now();
-  const codeStoryKey = 'v24:adaptive-detail:depth-' + analysisDepth + ':__whole_repo__:' + hashStructure(structureJson);
-  const architectureKey = '__architecture_document__:boundary-review-v8:focus-' + walkthroughSettingsFingerprint(walkthroughSettings);
-  const walkthroughKey = '__repository_implementation__:adaptive-detail-v13:depth-' + analysisDepth + ':focus-' + walkthroughSettingsFingerprint(walkthroughSettings);
-  cache.codeflows ??= {};
-  if (views.codeStory?.mermaid) cache.codeflows[codeStoryKey] = JSON.stringify({ version: 24, mermaid: views.codeStory.mermaid, descriptions: views.codeStory.descriptions ?? {}, happyPath: views.codeStory.happyPath ?? [] });
-  if (views.architecture?.mermaid) cache.codeflows[architectureKey] = JSON.stringify({ version: 8, mermaid: views.architecture.mermaid, descriptions: views.architecture.descriptions ?? {}, diagrams: { communicationFlow: views.architecture.mermaid }, document: views.architecture.document });
-  if (views.codeWalkthrough?.mermaid) cache.codeflows[walkthroughKey] = JSON.stringify({ version: 13, mermaid: views.codeWalkthrough.mermaid, descriptions: views.codeWalkthrough.descriptions ?? {} });
-  cache.warmup = {
-    version: 2, analysisHash,
-    project: { codeStory: !!views.codeStory?.mermaid, architecture: !!views.architecture?.mermaid, walkthrough: !!views.codeWalkthrough?.mermaid, updatedAt: now },
-    components: cache.warmup?.analysisHash === analysisHash ? cache.warmup.components : {},
-    completed: false, updatedAt: now,
-  };
-  cache.savedAt = now;
-  writeCache(folder, cache);
-}
-
 async function runAnalysisInternal(options: { ensureGraphify?: boolean } = {}): Promise<{ ok?: boolean; error?: string; fromCache?: boolean }> {
   if (!mainWindow || !currentFolder) return { error: 'No folder selected' };
 
@@ -1448,9 +1390,9 @@ async function runAnalysisInternal(options: { ensureGraphify?: boolean } = {}): 
       ? ` ${graphify.resolution.reasons[0]}`
       : '';
     mainWindow.webContents.send('analysis:statusDetail', `Analysing ${structure.totalFiles} files${graphNote} with ${providerLabel()}…${graphProvenance}`);
-    const prompt = buildProjectUnderstandingPrompt(structure, structureJson, buildAnalysisSourceContext(structure));
+    const prompt = buildClaudePrompt(structure, structureJson, buildAnalysisSourceContext(structure));
     const raw = await runCapture(prompt, currentFolder);
-    const diagram = extractJson(raw) as ProjectUnderstanding | null;
+    const diagram = extractJson(raw) as AnalysisDiagram | null;
 
     try {
       fs.writeFileSync(path.join(os.tmpdir(), 'rex-last-analysis.json'),
@@ -1474,7 +1416,6 @@ async function runAnalysisInternal(options: { ensureGraphify?: boolean } = {}): 
     // Component entries are evidence-fingerprinted. Keep reusable entries and
     // let the new queue regenerate only components whose evidence changed.
     const cacheSaved = saveCache(currentFolder, { structureHash, diagram });
-    if (cacheSaved) saveProjectUnderstandingViews(currentFolder, structureJson, structureHash, diagram.projectViews);
 
     mainWindow.webContents.send('canvas:diagram', diagram);
     if (!cacheSaved) mainWindow.webContents.send('analysis:statusDetail', 'Diagram generated, but it could not be saved to cache.');
