@@ -82,7 +82,7 @@ function providerLabel() {
 }
 
 // ── Diagram cache ─────────────────────────────────────────────────────────────
-// The cache belongs to Rex Canvas, never to the opened project. A local SQLite
+// The cache belongs to Open Source Simplified, never to the opened project. A local SQLite
 // database in Electron's user-data directory keeps one record per project path.
 
 interface CodeFlowStep { fn: string; what: string; data: string }
@@ -215,12 +215,17 @@ interface ArchitectureStoryResult {
 
 interface CacheDatabase {
   exec(sql: string): void;
-  prepare(sql: string): { get(...parameters: unknown[]): unknown; run(...parameters: unknown[]): unknown };
+  prepare(sql: string): { get(...parameters: unknown[]): unknown; all(...parameters: unknown[]): unknown[]; run(...parameters: unknown[]): unknown };
 }
 
 type CacheDatabaseConstructor = new (filename: string) => CacheDatabase;
 
 interface CacheDatabaseRow { cache_json?: string | null; canvas_json?: string | null }
+interface CachedProjectRow { project_path: string; cache_json?: string | null; canvas_json?: string | null; updated_at: number }
+
+type CachedProjectSummary = {
+  folder: string; name: string; savedAt: number; provider?: string; hasAnalysis: boolean; pattern?: string;
+};
 
 let cacheDatabaseInstance: CacheDatabase | null = null;
 
@@ -337,6 +342,14 @@ function queueCachedAnalysisSync(folder: string, cache: CacheFile) {
   const snapshot = JSON.parse(JSON.stringify(cache)) as CacheFile;
   const previous = cacheSyncQueue.get(folder) ?? Promise.resolve();
   const next = previous.catch(() => undefined).then(async () => {
+    // Never inherit the currently open project's visibility. A queued cache
+    // write can outlive a project switch, so classify this exact folder at the
+    // last possible point before a network operation.
+    const access = await getRepositoryAccess(folder);
+    if (access.kind === 'private') {
+      console.info('[supabase] private repository cache remains local');
+      return;
+    }
     const account = accountService?.getState().user ?? null;
     await syncAnalysisToSupabase({
       folder,
@@ -345,8 +358,8 @@ function queueCachedAnalysisSync(folder: string, cache: CacheFile) {
       analysis: snapshot.diagram,
       description: String((snapshot.diagram as { pattern?: unknown }).pattern ?? 'Repository analysis'),
       provider: snapshot.provider ?? getAiProvider(),
-      visibility: currentRepositoryAccess?.kind ?? 'private',
-      remoteUrl: currentRepositoryAccess?.remoteUrl,
+      visibility: access.kind,
+      remoteUrl: access.remoteUrl,
       publishedBy: account,
     });
   });
@@ -417,6 +430,33 @@ function loadCanvasDiagram(folder: string): object | null {
     if (!row) { migrateLegacyCache(folder); row = cacheRow(folder); }
     return row?.canvas_json ? JSON.parse(row.canvas_json) as object : null;
   } catch { return null; }
+}
+
+function listCachedProjects(): CachedProjectSummary[] {
+  try {
+    const rows = cacheDatabase().prepare(`
+      SELECT project_path, cache_json, canvas_json, updated_at
+      FROM project_cache
+      WHERE cache_json IS NOT NULL OR canvas_json IS NOT NULL
+      ORDER BY updated_at DESC
+    `).all() as CachedProjectRow[];
+    return rows.map(row => {
+      let cache: Partial<CacheFile> = {};
+      try { cache = row.cache_json ? JSON.parse(row.cache_json) as Partial<CacheFile> : {}; } catch {}
+      const diagram = cache.diagram as { pattern?: unknown } | undefined;
+      return {
+        folder: row.project_path,
+        name: path.basename(row.project_path),
+        savedAt: Number(cache.savedAt ?? row.updated_at ?? 0),
+        provider: cache.provider,
+        hasAnalysis: !!(cache.diagram || row.canvas_json),
+        pattern: typeof diagram?.pattern === 'string' ? diagram.pattern : undefined,
+      };
+    });
+  } catch (error) {
+    console.error('[cache] Could not list projects:', error);
+    return [];
+  }
 }
 
 /**
@@ -533,9 +573,11 @@ function clearProjectCache(folder: string): boolean {
     cacheDatabase().prepare('DELETE FROM project_cache WHERE project_path = ?').run(cacheProjectPath(folder));
     const legacyPath = legacyCacheFile(folder);
     if (fs.existsSync(legacyPath)) fs.unlinkSync(legacyPath);
-    void deleteAnalysisFromSupabase({
-      folder, visibility: currentRepositoryAccess?.kind ?? 'private', remoteUrl: currentRepositoryAccess?.remoteUrl,
-    }).catch(error => console.warn('[supabase] cache delete sync failed:', error instanceof Error ? error.message : String(error)));
+    // Classify the cache's own folder rather than relying on a possibly
+    // different project that the user opened after this delete was initiated.
+    void getRepositoryAccess(folder).then(access => deleteAnalysisFromSupabase({
+      folder, visibility: access.kind, remoteUrl: access.remoteUrl,
+    })).catch(error => console.warn('[supabase] cache delete sync failed:', error instanceof Error ? error.message : String(error)));
     return true;
   } catch { return false; }
 }
@@ -1119,6 +1161,7 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
+    title: 'Open Source Simplified',
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: { x: 16, y: 18 },
     backgroundColor: '#1a1a2e',
@@ -1230,6 +1273,10 @@ ipcMain.handle('analysis:setDepth', (_e, depth: number) => {
 // Unpackaged Electron runs are developer/debug builds. Subscription checks must
 // never block local development, but remain enforced in packaged releases.
 ipcMain.handle('app:isDebugMode', () => !app.isPackaged);
+ipcMain.handle('app:quit', () => {
+  app.quit();
+  return true;
+});
 ipcMain.handle('account:getState', () => accountService?.getState() ?? { configured: false, user: null, subscription: null });
 ipcMain.handle('account:signInGoogle', async () => {
   if (!accountService) throw new Error('Account service is not ready.');
@@ -1241,6 +1288,7 @@ ipcMain.handle('billing:startSubscription', async (_e, plan: PlanId) => {
   return accountService.startSubscription(plan);
 });
 ipcMain.handle('account:signOut', () => accountService?.signOut() ?? { configured: false, user: null, subscription: null });
+ipcMain.handle('cache:listProjects', () => listCachedProjects());
 ipcMain.handle('project:relationships', () => {
   if (!currentFolder) return { ok: false, error: 'No project is open' };
   const structure = extractStructure(currentFolder);
@@ -1298,6 +1346,15 @@ ipcMain.handle('folder:open', async () => {
   return openProject(folder, access);
 });
 
+ipcMain.handle('project:openCached', async (_event, folder: string) => {
+  if (!mainWindow || typeof folder !== 'string' || !folder) return null;
+  const resolved = path.resolve(folder);
+  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+    return { opened: false, error: 'This project folder is no longer available.' };
+  }
+  return openProject(resolved, await getRepositoryAccess(resolved));
+});
+
 ipcMain.on('session:savePanels', (_e, panels: SessionPanel[]) => {
   if (currentFolder) saveSessionPanels(currentFolder, panels);
 });
@@ -1317,6 +1374,7 @@ ipcMain.handle('supabase:syncCurrent', async () => {
   try {
     const access = currentRepositoryAccess ?? await getRepositoryAccess(currentFolder);
     currentRepositoryAccess = access;
+    if (access.kind === 'private') return { ok: false, error: 'Private or unverified repository analyses stay on this device and cannot be uploaded.' };
     const account = accountService?.getState().user ?? null;
     await syncAnalysisToSupabase({
       folder: currentFolder,

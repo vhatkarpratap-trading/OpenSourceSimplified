@@ -71,7 +71,9 @@ function supabaseClient() {
  * This never starts an AI request and follows the same privacy opt-in as sync.
  */
 export async function loadAnalysisFromSupabase(snapshot: Pick<SupabaseAnalysisSnapshot, 'folder' | 'visibility' | 'remoteUrl'>): Promise<SupabaseCachedAnalysis | null> {
-  if (snapshot.visibility === 'private' && value('REX_SUPABASE_SYNC_PRIVATE') !== 'true') return null;
+  // Private and unverified repositories never make a network request. This is
+  // deliberately not configurable: their source-derived analysis is local-only.
+  if (snapshot.visibility === 'private') return null;
   const supabase = supabaseClient();
   if (!supabase) return null;
   const repositoryKey = crypto.createHash('sha256').update(snapshot.remoteUrl || snapshot.folder).digest('hex');
@@ -86,7 +88,7 @@ export async function loadAnalysisFromSupabase(snapshot: Pick<SupabaseAnalysisSn
 
 /** Sync a completed analysis without making remote availability part of local analysis. */
 export async function syncAnalysisToSupabase(snapshot: SupabaseAnalysisSnapshot): Promise<void> {
-  if (snapshot.visibility === 'private' && value('REX_SUPABASE_SYNC_PRIVATE') !== 'true') {
+  if (snapshot.visibility === 'private') {
     console.info('[supabase] private repository cache remains local');
     return;
   }
@@ -114,7 +116,7 @@ export async function syncAnalysisToSupabase(snapshot: SupabaseAnalysisSnapshot)
 
 /** Remove the remote snapshot when a user clears that same local project cache. */
 export async function deleteAnalysisFromSupabase(snapshot: Pick<SupabaseAnalysisSnapshot, 'folder' | 'visibility' | 'remoteUrl'>): Promise<void> {
-  if (snapshot.visibility === 'private' && value('REX_SUPABASE_SYNC_PRIVATE') !== 'true') return;
+  if (snapshot.visibility === 'private') return;
   const repositoryKey = crypto.createHash('sha256').update(snapshot.remoteUrl || snapshot.folder).digest('hex');
   const supabase = supabaseClient();
   if (!supabase) return;

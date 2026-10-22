@@ -1,6 +1,7 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import type { ExcalidrawImperativeAPI } from '@excalidraw/excalidraw/types/types';
 import Canvas from './Canvas';
+import Home, { type CachedProject } from './Home';
 import { DiagramData, DiagramKind } from './diagramBuilder';
 import type { CommitInfo, CommitDiffResult, PRInfo, PRReviewResult, ChangeContextNode, WalkthroughSettings } from './global';
 
@@ -103,6 +104,7 @@ export default function App() {
   const [accountError, setAccountError] = useState<string | null>(null);
   const [repositoryAccess, setRepositoryAccess] = useState<RepositoryAccess | null>(null);
   const [folder, setFolder]           = useState<string | null>(null);
+  const [showHome, setShowHome]       = useState(true);
   const [diagram, setDiagram]         = useState<DiagramData | null>(null);
   const [status, setStatus]           = useState<AnalysisStatus>('idle');
   const [statusDetail, setStatusDetail] = useState<string | null>(null);
@@ -394,9 +396,35 @@ export default function App() {
     if (result) {
       setRepositoryAccess(result.access);
       setFolder(result.folder);
+      setShowHome(false);
       sessionPanelsRef.current = [];
       if (!result.hasCachedDiagram) { setStatus('idle'); setDiagram(null); }
     }
+  }, []);
+
+  const openProjectFromHome = useCallback(async (analyse = false) => {
+    const result = await window.electronAPI.openFolder();
+    if (!result) return;
+    setRepositoryAccess(result.access);
+    setFolder(result.folder);
+    sessionPanelsRef.current = [];
+    if (!result.hasCachedDiagram) { setStatus('idle'); setDiagram(null); }
+    setShowHome(false);
+    if (analyse) {
+      setStatus('running'); setStatusDetail('Preparing project analysis…');
+      const analysis = await window.electronAPI.runAnalysis();
+      if (analysis.error) { setStatus('error'); setRenderError(analysis.error); }
+    }
+  }, []);
+
+  const openCachedProjectFromHome = useCallback(async (project: CachedProject) => {
+    const result = await window.electronAPI.openCachedProject(project.folder);
+    if (!result?.opened || !result.folder || !result.access) throw new Error(result?.error ?? 'Could not open this cached project.');
+    setRepositoryAccess(result.access);
+    setFolder(result.folder);
+    sessionPanelsRef.current = [];
+    if (!result.hasCachedDiagram) { setStatus('idle'); setDiagram(null); }
+    setShowHome(false);
   }, []);
 
   const handleClearProjectCache = useCallback(async () => {
@@ -785,6 +813,12 @@ export default function App() {
     }
   }, [showPRView]);
 
+  if (showHome) return <Home
+    onOpenFolder={() => openProjectFromHome(false)}
+    onAnalyseFolder={() => openProjectFromHome(true)}
+    onOpenCached={openCachedProjectFromHome}
+  />;
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', width: '100vw', height: '100vh', background: '#0f0f1a' }}>
       <style>{`
@@ -792,11 +826,27 @@ export default function App() {
         @keyframes slideIn { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: translateX(0); } }
       `}</style>
 
+      <button
+        type="button"
+        onClick={() => setShowHome(true)}
+        aria-label="Back to home"
+        style={{
+          position: 'fixed', top: 88, left: 16, zIndex: 80,
+          padding: '8px 12px', border: '1px solid #737384', borderRadius: 7,
+          background: '#22222d', color: '#ffffff', boxShadow: '0 3px 12px rgba(0,0,0,.28)',
+          fontSize: 12, fontWeight: 700, fontFamily: 'system-ui, -apple-system, sans-serif', cursor: 'pointer',
+          // @ts-ignore
+          WebkitAppRegion: 'no-drag',
+        }}
+      >
+        ← Back to home
+      </button>
+
       {accountOpen && (
         <div style={{ position: 'fixed', inset: 0, zIndex: 1000, display: 'grid', placeItems: 'center', background: 'rgba(5, 6, 12, 0.78)', fontFamily: 'system-ui, -apple-system, sans-serif' }}>
           <div data-account-dialog role="dialog" aria-modal="true" aria-label="Account and Pro plans" style={{ width: 520, maxWidth: 'calc(100vw - 32px)', background: '#171721', border: '1px solid #45455a', borderRadius: 14, padding: 24, boxShadow: '0 24px 80px rgba(0,0,0,.55)' }}>
             <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
-              <div><div style={{ color: '#fff', fontSize: 21, fontWeight: 700 }}>Rex Canvas Pro</div><div style={{ color: '#a9a9bb', fontSize: 13, marginTop: 5 }}>Analysis runs locally for every repository, including private ones.</div></div>
+              <div><div style={{ color: '#fff', fontSize: 21, fontWeight: 700 }}>Open Source Simplified Pro</div><div style={{ color: '#a9a9bb', fontSize: 13, marginTop: 5 }}>Analysis runs locally for every repository, including private ones.</div></div>
               <button autoFocus onClick={() => setAccountOpen(false)} aria-label="Close" style={{ color: '#a9a9bb', background: 'transparent', border: 0, fontSize: 20, cursor: 'pointer' }}>×</button>
             </div>
             {repositoryAccess?.kind === 'private' && <div style={{ marginTop: 14, padding: 10, background: '#1d2939', border: '1px solid #3b82a8', borderRadius: 7, color: '#ccecff', fontSize: 12 }}>{repositoryAccess.detail}</div>}
@@ -846,8 +896,18 @@ export default function App() {
       }}>
         <div style={{ width: 80, flexShrink: 0 }} />
 
+        <button onClick={() => setShowHome(true)} aria-label="Back to projects" title="Back to projects" style={{
+          padding: '7px 12px', background: '#2b2b36', border: '1px solid #737384', borderRadius: 6,
+          color: '#ededf2', fontSize: 12, fontFamily: 'system-ui, -apple-system, sans-serif',
+          cursor: 'pointer', flexShrink: 0, fontWeight: 650,
+          // @ts-ignore
+          WebkitAppRegion: 'no-drag',
+        }}>
+          ← Back to projects
+        </button>
+
         <button data-account-action onClick={() => { setAccountError(null); setAccountOpen(true); }} style={{ padding: '6px 11px', background: (debugMode || account?.subscription) ? '#173a2b' : '#322855', border: `1px solid ${(debugMode || account?.subscription) ? '#31855c' : '#7767d9'}`, borderRadius: 6, color: '#f5f3ff', fontSize: 12, fontWeight: 600, cursor: 'pointer', flexShrink: 0, WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
-          {debugMode ? 'Debug · Free' : account?.subscription ? '✓ Pro' : repositoryAccess?.kind === 'private' ? 'Private · Local' : 'Rex Canvas Pro'}
+          {debugMode ? 'Debug · Free' : account?.subscription ? '✓ Pro' : repositoryAccess?.kind === 'private' ? 'Private · Local' : 'Open Source Simplified Pro'}
         </button>
 
         {/* Open Project */}
@@ -1256,7 +1316,7 @@ export default function App() {
           )}
         </div>
 
-        <button
+        {repositoryAccess?.kind !== 'private' && <button
           onClick={() => void handleSupabaseSync()}
           disabled={!folder || supabaseSyncing}
           title="Push this project's saved analysis and prepared walkthroughs to Supabase"
@@ -1269,7 +1329,7 @@ export default function App() {
           }}
         >
           {supabaseSyncing ? 'Pushing…' : 'Push to Supabase'}
-        </button>
+        </button>}
 
         <button
           onClick={handleClearProjectCache}

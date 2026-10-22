@@ -81,7 +81,7 @@ export class AccountService {
     const response = await fetch(`${PAYPAL_API}/v1/billing/subscriptions`, {
       method: 'POST',
       headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'paypal-request-id': crypto.randomUUID() },
-      body: JSON.stringify({ plan_id: planId, custom_id: account.user.email, application_context: { brand_name: 'Rex Canvas', user_action: 'SUBSCRIBE_NOW', shipping_preference: 'NO_SHIPPING' } }),
+      body: JSON.stringify({ plan_id: planId, custom_id: account.user.email, application_context: { brand_name: 'Open Source Simplified', user_action: 'SUBSCRIBE_NOW', shipping_preference: 'NO_SHIPPING' } }),
     });
     if (!response.ok) throw new Error('PayPal could not start checkout. Check the plan IDs and try again.');
     const subscription = await response.json() as { id: string; links?: Array<{ rel: string; href: string }> };
@@ -114,7 +114,7 @@ export class AccountService {
         const state = url.searchParams.get('state');
         const error = url.searchParams.get('error');
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-        res.end('<h2>You may return to Rex Canvas.</h2><p>This window can be closed.</p>');
+        res.end('<h2>You may return to Open Source Simplified.</h2><p>This window can be closed.</p>');
         cleanup();
         if (error || state !== expectedState || !code) reject(new Error(error ? `Google sign-in was cancelled: ${error}` : 'Google sign-in validation failed.'));
         else resolve(code);

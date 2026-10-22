@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
   isDebugMode: (): Promise<boolean> => ipcRenderer.invoke('app:isDebugMode'),
+  quitApp: (): Promise<boolean> => ipcRenderer.invoke('app:quit'),
   // Sent after the React app has attached its IPC listeners.
   rendererReady: (): Promise<boolean> => ipcRenderer.invoke('renderer:ready'),
   // Account and Pro billing. Provider credentials remain in the main process.
@@ -15,6 +16,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Folder
   openFolder: (): Promise<{ opened: boolean; folder: string; hasCachedDiagram?: boolean; access: { kind: 'open-source' | 'private'; source: string; detail: string; remoteUrl?: string } } | null> =>
     ipcRenderer.invoke('folder:open'),
+  listCachedProjects: (): Promise<Array<{ folder: string; name: string; savedAt: number; provider?: string; hasAnalysis: boolean; pattern?: string }>> =>
+    ipcRenderer.invoke('cache:listProjects'),
+  openCachedProject: (folder: string): Promise<{ opened: boolean; folder?: string; hasCachedDiagram?: boolean; access?: { kind: 'open-source' | 'private'; source: string; detail: string; remoteUrl?: string }; error?: string } | null> =>
+    ipcRenderer.invoke('project:openCached', folder),
   clearProjectCache: (): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('cache:clearProject'),
   syncCurrentProjectToSupabase: (): Promise<{ ok: boolean; error?: string }> =>
