@@ -114,17 +114,6 @@ For renderer watch mode plus Electron startup:
 npm run dev
 ~~~
 
-## Optional Supabase configuration
-
-Supabase synchronization is optional. To enable it for eligible open-source repositories, set the following values in .env.local or your environment:
-
-~~~text
-SUPABASE_URL=...
-SUPABASE_PUBLISHABLE_KEY=...
-~~~
-
-NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY are also supported. Without this configuration, local analysis and local caching continue to work; no remote synchronization occurs.
-
 ## Useful commands
 
 | Command | What it does |

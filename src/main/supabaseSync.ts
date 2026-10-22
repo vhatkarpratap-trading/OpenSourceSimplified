@@ -59,9 +59,12 @@ function repositoryName(remoteUrl?: string): string {
   return name || 'repository';
 }
 
+const DEFAULT_SUPABASE_URL = 'https://xyxiwzcjtmohrcfhansz.supabase.co';
+const DEFAULT_SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_tr7KulNm0Fr93Gws1wHgyA_4FPuFF9X';
+
 function supabaseClient() {
-  const url = value('NEXT_PUBLIC_SUPABASE_URL') ?? value('SUPABASE_URL');
-  const key = value('NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY') ?? value('SUPABASE_PUBLISHABLE_KEY');
+  const url = value('NEXT_PUBLIC_SUPABASE_URL') ?? value('SUPABASE_URL') ?? DEFAULT_SUPABASE_URL;
+  const key = value('NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY') ?? value('SUPABASE_PUBLISHABLE_KEY') ?? DEFAULT_SUPABASE_PUBLISHABLE_KEY;
   if (!url || !key) return null;
   return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
 }
