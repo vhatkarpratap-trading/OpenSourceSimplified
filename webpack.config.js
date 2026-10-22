@@ -1,17 +1,45 @@
 const path = require('path');
+const fs = require('fs');
 const webpack = require('webpack');
+
+class RendererHtmlPlugin {
+  apply(compiler) {
+    compiler.hooks.thisCompilation.tap('RendererHtmlPlugin', (compilation) => {
+      compilation.hooks.processAssets.tap(
+        {
+          name: 'RendererHtmlPlugin',
+          stage: webpack.Compilation.PROCESS_ASSETS_STAGE_ADDITIONAL,
+        },
+        () => {
+          const templatePath = path.resolve(
+            __dirname,
+            'src/renderer/index.html',
+          );
+
+          const template = fs.readFileSync(templatePath, 'utf8');
+
+          compilation.emitAsset(
+            'index.html',
+            new webpack.sources.RawSource(template),
+          );
+        },
+      );
+    });
+  }
+}
 
 module.exports = {
   mode: 'development',
-  entry: './src/renderer/index.tsx',
   target: 'web',
+  entry: './src/renderer/index.tsx',
   devtool: 'source-map',
+
   module: {
     rules: [
       {
         test: /\.tsx?$/,
-        use: 'ts-loader',
         exclude: /node_modules/,
+        use: 'ts-loader',
       },
       {
         test: /\.css$/,
@@ -19,32 +47,28 @@ module.exports = {
       },
     ],
   },
+
   resolve: {
     extensions: ['.tsx', '.ts', '.js'],
     fallback: {
-      path: false,
       fs: false,
+      path: false,
       os: false,
       crypto: false,
+      child_process: false,
     },
   },
+
   plugins: [
+    new RendererHtmlPlugin(),
     new webpack.DefinePlugin({
       'process.env.NODE_ENV': JSON.stringify('development'),
-      'process.env': '{}',
-      'process.platform': JSON.stringify('darwin'),
-      'process.version': JSON.stringify(''),
     }),
   ],
+
   output: {
     filename: 'bundle.js',
     path: path.resolve(__dirname, 'dist/renderer'),
-  },
-  externals: {
-    'node-pty': 'commonjs node-pty',
-    '@typescript-eslint/typescript-estree': 'commonjs @typescript-eslint/typescript-estree',
-    'glob': 'commonjs glob',
-    'fs': 'commonjs fs',
-    'child_process': 'commonjs child_process',
+    clean: true,
   },
 };
