@@ -83,47 +83,74 @@ If visibility cannot be verified, the repository is treated as private. The Term
 
 ## Requirements
 
-- macOS, Windows, or Linux with a supported Electron runtime.
-- Node.js 20 or newer is recommended for development.
-- A local repository folder to analyse.
-- Git is recommended for commit, diff, branch, and remote-repository features.
+- **Operating System**: macOS, Windows, or Linux with a supported Electron runtime.
+- **Node.js**: Node.js 20 or newer (tested on Node 22/23).
+- **Git**: Installed and available in PATH (for repository history, commit diffs, and branch features).
 
-## Run the app in development
+## Getting Started
 
-Install dependencies:
+### 1. Install dependencies
 
 ~~~bash
 npm install
 ~~~
 
-Build the application:
+### 2. Rebuild native modules
+
+The project uses `node-pty` for terminal and command interactions, which compiles native bindings against Electron's internal ABI:
+
+~~~bash
+npm run rebuild-native
+~~~
+
+> **Tip**: Always run this step after `npm install`, updating Node.js, or switching Electron versions.
+
+### 3. Build the application
+
+Compile both the Electron main process (TypeScript) and the renderer bundle (React & Webpack):
 
 ~~~bash
 npm run build
 ~~~
 
-Launch the built Electron application:
+### 4. Run the application
+
+Launch the built desktop application:
 
 ~~~bash
 npm start
 ~~~
 
-For renderer watch mode plus Electron startup:
+---
+
+## Development Mode
+
+For active development with live recompilation of renderer assets:
 
 ~~~bash
 npm run dev
 ~~~
 
+This command concurrently watches and bundles changes in `src/renderer/` and boots the Electron window once the bundle is ready.
+
 ## Useful commands
 
 | Command | What it does |
 | --- | --- |
-| npm run build | Builds the main Electron process and renderer. |
-| npm start | Starts the built Electron application. |
-| npm run dev | Watches renderer changes and launches Electron. |
-| npm run build:main | Compiles the Electron main process. |
-| npm run build:renderer | Bundles the React renderer. |
-| npm run rebuild-native | Rebuilds the native node-pty module if required after an Electron or Node update. |
+| `npm run build` | Builds both the main Electron process and Webpack renderer bundle. |
+| `npm start` | Launches the built Electron desktop application. |
+| `npm run dev` | Watches renderer source changes and launches Electron with live reloads. |
+| `npm run build:main` | Compiles the Electron main process via `tsc`. |
+| `npm run build:renderer` | Bundles the React renderer via Webpack. |
+| `npm run rebuild-native` | Rebuilds native C++ modules (`node-pty`) for the Electron ABI. |
+
+## Troubleshooting
+
+- **Native module mismatch (`NODE_MODULE_VERSION`)**: If Electron errors with `was compiled against a different Node.js version`, run `npm run rebuild-native`.
+- **Clean rebuild**: If assets fail to load or build state is stale, run:
+  ~~~bash
+  npm run rebuild-native && npm run build && npm start
+  ~~~
 
 ## Notes
 
