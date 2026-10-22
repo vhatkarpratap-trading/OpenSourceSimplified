@@ -1,5 +1,13 @@
 # Open Source Simplified
 
+<img width="1512" height="951" alt="Screenshot 2026-10-22 at 6 02 22 PM" src="https://github.com/user-attachments/assets/18a1f689-f828-4755-8806-4433aa83cb1a" />
+
+
+<img width="1510" height="779" alt="Screenshot 2026-10-22 at 6 03 12 PM" src="https://github.com/user-attachments/assets/459c67f4-362e-4e6b-a3ad-12e91df9acd8" />
+
+<img width="1510" height="775" alt="Screenshot 2026-10-22 at 6 03 31 PM" src="https://github.com/user-attachments/assets/e278ece4-4727-4417-b5b2-bc2ba8e582cb" />
+
+
 Open Source Simplified is a desktop application for understanding a codebase visually. Open a local repository and the app builds an interactive canvas that explains user flows, architecture, code paths, changes, and relationships in plain language.
 
 It is designed for developers who need to orient themselves in an unfamiliar project, explain a system to others, investigate a change, or keep a visual map of repositories they work with.
