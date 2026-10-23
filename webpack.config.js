@@ -62,7 +62,10 @@ module.exports = {
   plugins: [
     new RendererHtmlPlugin(),
     new webpack.DefinePlugin({
-      'process.env.NODE_ENV': JSON.stringify('development'),
+      'process.env': JSON.stringify({
+        NODE_ENV: 'development',
+        IS_PREACT: 'false',
+      }),
     }),
   ],
 
